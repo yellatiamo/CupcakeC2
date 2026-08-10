@@ -51,6 +51,7 @@
           :ref="el => setTerminalRef(tab.name, el)"
           :socket="socket"
           :client-id="clientId"
+          :session-id="tab.sessionId"
           :allow-p-t-y="tab.isPTY"
         />
       </div>

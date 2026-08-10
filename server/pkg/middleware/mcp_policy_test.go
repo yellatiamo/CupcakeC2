@@ -28,43 +28,40 @@ func TestMCPEndpointAllowlistReadOnly(t *testing.T) {
 		{http.MethodGet, "/api/modules", true, true},
 		{http.MethodGet, "/api/modules/pack/x", true, true},
 		{http.MethodGet, "/api/resp", true, true},
+		{http.MethodGet, "/api/ad/capabilities", true, true},
+		{http.MethodGet, "/api/ad/tasks", true, true},
+		{http.MethodGet, "/api/mcp/pending", true, true},
+		{http.MethodGet, "/api/mcp/pending/abc", true, true},
 
-		// Sole write endpoint denied in read-only mode
+		// Writes denied in read-only mode
 		{http.MethodPost, "/api/cmd", true, false},
-
-		// High-risk writes always denied (removed from allowlist entirely)
+		{http.MethodPost, "/api/ad/exec", true, false},
+		{http.MethodPost, "/api/ad/discover", true, false},
+		{http.MethodPost, "/api/modules/push", true, false},
 		{http.MethodPost, "/api/files/delete", true, false},
-		{http.MethodPost, "/api/files/delete", false, false},
-		{http.MethodPost, "/api/files/upload", true, false},
-		{http.MethodPost, "/api/files/upload", false, false},
 		{http.MethodPost, "/api/processes/kill", true, false},
-		{http.MethodPost, "/api/processes/kill", false, false},
-		{http.MethodPost, "/api/tunnel/start", false, false},
-		{http.MethodPost, "/api/tunnel/stop", false, false},
-		{http.MethodPost, "/api/tunnel/delete", false, false},
-		{http.MethodPost, "/api/socks/start", false, false},
-		{http.MethodPost, "/api/socks/stop", false, false},
-		{http.MethodPost, "/api/socks/delete", false, false},
-		{http.MethodPost, "/api/plugins/run", true, false},
-		{http.MethodPost, "/api/plugins/run", false, false},
-		{http.MethodPost, "/api/plugins/upload", false, false},
-		{http.MethodPost, "/api/modules/push", false, false},
-		{http.MethodPost, "/api/modules/upload", false, false},
-		{http.MethodPost, "/api/modules/query", false, false},
 
-		// Only /api/cmd write when read-only is off
+		// Writes allowed when read-only off (still need panel confirm at gate)
 		{http.MethodPost, "/api/cmd", false, true},
+		{http.MethodPost, "/api/ad/exec", false, true},
+		{http.MethodPost, "/api/ad/discover", false, true},
+		{http.MethodPost, "/api/ad/ping", false, true},
+		{http.MethodPost, "/api/modules/push", false, true},
+		{http.MethodPost, "/api/modules/query", false, true},
+		{http.MethodPost, "/api/files/delete", false, true},
+		{http.MethodPost, "/api/processes/kill", false, true},
+		{http.MethodPost, "/api/plugins/run", false, true},
+		{http.MethodPost, "/api/tunnel/start", false, true},
+		{http.MethodPost, "/api/socks/start", false, true},
 
-		// Unknown endpoints always denied
+		// Control plane still denied
 		{http.MethodGet, "/api/settings/config", true, false},
-		{http.MethodGet, "/api/maintenance/export", true, false},
-		{http.MethodGet, "/api/auth/login", true, false},
+		{http.MethodPost, "/api/settings/config", false, false},
+		{http.MethodPost, "/api/maintenance/reset", false, false},
+		{http.MethodGet, "/api/maintenance/export", false, false},
+		{http.MethodPost, "/api/auth/login", false, false},
+		{http.MethodPost, "/api/generate", false, false},
 		{http.MethodGet, "/api/unknown", true, false},
-		{http.MethodPost, "/api/unknown", false, false},
-
-		// DELETE on modules (admin-only, not in MCP allowlist)
-		{http.MethodDelete, "/api/modules/abc", false, false},
-		{http.MethodDelete, "/api/listeners/abc", false, false},
 	}
 
 	for _, tc := range cases {
@@ -77,7 +74,6 @@ func TestMCPEndpointAllowlistReadOnly(t *testing.T) {
 }
 
 func TestMCPEndpointAllowlistDeniesManagementPaths(t *testing.T) {
-	// Even with read-only off, management paths are not in the MCP allowlist.
 	managementPaths := []struct {
 		method string
 		path   string
@@ -93,17 +89,12 @@ func TestMCPEndpointAllowlistDeniesManagementPaths(t *testing.T) {
 		{http.MethodGet, "/api/generate/stream"},
 		{http.MethodGet, "/api/stager"},
 		{http.MethodPost, "/api/agents/connect"},
-		// High-risk writes never allowlisted
-		{http.MethodPost, "/api/processes/kill"},
-		{http.MethodPost, "/api/plugins/run"},
-		{http.MethodPost, "/api/modules/push"},
-		{http.MethodPost, "/api/tunnel/start"},
 	}
 
 	for _, p := range managementPaths {
 		allowed, _ := mcpEndpointAllowed(p.method, p.path, false)
 		if allowed {
-			t.Errorf("management/high-risk path %s %s must never be MCP-accessible",
+			t.Errorf("management path %s %s must never be MCP-accessible",
 				p.method, p.path)
 		}
 	}

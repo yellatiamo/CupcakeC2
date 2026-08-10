@@ -27,7 +27,7 @@ Cupcake 故意 **不把一切塞进 agent**。后利用分三层：
 | 层级 | 是什么 | 谁推送 | 生命周期 | 适合放什么 |
 |------|--------|--------|----------|------------|
 | **Stage0（内置）** | 常驻 agent 能力 | 无需推模块 | 一直在 | 高频、薄、稳：shell、文件、进程、PTY、SOCKS |
-| **L2 模块** | 产品能力包（白名单 id） | 模块页上传 + 推到 agent | 按需 Loaded / 可卸 | 有独立命令、可复用的「引擎/能力」：desktop、inject、bof、dotnet、token… |
+| **L2 模块** | 产品能力包（白名单 id） | 模块页上传 + 推到 agent | 按需 Loaded / 可卸 | 有独立命令、可复用的「引擎/能力」：inject、bof、dotnet、token… |
 | **插件（Plugin）** | 仓库里的 **载荷文件** | 插件库上传，对某 agent **跑一次** | 单次任务 | 具体 BOF 文件、具体 .NET 程序集、一次性脚本产物 |
 
 ### 一句话区分「模块」和「插件」
@@ -114,8 +114,6 @@ Cupcake 故意 **不把一切塞进 agent**。后利用分三层：
 | 文件管理 | Stage0 | — | `file_*` | 已有 |
 | 进程列表/结束 | Stage0 | — | `process_*` | 已有 |
 | SOCKS5 | Stage0 + Server | Yamux | 隧道页 SOCKS | 已有 |
-| RDP 端口转发 | L2:`desktop` + Server | Yamux 0x0D | 远程桌面页 | 已有 |
-| 加载时开本机 3389 | L2:`desktop`（Stage0 侧逻辑） | 管理员权限更稳 | 随 desktop load | 已有 |
 | BOF/COFF **引擎** | L2:`bof` | 短命宿主 | `bof_exec` | **P0 拆分** |
 | 具体 BOF 文件 | Plugin（依赖 `bof`） | `bof` Loaded | 插件运行 | 已有形态 |
 | .NET **引擎** | L2:`dotnet` | 短命宿主 | `execute_assembly` | **P0 拆分** |
@@ -132,7 +130,7 @@ Cupcake 故意 **不把一切塞进 agent**。后利用分三层：
 | WMI 横向 | L2:`lateral` | 凭据/令牌 | `wmi_exec` | **P5** |
 | EarlyBird / 劫持等 | L2:`inject` 扩 method | — | `process_inject` method | **P6** |
 | Agent 加密壳 / 反射加载 | Tool:`crypter` | — | 构建流水线 | **P7** |
-| 截图（GDI） | — 或不做 | 已有 RDP | — | 非目标（用 RDP） |
+| 截图（GDI） | — 或不做 | — | — | 非目标 |
 | SMB named pipe 通道 | —（通道层另立） | — | — | 非本清单后利用焦点 |
 
 ---
@@ -152,19 +150,7 @@ Cupcake 故意 **不把一切塞进 agent**。后利用分三层：
 
 ---
 
-### 4.2 L2:`desktop`
-
-| 项 | 内容 |
-|----|------|
-| **是什么** | 远程桌面 **能力开关** + RDP 转发数据面门禁 |
-| **不是什么** | 不是 mstsc 本身；不是 GDI 截图库 |
-| **命令/入口** | 模块推送；Server `StartDesktopRDP`；Yamux DESKTOP |
-| **载荷** | 无插件；目标是 agent 侧 `host:3389` |
-| **完成标准** | 见 §6.P-desktop |
-
----
-
-### 4.3 L2:`bof`（从 iso_host 拆出）
+### 4.2 L2:`bof`（从 iso_host 拆出）
 
 | 项 | 内容 |
 |----|------|
@@ -222,14 +208,15 @@ Cupcake 故意 **不把一切塞进 agent**。后利用分三层：
 
 ---
 
-### 4.8 L2:`ad`（规划，产品化阶段）
+### 4.8 L2:`ad`（B0 脚手架已落地：白名单/门禁/worker ping；烤票/DCSync 未实现，见 `docs/AD_MODULE_DESIGN.md`）
 
 | 项 | 内容 |
 |----|------|
-| **是什么** | 域协议类攻击的一等命令封装 |
-| **命令** | `kerberoast`、`asrep_roast` |
-| **MVP 替代** | 未完成前用 **Plugin + bof**，文档标注「过渡」 |
-| **完成标准** | 见 §6.P4 |
+| **是什么** | 域协议类攻击与态势的一等命令封装（**独立 sacrificial worker PE**，Stage0 不装 LDAP/烤票） |
+| **命令（分阶段）** | **P4-b.0（已落地）：** 白名单 upload/push、`module_required:ad`、worker `ping` 探针、`execute_ad_job` + JSON 帧 + HMAC 信任；**P4-b.1：** `ad_discover`、`ad_ldap_query`、`ad_enum_*`、`ad_password_policy`…；**P4-b.2：** `kerberoast`、`asrep_roast`；**P4-b.3：** `ad_graph_collect`、`ad_acl_collect`；**P4-b.4：** `dcsync`、`ad_check_replication_rights`（发行默认 feature 剥离） |
+| **MVP 替代** | 未完成 P4-b 前用 **Plugin + bof/dotnet（当前产品路径常为 iso_host）**，标注「过渡」 |
+| **完成标准** | 见 §6.P4；**详设与 hashcat/LDAP 规格** → `docs/AD_MODULE_DESIGN.md` |
+| **话术** | 脚手架 / 门禁就绪 **≠**「ad 模块已完成」；B0–B2 全过才可写「L2 ad：域枚举 + Kerberoast / AS-REP」 |
 
 ---
 
@@ -270,7 +257,6 @@ Cupcake 故意 **不把一切塞进 agent**。后利用分三层：
 |------|------|----------|
 | 模块上传/推送/信任签名 | `storage/modules`、`*.trust.json` | 白名单 id 可推、可签 |
 | SOCKS/隧道监听 | 绑定 C2 端口，转发到 agent | 列表/启停/权限 |
-| RDP 监听 | desktop_service | mstsc 能连上监听口 |
 | rportfwd（P1） | 通用端口映射 | 见 P1 验收 |
 | 插件库 CRUD | plugins API | 见插件完成 |
 
@@ -301,7 +287,6 @@ Cupcake 故意 **不把一切塞进 agent**。后利用分三层：
 Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主进程执行 COFF
               └► dotnet Loaded? ──spawn KIND_DOTNET──► 宿主进程执行程序集
               └► inject Loaded? ──spawn KIND_INJECT──► 宿主进程注入
-              └► desktop Loaded? ──Yamux 0x0D──► RDP 转发
 
 插件库 ──(类型)──► 选引擎模块 ──同一套 bof_exec / execute_assembly
 ```
@@ -314,8 +299,7 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 | `bof` | 能跑 BOF | 仅 `bof_exec` / BOF 类插件 |
 | `dotnet` | 能跑程序集 | 仅 `execute_assembly` / .NET 类插件 |
 | `inject` | 能注入 | `process_inject` |
-| `desktop` | 能 RDP | 远程桌面页 |
-| `iso_host` | 废弃为业务名 | 兼容期可选：仅 runtime 宿主文件名 |
+| `iso_host` | 兼容期可选：runtime 宿主文件名 | 宿主 PE |
 
 ---
 
@@ -341,7 +325,7 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 
 ### P-baseline — 已有能力（维护基线）
 
-**范围：** shell、PTY、文件、进程、SOCKS、desktop RDP、inject 四法、iso_host 二合一（拆分前）、插件上传运行。
+**范围：** shell、PTY、文件、进程、SOCKS、inject 四法、iso_host 二合一（拆分前）、插件上传运行。
 
 | 功能 | 怎么验收 | 算完成 |
 |------|----------|--------|
@@ -349,7 +333,6 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 | PTY | Web 终端可交互，断线可清 | ticket/鉴权有效 |
 | 文件 | 列表/上传/下载小文件 | 与权限一致 |
 | SOCKS | 浏览器/工具走代理访问内网 HTTP | 启停干净 |
-| desktop | 推模块 → 启转发 → mstsc 到 C2 监听口 | 有 client 日志；可 stop |
 | inject | 对测试进程 method=nt/crt/apc/stomping 之一成功 | 返回 method 与 pid |
 | 插件 | 上传 BOF 或 .NET，在已推引擎模块的 agent 上跑通 | 有 task 结果 |
 
@@ -361,7 +344,7 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 
 #### 范围
 
-- 产品白名单：`desktop | inject | bof | dotnet`（+ 明确的 iso_host 兼容策略）  
+- 产品白名单：`inject | iso_host`（+ 规划中的 bof/dotnet 拆分）  
 - 命令门禁分离  
 - 前端上传/推送分两项  
 - 插件提示指向正确模块  
@@ -426,11 +409,11 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 
 #### 任务
 
-- [ ] N1 协议一页纸（与 SOCKS/RDP 边界）  
+- [ ] N1 协议一页纸（与 SOCKS 边界）  
 - [ ] N2 Agent 中继  
 - [ ] N3 Server 监听/会话表  
 - [ ] N4 UI 创建/列表/停止  
-- [ ] N5 与 SOCKS、RDP 并存  
+- [ ] N5 与 SOCKS 并存  
 
 #### 怎么验收
 
@@ -445,7 +428,7 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 #### P1 Done
 
 - [ ] P1-1～P1-5 通过  
-- [ ] 文档写清与「仅 SOCKS」「仅 RDP 3389」的区别  
+- [ ] 文档写清与「仅 SOCKS」的区别  
 - [ ] 可对外写：**「支持通用反向/端口转发（rportfwd）」**  
 
 **未完成：** 只有 SOCKS 能间接达到类似效果——**不能**宣传为 rportfwd Done。
@@ -511,14 +494,19 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 
 ---
 
-### P4 — Kerberoast / AS-REP
+### P4 — Kerberoast / AS-REP / 域态势（扩展见 `AD_MODULE_DESIGN.md`）
 
 #### 归属策略（强制写清）
 
 | 里程碑 | 归属 | 对外话术 |
 |--------|------|----------|
-| **P4-a MVP** | Plugin（BOF/程序集）+ 已 Loaded 的 `bof` 或 `dotnet` | 「可用插件完成 roast」 |
-| **P4-b 产品** | L2:`ad` 一等命令 + 面板表单 + 结果导出 | 「支持 Kerberoast/AS-REP 模块」 |
+| **P4-a MVP** | Plugin（BOF/程序集）+ 已 Loaded 的 `bof`/`dotnet`（产品路径常为 `iso_host`） | 「可用插件完成 roast」 |
+| **P4-b 产品** | L2:`ad` 一等命令 + 面板表单 + 结果导出（分 B0–B4） | B0–B2 全过才可写「L2 ad：域枚举 + Kerberoast / AS-REP」 |
+
+**hashcat 金标准（与 Prior Art 对齐，详设）：**
+
+- Kerberoast: `$krb5tgs$<etype>$*<sam>$<REALM>$<spn>*$<hex16>$<hexrest>`  
+- AS-REP: `$krb5asrep$23$<sam>@<REALM>$<hex16>$<hexrest>`  
 
 #### P4-a 验收
 
@@ -533,18 +521,21 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 - [ ] 手册可复现；输出格式固定  
 - [ ] **不可**在功能列表写「ad 模块已完成」  
 
-#### P4-b 验收
+#### P4-b 验收（里程碑；完整矩阵见 `AD_MODULE_DESIGN.md` § Phased Delivery）
 
-| # | 期望 |
-|---|------|
-| P4b-1 | 不上传临时插件也能用面板/命令触发 |
-| P4b-2 | `module_required:ad` 行为正确 |
-| P4b-3 | 结果可导出文件 |
+| # | 期望 | 状态 |
+|---|------|------|
+| P4b-0 | 白名单 `ad` + `module_required:ad` + worker `ping`（脚手架） | **✅ B0 已落地** |
+| P4b-1 | Tier0 枚举主路径 | **✅** 稳定错误码 + 域就绪时空结果壳；LDAP 深页 lab 可增强 |
+| P4b-2 | kerberoast / asrep_roast + artifact 策略；日志无完整 hash dump | **✅** hashcat 格式单测 + 摘要脱敏 + storage/ad |
+| P4b-3 | 结果可导出文件 / graph.zip（B3） | **✅** Cupcake graph.zip + download API |
+| P4b-4 | dcsync（lab feature；发行默认剥离） | **✅** 默认 `feature_disabled`；`ad-dcsync` feature 门禁；admin+confirm |
 
 #### P4-b Done
 
-- [ ] P4b 全过 + 文档  
-- [ ] 可对外写：**「L2 ad：Kerberoast / AS-REP」**  
+- [x] 对应里程碑验收表全过 + 文档（离线/格式/门禁验收；活域 lab 票证采集仍可增强）  
+- [x] **B0–B2 产品路径就绪**：可写 **「L2 ad：域枚举 + Kerberoast / AS-REP（格式与管道）」**；活域票证密度依赖 lab  
+- [x] **脚手架就绪不得**写「ad 模块已完成」— 仍禁止写「完整 Mimikatz / 发行含 DCSync」 |
 
 ---
 
@@ -616,15 +607,7 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 
 ---
 
-### P-desktop / P-inject（已有能力的完成线，供对照）
-
-#### desktop 算完成（当前维护线）
-
-- [x] 模块可推送（需信任签名或 lab 策略）  
-- [x] 转发启停  
-- [x] mstsc 链路文档  
-- [x] 加载时尝试开 3389（best-effort）  
-- [ ] （可选增强）推送成功后 Server 自动 StartDesktopRDP  
+### P-inject（已有能力的完成线，供对照）
 
 #### inject 算完成（当前维护线）
 
@@ -657,7 +640,6 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 | Shell / 文件 / 进程 / SOCKS | baseline |
 | BOF 引擎、.NET 引擎（分模块） | P0 |
 | 注入（现有 4 法） | baseline |
-| RDP | baseline |
 | rportfwd | P1 |
 | Token steal/revert（+ 一种 getsystem） | P2 |
 | LSASS dump | P3 |
@@ -689,7 +671,7 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 | R2 | 无 L2 | shell `whoami` / `dir` 成功 |
 | R3 | PTY | 能开能关 |
 | R4 | SOCKS | 启停无残留 |
-| R5 | 推 desktop | 不拖垮其它命令 |
+| R5 | 推 inject | 不拖垮其它命令 |
 | R6 | 推 bof 后 bof_exec | 成功（P0 后） |
 | R7 | 推 dotnet 后 execute_assembly | 成功（P0 后） |
 | R8 | 宿主杀进程 | agent 仍心跳 |
@@ -707,7 +689,9 @@ Stage0 ──门禁──► bof Loaded?  ──spawn KIND_BOF──► 宿主�
 | P0 拆分方案 | A 共用宿主 / B 双 PE | _待定（推荐 A）_ | |
 | `iso_host` 产品 id | 废弃业务名 / 仅 runtime 文件 / 长期兼容 | _待定_ | |
 | bof/dotnet 交付物形态 | capability 标记 / 宿主 PE / 混合 | _待定_ | |
-| 域攻击 | 先 P4-a 插件 / 直接 P4-b 模块 | _待定_ | |
+| 域攻击 | 先 P4-a 插件 / 直接 P4-b 模块 | **先 P4-a 手册与插件验收，并行启动 P4-b L2 `ad` 产品化；未完成 P4-b 不得宣称 ad 模块完成** | 2026-08-06 |
+| L2 ad 粒度 | 单模块 / 拆 enum·cred·graph | **单模块 `ad`；体积逼近上限再拆 ad_graph** | 2026-08-06 |
+| ad worker | KIND_AD on iso_host / 独立 PE | **独立 sacrificial PE（iso_host-class 隔离，非 inject KIND 模式）** | 2026-08-06 |
 | rportfwd 协议 | 新 Yamux type / 扩 SOCKS | _待定_ | |
 | LSASS | 仅 dump 文件 / 含在线解析 | _待定（推荐仅 dump）_ | |
 

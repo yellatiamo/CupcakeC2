@@ -31,15 +31,22 @@ func HandleListPlugins(c *gin.Context) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, plugins)
+	// Enrich with 插件能力 flags + required L2 module (模块能力 dependency).
+	out := make([]services.PluginMetadata, 0, len(plugins))
+	for _, p := range plugins {
+		cp := p
+		services.EnrichPluginCapabilities(&cp)
+		out = append(out, cp)
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 func HandleRunPlugin(c *gin.Context) {
 	var req struct {
-		UUID      string `json:"uuid"`
-		AgentID   string `json:"agent_id"` // Support both uuid and agent_id
-		PluginID  string `json:"plugin_id"`
-		Args      string `json:"args"`
+		UUID     string `json:"uuid"`
+		AgentID  string `json:"agent_id"` // Support both uuid and agent_id
+		PluginID string `json:"plugin_id"`
+		Args     string `json:"args"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Invalid input"})
@@ -61,7 +68,30 @@ func HandleRunPlugin(c *gin.Context) {
 
 	taskID, err := services.DeployPlugin(targetUUID, req.PluginID, req.Args)
 	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
+		if services.IsModuleRequired(err) {
+			mod := services.ModuleRequiredID(err)
+			if mod == "" {
+				mod = "bof"
+			}
+			c.JSON(http.StatusConflict, gin.H{
+				"error":      err.Error(),
+				"error_code": "module_required",
+				"code":       "module_required",
+				"module":     mod,
+				"hint":       "BOF 插件依赖模块能力 bof，请先在「模块」页推送",
+			})
+			return
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "offline") {
+			c.JSON(http.StatusConflict, gin.H{"error": msg, "code": "agent_offline", "error_code": "agent_offline"})
+			return
+		}
+		if strings.Contains(msg, "not found") {
+			c.JSON(http.StatusNotFound, gin.H{"error": msg, "code": "not_found", "error_code": "not_found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
 		return
 	}
 
@@ -194,9 +224,9 @@ func typeDetectNote(t string) string {
 	case "native-exec":
 		return "识别为原生 PE（如 fscan），将走 PPID 隔离短命进程执行"
 	case "execute-assembly":
-		return "识别为 .NET 程序集，将走 iso_host CLR 内存执行"
+		return "识别为 .NET 程序集 — 执行已退役：请转 shellcode（如 Donut）后走 inject 模块"
 	case "bof-exec":
-		return "识别为 COFF/BOF 对象，将走 iso_host BOF 引擎"
+		return "识别为 COFF/BOF 对象，将走 bof 模块（Agent 进程内经典 BOF）"
 	default:
 		return "已自动选择执行类型: " + t
 	}

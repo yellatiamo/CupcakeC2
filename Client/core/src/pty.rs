@@ -3,7 +3,7 @@
 // Default: HybridSession (Mode A) — builtins + direct exe spawn with streamed pipes.
 // No cmd.exe / powershell by default.
 //
-// Compatibility: set env CUPCAKE_PTY_MODE=cmd for legacy pipe-to-cmd shell.
+// Compatibility: set env APP_PTY_MODE=cmd for legacy pipe-to-cmd shell.
 
 use log::{debug, error, info};
 use std::path::PathBuf;
@@ -17,12 +17,12 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 pub async fn handle_stream(stream: yamux::Stream) {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-    let mode = std::env::var("CUPCAKE_PTY_MODE")
+    let mode = std::env::var("APP_PTY_MODE")
         .unwrap_or_default()
         .to_ascii_lowercase();
 
     if mode == "cmd" || mode == "legacy" {
-        info!("[PTY] Legacy cmd pipe mode (CUPCAKE_PTY_MODE={})", mode);
+        info!("[PTY] Legacy cmd pipe mode (APP_PTY_MODE={})", mode);
         handle_legacy_cmd_pty(stream).await;
     } else {
         info!("[PTY] HybridSession Mode A (no cmd/powershell)");

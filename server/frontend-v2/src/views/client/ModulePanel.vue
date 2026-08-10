@@ -2,16 +2,17 @@
   <div class="module-panel">
     <div class="panel-head">
       <div>
-        <h3>L2 模块（三件套）</h3>
+        <h3>模块能力 · L2</h3>
         <p class="hint">
-          终端/文件/进程已内置。本页推送三个独立模块：
-          <code>desktop</code> 远程桌面、
-          <code>iso_host</code> BOF/.NET、
-          <code>inject</code> 注入。已存活则按钮置灰。
+          终端/文件/进程已内置。本页推送<strong>模块能力</strong>：
+          <code>bof</code>（进程内经典 BOF 执行器，Manual-Map 无文件加载）、
+          <code>inject</code>（shellcode 注入 worker）、
+          <code>ad</code>（域渗透 worker）。
+          「已就绪」= 模块已在 Agent 侧可执行，inject/ad 为独立 worker 而非常驻进程。
         </p>
       </div>
       <div class="head-actions">
-        <el-button :loading="listing" @click="listOnAgent">刷新存活状态</el-button>
+        <el-button :loading="listing" @click="listOnAgent">刷新就绪状态</el-button>
         <el-button :loading="loading" @click="refresh">刷新仓库</el-button>
       </div>
     </div>
@@ -21,7 +22,7 @@
       type="warning"
       show-icon
       :closable="false"
-      title="仓库为空：请在「模块」页上传 desktop / iso_host / inject"
+      title="仓库为空：请在「模块」页上传 bof / inject / ad"
       class="mb"
     />
 
@@ -38,20 +39,42 @@
       type="info"
       show-icon
       :closable="false"
-      title="当前主机未检测到已加载模块（可推送 desktop / iso_host / inject）"
+      title="当前主机未检测到已就绪模块（可推送 bof / inject / ad）"
       class="mb"
     />
 
     <el-table :data="displayModules" class="mt" v-loading="loading" empty-text="无已登记模块">
-      <el-table-column prop="id" label="ID" width="120" />
-      <el-table-column prop="name" label="名称" width="150" />
-      <el-table-column prop="description" label="描述" min-width="240" show-overflow-tooltip />
-      <el-table-column label="大小" width="100">
+      <el-table-column prop="id" label="ID" width="100" />
+      <el-table-column prop="name" label="名称" width="130" />
+      <el-table-column prop="description" label="描述" min-width="180" show-overflow-tooltip />
+      <el-table-column label="模块能力" min-width="150">
+        <template #default="{ row }">
+          <div class="cap-row">
+            <el-tag
+              v-for="cap in (row.capabilities || capFallback(row.id))"
+              :key="cap"
+              size="small"
+              type="warning"
+              effect="plain"
+            >{{ cap }}</el-tag>
+          </div>
+        </template>
+      </el-table-column>
+      <el-table-column label="签名" width="90">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.signed ? 'success' : 'info'" effect="plain">
+            {{ row.signed ? '已签' : '—' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="大小" width="90">
         <template #default="{ row }">{{ formatSize(row.size) }}</template>
       </el-table-column>
-      <el-table-column label="本机状态" width="130">
+      <el-table-column label="本机状态" width="150">
         <template #default="{ row }">
-          <el-tag v-if="isAlive(row)" type="success" size="small" effect="dark">已推送·存活</el-tag>
+          <el-tag v-if="isAlive(row)" type="success" size="small" effect="dark">
+            {{ statusLabel(row) }}
+          </el-tag>
           <el-tag v-else type="info" size="small">未推送</el-tag>
         </template>
       </el-table-column>
@@ -64,14 +87,14 @@
             :disabled="isAlive(row)"
             @click="pushModule(row)"
           >
-            {{ isAlive(row) ? '已在本机' : '推送到本机' }}
+            {{ isAlive(row) ? '已就绪' : '推送到本机' }}
           </el-button>
         </template>
       </el-table-column>
     </el-table>
 
     <p class="foot-note">
-      产品模块仅三项：desktop · iso_host · inject。同进程 bof/dotnet/shell 已退出产品仓库。
+      bof = Agent 进程内 Manual-Map 加载（无文件落地、无新进程）；inject / ad = 独立 sacrificial worker。.NET 执行已退役：程序集请转 shellcode（如 Donut）后走 inject。
     </p>
   </div>
 </template>
@@ -92,19 +115,28 @@ const pushing = ref('')
 const listing = ref(false)
 const modules = ref([])
 const listedOnce = ref(false)
-const PRODUCT_IDS = new Set(['desktop', 'iso_host', 'inject'])
+// Keep in sync with server productModuleIDs (bof | inject | ad)
+const PRODUCT_IDS = new Set(['bof', 'inject', 'ad'])
 
 const displayModules = computed(() => {
-  // Product three modules only (+ any already alive for edge cases)
-  return modules.value.filter(
-    (m) => PRODUCT_IDS.has(m.id) || isAlive(m)
-  )
+  const clientOS = (props.clientInfo?.os || '').toLowerCase()
+  // Product three modules only (+ any already alive for edge cases), filtered by platform support.
+  return modules.value.filter((m) => {
+    if (!PRODUCT_IDS.has(m.id) && !isAlive(m)) return false
+    // Server already filters ListCatalog by OS; this is a second line of defense in the UI.
+    // Known windows-only: ad, inject, bof. Hide if client is linux and not alive.
+    const winOnly = new Set(['ad', 'inject', 'bof'])
+    if (winOnly.has(m.id) && clientOS && !clientOS.includes('win') && !isAlive(m)) {
+      return false
+    }
+    return true
+  })
 })
 
 const aliveSummary = computed(() => {
   const alive = modules.value.filter((m) => isAlive(m)).map((m) => m.name || m.id)
   if (!alive.length) return ''
-  return `本机已存活：${alive.join('、')}`
+  return `本机已就绪（缓存/可执行）：${alive.join('、')}`
 })
 
 const formatSize = (n) => {
@@ -116,11 +148,36 @@ const formatSize = (n) => {
 
 const isAlive = (row) => !!(row && (row.loaded_on_agent || row.alive))
 
+/** bof is mapped into the agent process; inject/ad are sacrificial workers */
+const statusLabel = (row) => {
+  if (!isAlive(row)) return '未推送'
+  if (row.id === 'bof') return '已映射·就绪'
+  if (row.id === 'ad') return '已推送·worker'
+  return '已推送·就绪'
+}
+
+/** Agent module_list returns "id:mode" (e.g. bof:mem) */
+const parseAgentModuleIds = (raw) => {
+  return String(raw || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => s.split(':')[0].trim())
+    .filter(Boolean)
+}
+
+const CAP_FALLBACK = {
+  bof: ['bof'],
+  inject: ['inject'],
+  ad: ['ad_ops']
+}
+const capFallback = (id) => CAP_FALLBACK[id] || []
+
 const normalizeList = (list) =>
   (list || []).map((m) =>
     typeof m === 'string'
-      ? { id: m, name: m, description: '', size: 0, kind: 'custom', loaded_on_agent: false }
-      : { ...m, loaded_on_agent: !!m.loaded_on_agent }
+      ? { id: m, name: m, description: '', size: 0, kind: 'custom', loaded_on_agent: false, capabilities: capFallback(m) }
+      : { ...m, loaded_on_agent: !!m.loaded_on_agent, capabilities: m.capabilities || capFallback(m.id) }
   )
 
 const refresh = async () => {
@@ -138,7 +195,11 @@ const refresh = async () => {
 const pushModule = async (row) => {
   const id = row.id
   if (isAlive(row)) {
-    ElMessage.info(`模块「${row.name || id}」已在本机存活，无需重复推送`)
+    ElMessage.info(
+      id === 'bof'
+        ? 'bof 模块已在本机映射就绪（进程内加载），无需重复推送'
+        : `模块「${row.name || id}」已在本机就绪，无需重复推送`
+    )
     return
   }
   pushing.value = id
@@ -147,14 +208,24 @@ const pushModule = async (row) => {
     const data = res.data || {}
     row.loaded_on_agent = true
     row.alive = true
+    const detail = data.detail ? String(data.detail) : ''
     ElNotification({
       title: '推送成功',
-      message: data.msg || `模块 ${data.name || id} 已在目标主机就绪`,
+      message:
+        data.msg ||
+        (id === 'bof'
+          ? `bof 模块已映射（进程内执行 BOF，无文件落地）${detail ? ' · ' + detail : ''}`
+          : `模块 ${data.name || id} 已在目标主机就绪`),
       type: 'success',
-      duration: 4500
+      duration: 5000
     })
     if (data.warning) ElMessage.warning(data.warning)
     await refresh()
+    try {
+      await listOnAgent()
+    } catch (_) {
+      /* optional */
+    }
   } catch (e) {
     ElNotification({
       title: '推送失败',
@@ -178,19 +249,19 @@ const listOnAgent = async () => {
     } else {
       await refresh()
     }
-    // result is comma-separated ids from agent (may be empty)
+    // Agent returns "id:mode" e.g. "bof:mem,inject:worker"
     const raw = (res.data?.result || '').trim()
     if (raw) {
-      const ids = raw.split(',').map((s) => s.trim()).filter(Boolean)
+      const ids = parseAgentModuleIds(raw)
       for (const m of modules.value) {
         if (ids.includes(m.id)) {
           m.loaded_on_agent = true
           m.alive = true
         }
       }
-      ElMessage.success(`已同步：Agent 报告已加载 ${ids.join(', ')}`)
+      ElMessage.success(`已同步：Agent 报告就绪 ${ids.join(', ')}（原始: ${raw}）`)
     } else {
-      ElMessage.success('已同步：Agent 当前无已加载模块')
+      ElMessage.success('已同步：Agent 当前无已就绪模块')
     }
   } catch (e) {
     ElMessage.error(e?.response?.data?.error || '查询失败')
@@ -231,4 +302,5 @@ onMounted(async () => {
   flex-wrap: wrap;
   gap: 4px;
 }
+.cap-row { display: flex; flex-wrap: wrap; gap: 4px; }
 </style>

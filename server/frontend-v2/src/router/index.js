@@ -44,10 +44,27 @@ const routes = [
         meta: { title: 'Modules' }
       },
       {
-        path: 'domain',
-        name: 'Domain',
+        path: 'ad',
+        name: 'AdCenter',
+        component: () => import('../views/AdCenter.vue'),
+        meta: { title: 'AdCenter' }
+      },
+      {
+        path: 'plugins',
+        name: 'Plugins',
         component: () => import('../views/DomainScanner.vue'),
         meta: { title: 'Plugins' }
+      },
+      {
+        path: 'history',
+        name: 'History',
+        component: () => import('../views/History.vue'),
+        meta: { title: 'History' }
+      },
+      {
+        // KD-5: permanent redirect from misnamed /domain → /plugins
+        path: 'domain',
+        redirect: '/plugins'
       },
       {
         path: 'settings',
@@ -99,10 +116,11 @@ const routes = [
             meta: { title: 'Client Modules' }
           },
           {
-            path: 'desktop',
-            name: 'ClientDesktop',
-            component: () => import('../views/client/RemoteDesktop.vue'),
-            meta: { title: 'Remote Desktop' }
+            path: 'ad',
+            name: 'ClientAd',
+            component: () => import('../views/client/AdPanel.vue'),
+            meta: { title: 'Client AD' },
+            props: (route) => ({ clientId: route.params.id })
           }
         ]
       }

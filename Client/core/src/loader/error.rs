@@ -11,12 +11,12 @@ pub enum BofError {
     #[error("Unsupported architecture: 0x{0:04X} (expected x86 or x64)")]
     UnsupportedArchitecture(u16),
 
-    /// COFF 文件格式错误
-    #[error("Invalid COFF format: {0}")]
+    /// 载荷格式错误
+    #[error("invalid image format: {0}")]
     InvalidCoffFormat(String),
 
-    /// 文件太小
-    #[error("COFF data too small: {0} bytes (minimum {1} bytes required)")]
+    /// 数据太小
+    #[error("image data too small: {0} bytes (minimum {1} bytes required)")]
     FileTooSmall(usize, usize),
 
     /// 符号未找到
@@ -44,19 +44,19 @@ pub enum BofError {
     MemoryProtectionFailed(String),
 
     /// Module Overloading 失败
-    #[error("Module overloading failed for '{dll}': {reason}")]
+    #[error("image map failed for '{dll}': {reason}")]
     ModuleOverloadingFailed { dll: String, reason: String },
 
     /// 段未找到
-    #[error("Section '{0}' not found in carrier DLL")]
+    #[error("section '{0}' not found in host image")]
     SectionNotFound(String),
 
     /// 入口点未找到
-    #[error("Entry point '{0}' not found in BOF")]
+    #[error("entry point '{0}' not found in payload")]
     EntryPointNotFound(String),
 
     /// 执行失败
-    #[error("BOF execution failed: {0}")]
+    #[error("payload execution failed: {0}")]
     ExecutionFailed(String),
 
     /// 系统调用失败
@@ -68,18 +68,18 @@ pub enum BofError {
     BoundsCheckFailed { offset: usize, size: usize },
 
     /// 架构不匹配
-    #[error("Architecture mismatch: cannot execute {bof_arch} BOF in {process_arch} process")]
+    #[error("architecture mismatch: cannot execute {bof_arch} payload in {process_arch} process")]
     ArchitectureMismatch {
         bof_arch: String,
         process_arch: String,
     },
 
-    /// Beacon API 调用失败
-    #[error("Beacon API call failed: {api} - {reason}")]
+    /// 内部 API 调用失败
+    #[error("plugin api call failed: {api} - {reason}")]
     BeaconApiError { api: String, reason: String },
 
     /// 参数解析失败
-    #[error("Failed to parse BOF arguments: {0}")]
+    #[error("failed to parse payload arguments: {0}")]
     ArgumentParseError(String),
 }
 

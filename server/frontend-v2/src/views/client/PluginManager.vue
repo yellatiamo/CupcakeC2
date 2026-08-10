@@ -70,7 +70,10 @@
         <div class="surface-card card-container">
           <div class="card-header">
             <span class="header-title"><el-icon><Clock /></el-icon> 执行历史 (最近 10 条)</span>
-            <el-button link type="primary" @click="fetchLogs">刷新</el-button>
+            <div class="header-actions">
+              <el-button link type="primary" @click="goFullHistory">全部历史</el-button>
+              <el-button link type="primary" @click="fetchLogs">刷新</el-button>
+            </div>
           </div>
 
           <div class="card-body task-list-body" v-loading="loadingLogs">
@@ -78,8 +81,12 @@
               <el-empty v-if="history.length === 0" description="暂无执行记录" />
               <div v-for="log in history" :key="log.req_id" class="task-item" :class="log.status">
                 <div class="task-info">
-                  <span class="task-type">{{ log.type }}</span>
+                  <div class="task-type-row">
+                    <span class="task-type">{{ log.type }}</span>
+                    <el-tag size="small" :type="sourceTagType(log.source)" effect="light">{{ sourceLabel(log.source) }}</el-tag>
+                  </div>
                   <span class="task-id">ID: {{ log.req_id }}</span>
+                  <span class="task-meta" v-if="log.created_by">by {{ log.created_by }}</span>
                   <span class="task-time">{{ formatDate(log.created_at) }}</span>
                 </div>
                 <div class="task-actions">
@@ -111,9 +118,9 @@
         </el-form-item>
         <div class="opsec-tip">
           <el-icon><Warning /></el-icon>
-          插件库 = BOF / .NET <strong>载荷</strong>。执行前自动 stage
-          <code>iso_host</code>，在 <strong>PPID 伪装短命进程</strong>内内存执行（尽量非 Agent 子进程）。
-          宿主退出即焚；载荷不在 Agent 长期缓存。
+          插件库 = BOF / shellcode <strong>载荷</strong>。BOF 走 <code>bof</code> 模块在
+          <strong>Agent 进程内</strong>无文件执行；注入类载荷走 <code>inject</code> 牺牲进程。
+          载荷不在 Agent 长期缓存。
         </div>
       </el-form>
       <template #footer>
@@ -138,6 +145,7 @@
 
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { 
   Tools, Monitor, Collection, Search, CaretRight, 
   Clock, Warning, Download 
@@ -149,6 +157,8 @@ const props = defineProps({
   clientId: String,
   clientInfo: Object
 })
+
+const router = useRouter()
 
 const search = ref('')
 const plugins = ref([])
@@ -206,10 +216,18 @@ const fetchPlugins = async () => {
 const fetchLogs = async () => {
     loadingLogs.value = true
     try {
-        const histRes = await api.get(`/api/clients/history/${props.clientId}`)
+        // Prefer source-aware agent history; keep existing endpoint shape.
+        const histRes = await api.get(`/api/clients/history/${props.clientId}`, {
+          params: { source: 'all', limit: 50 }
+        })
         // 只显示插件执行记录，过滤掉系统命令（migrate、shell、heartbeat等）
-        const systemCommands = ['migrate', 'shell', 'shell_interactive', 'shell_exit', 'heartbeat', 'file_upload', 'file_download', 'file_upload_chunk', 'file_download_chunk', 'file_delete', 'file_list']
-        const pluginOnly = (histRes.data || []).filter(log => !systemCommands.includes(log.type))
+        const systemCommands = ['migrate', 'shell', 'shell_interactive', 'shell_exit', 'heartbeat', 'file_upload', 'file_download', 'file_upload_chunk', 'file_download_chunk', 'file_delete', 'file_list', 'module_stage', 'module_unload']
+        const pluginOnly = (histRes.data || []).filter(log => {
+          const t = (log.type || '').toLowerCase()
+          if (systemCommands.includes(t)) return false
+          if (t.startsWith('file_') || t.startsWith('process_') || t.startsWith('ad_') || t.startsWith('module_')) return false
+          return true
+        })
         history.value = pluginOnly.slice(0, 10)
     } catch (e) {
         console.error('Logs fetch failed', e)
@@ -218,10 +236,71 @@ const fetchLogs = async () => {
     }
 }
 
+const goFullHistory = () => {
+  router.push({
+    name: 'History',
+    query: {
+      uuid: props.clientId || undefined,
+      type: 'plugin',
+      source: 'all'
+    }
+  })
+}
+
+const sourceLabel = (src) => {
+  const s = (src || 'panel').toLowerCase()
+  if (s === 'mcp') return 'MCP'
+  if (s === 'internal') return '内部'
+  return '手动'
+}
+
+const sourceTagType = (src) => {
+  const s = (src || 'panel').toLowerCase()
+  if (s === 'mcp') return 'warning'
+  if (s === 'internal') return 'info'
+  return 'success'
+}
+
 const prepRun = (plugin) => {
   runDialog.selectedPlugin = plugin
   runDialog.args = ''
   runDialog.visible = true
+}
+
+/** Poll history/result until completed|failed or timeout; surface STDERR to user. */
+const waitPluginResult = async (taskId, maxMs = 45000) => {
+  const started = Date.now()
+  let lastOutput = ''
+  while (Date.now() - started < maxMs) {
+    await new Promise((r) => setTimeout(r, 1200))
+    try {
+      const histRes = await api.get(`/api/clients/history/${props.clientId}`, {
+        params: { source: 'all', limit: 30 }
+      })
+      const row = (histRes.data || []).find((x) => x.req_id === taskId)
+      if (row && (row.status === 'completed' || row.status === 'failed')) {
+        lastOutput = row.output || ''
+        // Prefer task file if present
+        try {
+          const res = await api.get(`/api/plugins/result/${taskId}`)
+          if (res.data) lastOutput = typeof res.data === 'string' ? res.data : String(res.data)
+        } catch (_) {
+          /* use history output */
+        }
+        return { status: row.status, output: lastOutput }
+      }
+    } catch (_) {
+      /* keep polling */
+    }
+  }
+  // Timeout: try one more result file
+  try {
+    const res = await api.get(`/api/plugins/result/${taskId}`)
+    lastOutput = typeof res.data === 'string' ? res.data : String(res.data || '')
+  } catch (_) {
+    /* empty */
+  }
+  return { status: 'timeout', output: lastOutput }
 }
 
 const executePlugin = async () => {
@@ -233,12 +312,49 @@ const executePlugin = async () => {
       plugin_id: runDialog.selectedPlugin.id,
       args: runDialog.args
     })
-    
-    ElMessage.success(`指令已下发! 任务ID: ${res.data.task_id}`)
+    const taskId = res.data?.task_id
+    if (!taskId) {
+      ElMessage.warning('已提交但未返回 task_id')
+      runDialog.visible = false
+      return
+    }
+    ElMessage.info(`已下发，等待回显… (${taskId.slice(0, 8)})`)
     runDialog.visible = false
-    setTimeout(fetchLogs, 1000)
+
+    const { status, output } = await waitPluginResult(taskId)
+    await fetchLogs()
+
+    const errText = output || ''
+    const hasStderr =
+      /\[STDERR\]/i.test(errText) ||
+      /isolated bof:/i.test(errText) ||
+      /WriteFile failed/i.test(errText) ||
+      /host runtime missing/i.test(errText) ||
+      /module_required/i.test(errText)
+
+    if (status === 'failed' || hasStderr) {
+      ElMessage.error({
+        message: (errText || '插件执行失败').slice(0, 280),
+        duration: 8000,
+        showClose: true
+      })
+      resultDialog.taskId = taskId
+      resultDialog.content = errText || '（无输出，仅失败状态）'
+      resultDialog.visible = true
+    } else if (status === 'timeout') {
+      ElMessage.warning('等待回显超时：任务可能仍在跑，或 agent 已被杀/未回包。请到历史记录查看。')
+    } else {
+      ElMessage.success('插件执行完成')
+      if (errText) {
+        resultDialog.taskId = taskId
+        resultDialog.content = errText
+        resultDialog.visible = true
+      }
+    }
   } catch (e) {
-    ElMessage.error(e.response?.data?.error || '执行失败')
+    const d = e?.response?.data || {}
+    const msg = d.hint || d.error || e.message || '执行失败'
+    ElMessage.error(msg)
   } finally {
     runDialog.loading = false
   }
@@ -249,13 +365,32 @@ const viewResult = async (log) => {
   resultDialog.content = ''
   resultDialog.visible = true
   resultDialog.loading = true
-  
+
   try {
-    // We created an endpoint handleGetPluginResult in main.go: /api/plugins/result/:task_id
     const res = await api.get(`/api/plugins/result/${log.req_id}`)
-    resultDialog.content = res.data
+    resultDialog.content = typeof res.data === 'string' ? res.data : String(res.data)
   } catch (e) {
-    resultDialog.content = '无法加载日志，可能文件已被清理或尚未生成。'
+    // Fallback: history row output (DB), then explain
+    if (log.output) {
+      resultDialog.content = log.output
+    } else {
+      try {
+        const histRes = await api.get(`/api/clients/history/${props.clientId}`, {
+          params: { source: 'all', limit: 50 }
+        })
+        const row = (histRes.data || []).find((x) => x.req_id === log.req_id)
+        if (row?.output) {
+          resultDialog.content = row.output
+        } else if (log.status === 'pending') {
+          resultDialog.content =
+            '任务仍为 pending：agent 尚未回包。常见原因：bof 模块未就绪、注入的牺牲进程被 AV 杀掉、或仍在执行。可强制刷新历史记录。'
+        } else {
+          resultDialog.content = '无法加载日志，可能文件已被清理或尚未生成。'
+        }
+      } catch (_) {
+        resultDialog.content = '无法加载日志，可能文件已被清理或尚未生成。'
+      }
+    }
   } finally {
     resultDialog.loading = false
   }
@@ -400,6 +535,23 @@ onMounted(() => {
   font-size: 14px;
   font-weight: 700;
   color: var(--text-strong);
+}
+
+.header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.task-type-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.task-meta {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .search-input {

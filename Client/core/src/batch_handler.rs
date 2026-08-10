@@ -16,7 +16,7 @@ use tokio::time::{Duration, Instant};
 /// Optimized message handler with batch execution support
 ///
 /// Command dispatch is delegated to [`MessageHandler`] so product paths
-/// (module_stage, bof_exec → iso_host, inject, …) stay consistent.
+/// (module_stage, bof_exec, inject, …) stay consistent.
 /// The batch manager remains available for optional background plugin tasks.
 pub struct BatchMessageHandler {
     /// Transport layer (Option so we can lend it to MessageHandler for dispatch)
@@ -236,7 +236,7 @@ impl BatchMessageHandler {
         Ok(())
     }
 
-    /// Dispatch every command through MessageHandler (product path: iso_host BOF/.NET,
+    /// Dispatch every command through MessageHandler (product path: classic BOF,
     /// module_stage, inject, etc.).
     async fn handle_command_async(&mut self, wrapper: MessageWrapper) -> Result<()> {
         let transport = self.take_transport()?;

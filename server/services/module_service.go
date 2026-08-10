@@ -20,9 +20,38 @@ import (
 
 // Product L2 modules (independent packages, separate push).
 var productModuleIDs = map[string]bool{
-	"desktop":  true,
-	"iso_host": true,
-	"inject":   true,
+	"bof":    true, // L2 classic in-process COFF runner (Manual-Map, fileless)
+	"inject": true,
+	"ad":     true, // L2 AD sacrificial worker (docs/AD_MODULE_DESIGN.md)
+}
+
+// modulePlatforms declares which OSes each product module supports.
+// "windows" | "linux" (case-insensitive match against agent-reported os).
+// If absent or empty, treated as windows-only for safety (current product reality).
+var modulePlatforms = map[string][]string{
+	"ad":     {"windows"},
+	"inject": {"windows"},
+	"bof":    {"windows"},
+}
+
+// IsModuleSupportedOnOS reports whether module id may be used on the given agent OS.
+// Empty os falls back to conservative "windows-only" for product modules.
+func IsModuleSupportedOnOS(id, os string) bool {
+	id = sanitizeID(id)
+	plats, ok := modulePlatforms[id]
+	if !ok || len(plats) == 0 {
+		// Unknown product module: be conservative — assume windows (current design).
+		return strings.EqualFold(os, "windows")
+	}
+	if os == "" {
+		return false
+	}
+	for _, p := range plats {
+		if strings.EqualFold(p, os) {
+			return true
+		}
+	}
+	return false
 }
 
 var (
@@ -32,7 +61,7 @@ var (
 	ErrModuleNotFound = errors.New("module not found")
 )
 
-// IsProductModule reports whether id is one of the three product L2 modules.
+// IsProductModule reports whether id is a product L2 module (bof | inject | ad).
 func IsProductModule(id string) bool {
 	return productModuleIDs[sanitizeID(id)]
 }
@@ -61,11 +90,21 @@ type ModuleCatalogEntry struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Kind        string `json:"kind"` // host | runtime | legacy | custom
-	// LoadMode: product load path — mem (Manual-Map) | iso (iso_host) | legacy (LoadLibrary)
+	// LoadMode: product load path — mem (Manual-Map) | worker (sacrificial EXE) | legacy (LoadLibrary)
 	LoadMode string `json:"load_mode"`
 	Size     int    `json:"size"`
 	// LoadedOnAgent: when listing with ?uuid=, whether agent currently holds this module
 	LoadedOnAgent bool `json:"loaded_on_agent,omitempty"`
+	// SupportedOS: list of OS strings this module supports (e.g. ["windows"]). Empty means unknown (treated conservatively as windows-only for product modules).
+	SupportedOS []string `json:"supported_os,omitempty"`
+	// Capabilities: module-level feature flags for UI gating (模块能力).
+	// e.g. bof → ["bof"]; ad → ["ad_ops"]; inject → ["inject"].
+	Capabilities []string `json:"capabilities,omitempty"`
+	// Trust / maintain metadata for warehouse UI.
+	Version string `json:"version,omitempty"`
+	Signer  string `json:"signer,omitempty"`
+	SHA256  string `json:"sha256,omitempty"`
+	Signed  bool   `json:"signed"`
 }
 
 // ModuleService packs/serves L2 modules for Stage0 agents.
@@ -137,7 +176,7 @@ func (m *ModuleService) activeKey() []byte {
 }
 
 // RegisterRaw stores raw module PE on disk first, then memory (atomic-ish).
-// Product whitelist: desktop | iso_host | inject only.
+// Product whitelist: bof | inject | ad.
 // Non-goal: no "policy lock" — any admin may delete any product module.
 func (m *ModuleService) RegisterRaw(id string, pe []byte) error {
 	id = sanitizeID(id)
@@ -145,7 +184,7 @@ func (m *ModuleService) RegisterRaw(id string, pe []byte) error {
 		return fmt.Errorf("invalid module id or empty payload")
 	}
 	if !IsProductModule(id) {
-		return fmt.Errorf("%w: %s (product: desktop, iso_host, inject)", ErrModuleForbidden, id)
+		return fmt.Errorf("%w: %s (product: bof, inject, ad)", ErrModuleForbidden, id)
 	}
 	_ = os.MkdirAll(m.dir, 0o755)
 	final := filepath.Join(m.dir, id+".bin")
@@ -234,17 +273,23 @@ func (m *ModuleService) Delete(id string) error {
 
 func altNames(dir, id string) []string {
 	alts := []string{filepath.Join(dir, "cupcake_mod_"+id+".dll")}
-	if id == "iso_host" {
+	switch id {
+	case "bof":
+		// Neutral artifact name produced by build-bof-module.ps1 (v2).
+		alts = append(alts, filepath.Join(dir, "app_rt.dll"))
+	case "inject":
+		alts = append(alts, filepath.Join(dir, "cupcake-inject-worker.exe"))
+	case "ad":
 		alts = append(alts,
-			filepath.Join(dir, "cupcake-iso-host.exe"),
-			filepath.Join(dir, "iso_host.exe"),
+			filepath.Join(dir, "cupcake-ad-worker.exe"),
+			filepath.Join(dir, "ad.exe"),
 		)
 	}
 	return alts
 }
 
 // resolveRaw returns registered PE bytes for module id (memory then disk).
-// Always enforces product whitelist — legacy bof.bin on disk cannot be packed.
+// Always enforces product whitelist — stray blobs on disk cannot be packed.
 func (m *ModuleService) resolveRaw(id string) ([]byte, error) {
 	id = sanitizeID(id)
 	if !IsProductModule(id) {
@@ -350,9 +395,9 @@ func (m *ModuleService) PackBase64WithKey(id string, moduleHMACKey []byte) (stri
 	return base64.StdEncoding.EncodeToString(blob), nil
 }
 
-// List returns registered module ids.
+// List returns registered module ids (no OS filter — used for admin warehouse views).
 func (m *ModuleService) List() []string {
-	entries := m.ListCatalog("")
+	entries := m.ListCatalog("", "")
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, e.ID)
@@ -366,28 +411,88 @@ func ModuleDescribe(id string) (name, desc, kind string) {
 	return name, desc, kind
 }
 
-// ModuleDescribeEx also returns product load_mode: mem | iso | legacy.
+// ModuleDescribeEx also returns product load_mode: mem | worker | legacy.
 func ModuleDescribeEx(id string) (name, desc, kind, loadMode string) {
 	switch sanitizeID(id) {
-	case "iso_host":
-		return "隔离执行宿主",
-			"产品模块③：PPID 伪装短命进程内内存执行 BOF/.NET。载荷在插件库，本模块是宿主。",
-			"host", "iso"
+	case "bof":
+		return "BOF 执行器",
+			"产品模块③：Agent 进程内经典 BOF（Manual-Map 无文件加载，无新进程）。BOF 载荷在插件库，本模块是执行器。",
+			"runtime", "mem"
 	case "inject":
 		return "进程注入",
-			"产品模块②：L2 远程 shellcode 注入（method: nt|crt|apc|stomping|auto）。与 desktop/iso_host 独立推送。",
-			"runtime", "mem"
-	case "desktop":
-		return "远程桌面",
-			"产品模块①：RDP 3389 端口转发。加载后在「远程桌面」页启动转发；Yamux DESKTOP(0x0D)。",
-			"runtime", "mem"
+			"产品模块：L2 远程 shellcode 注入（method: nt|crt|apc|stomping|auto）。独立 sacrificial worker，与 bof 独立推送。.NET 已退役：程序集请先转 shellcode（如 Donut）再注入。",
+			"runtime", "worker"
+	case "ad":
+		return "Active Directory",
+			"产品模块：L2 域态势/Kerberos 等（独立 sacrificial worker PE；Stage0 不映射）。规格见 AD_MODULE_DESIGN。脚手架含 ping；烤票/DCSync 分阶段交付，未完成不得宣称 ad 模块完成。",
+			"host", "worker"
 	default:
-		return id, "非产品模块（已忽略；产品仅 desktop / iso_host / inject）。", "legacy", "mem"
+		return id, "非产品模块（已忽略；产品仅 bof / inject / ad）。", "legacy", "mem"
 	}
 }
 
+// ModuleCapabilities returns feature flags unlocked by a product L2 module (模块能力).
+// Distinct from plugin weapon_run (插件能力).
+func ModuleCapabilities(id string) []string {
+	switch sanitizeID(id) {
+	case "bof":
+		return []string{"bof"}
+	case "inject":
+		return []string{"inject"}
+	case "ad":
+		return []string{"ad_ops"}
+	default:
+		return nil
+	}
+}
+
+// ErrModuleRequired is returned when an agent lacks a required product L2 module.
+// Error text always starts with "module_required: <id>" for UI/MCP parsing.
+var ErrModuleRequired = errors.New("module_required")
+
+// ModuleRequiredError builds a clear gate error for missing L2 modules.
+func ModuleRequiredError(moduleID, reason string) error {
+	moduleID = sanitizeID(moduleID)
+	if reason == "" {
+		reason = fmt.Sprintf("load product module '%s' on agent first", moduleID)
+	}
+	return fmt.Errorf("%w: %s (%s)", ErrModuleRequired, moduleID, reason)
+}
+
+// IsModuleRequired reports whether err is a module capability gate failure.
+func IsModuleRequired(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrModuleRequired) {
+		return true
+	}
+	return strings.Contains(err.Error(), "module_required:")
+}
+
+// ModuleRequiredID extracts the module id from a module_required error (best-effort).
+func ModuleRequiredID(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	idx := strings.Index(msg, "module_required:")
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(msg[idx+len("module_required:"):])
+	for i, c := range rest {
+		if c == ' ' || c == '(' || c == '\n' || c == '\r' || c == ',' {
+			return sanitizeID(rest[:i])
+		}
+	}
+	return sanitizeID(rest)
+}
+
 // ListCatalog returns modules with descriptions; if agentUUID set, fills LoadedOnAgent.
-func (m *ModuleService) ListCatalog(agentUUID string) []ModuleCatalogEntry {
+// The agentOS (from agent SystemInfo, e.g. "windows" or "linux") is used to filter platform support.
+// Empty agentOS is treated conservatively (only modules that claim "multi" or empty would pass, which for our set means none).
+func (m *ModuleService) ListCatalog(agentUUID, agentOS string) []ModuleCatalogEntry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	seen := make(map[string]bool)
@@ -397,15 +502,34 @@ func (m *ModuleService) ListCatalog(agentUUID string) []ModuleCatalogEntry {
 		if id == "" || seen[id] || !IsProductModule(id) {
 			return
 		}
+		// Warehouse view (agentOS empty) lists all product modules; agent-scoped
+		// views filter by supported OS (empty os → conservative refuse, see push gate).
+		if agentOS != "" && !IsModuleSupportedOnOS(id, agentOS) {
+			return
+		}
 		seen[id] = true
 		name, desc, kind, loadMode := ModuleDescribeEx(id)
+		supported := modulePlatforms[id]
+		if supported == nil {
+			supported = []string{}
+		}
+		caps := ModuleCapabilities(id)
 		e := ModuleCatalogEntry{
-			ID:          id,
-			Name:        name,
-			Description: desc,
-			Kind:        kind,
-			LoadMode:    loadMode,
-			Size:        size,
+			ID:           id,
+			Name:         name,
+			Description:  desc,
+			Kind:         kind,
+			LoadMode:     loadMode,
+			Size:         size,
+			SupportedOS:  append([]string(nil), supported...),
+			Capabilities: append([]string(nil), caps...),
+		}
+		EnsureModuleTrustFromDisk(m.dir, id)
+		if meta, ok := getModuleTrust(id); ok {
+			e.Version = meta.Version
+			e.Signer = meta.Signer
+			e.SHA256 = meta.SHA256
+			e.Signed = strings.TrimSpace(meta.Signature) != ""
 		}
 		if agentUUID != "" {
 			if set := m.agentLoaded[agentUUID]; set != nil && set[id] {
@@ -475,6 +599,8 @@ func (m *ModuleService) AgentHasModule(agentUUID, moduleID string) bool {
 }
 
 // SetAgentModules replaces loaded set from agent module_list (comma-separated).
+// Agent list_loaded returns "id:mode" entries (e.g. "bof:mem,inject:worker");
+// strip the mode suffix so AgentHasModule("bof") keeps working after query.
 func (m *ModuleService) SetAgentModules(agentUUID, listCSV string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -483,6 +609,14 @@ func (m *ModuleService) SetAgentModules(agentUUID, listCSV string) {
 	}
 	set := make(map[string]bool)
 	for _, p := range strings.Split(listCSV, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// "bof:mem" / "inject:worker" → id only
+		if i := strings.IndexByte(p, ':'); i > 0 {
+			p = p[:i]
+		}
 		p = strings.TrimSpace(p)
 		if p != "" {
 			set[sanitizeID(p)] = true
@@ -528,10 +662,11 @@ func (m *ModuleService) scanDisk() {
 	}
 	// Well-known product module filenames
 	for _, pair := range []struct{ id, name string }{
-		{"iso_host", "cupcake-iso-host.exe"},
-		{"iso_host", "iso_host.exe"},
-		{"desktop", "cupcake_mod_desktop.dll"},
-		{"inject", "cupcake_mod_inject.dll"},
+		{"bof", "app_rt.dll"},
+		{"bof", "cupcake_mod_bof.dll"},
+		{"inject", "cupcake-inject-worker.exe"},
+		{"ad", "cupcake-ad-worker.exe"},
+		{"ad", "ad.exe"},
 	} {
 		if !IsProductModule(pair.id) {
 			continue
@@ -561,19 +696,13 @@ func (m *ModuleService) TryLoadDefaultRuntime(id string) error {
 	if ok {
 		return nil
 	}
-	candidates := []string{
-		filepath.Join(m.dir, id+".bin"),
-		filepath.Join(m.dir, "cupcake-iso-host.exe"),
-		filepath.Join(m.dir, "iso_host.exe"),
-		filepath.Join(m.dir, "cupcake_mod_"+id+".dll"),
-		filepath.Join(m.dir, "cupcake_mod_"+id+".so"),
-	}
+	candidates := append([]string{filepath.Join(m.dir, id+".bin")}, altNames(m.dir, id)...)
 	for _, p := range candidates {
 		if err := m.LoadFromFile(id, p); err == nil {
 			return nil
 		}
 	}
-	return fmt.Errorf("runtime module %q not in storage/modules (build cupcake-mod-%s and copy as %s.bin)", id, id, id)
+	return fmt.Errorf("runtime module %q not in storage/modules (build the artifact and copy it as %s.bin)", id, id)
 }
 
 func sanitizeID(id string) string {

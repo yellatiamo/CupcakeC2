@@ -9,16 +9,12 @@ use async_trait::async_trait;
 // 🛡️ Phase 3: Malleable C2 Profile — customizable HTTP headers/UA
 pub mod profile;
 
-// Yamux first-byte stream type tags (PTY/SOCKS/FS/PROCESS/DESKTOP/FILE) — not HTTP profiles
+// Yamux first-byte stream type tags (PTY/SOCKS/FS/PROCESS/FILE) — not HTTP profiles
 pub mod stream_types;
 pub use stream_types::{
-    YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FILE, YAMUX_STREAM_FS, YAMUX_STREAM_PROCESS,
-    YAMUX_STREAM_PTY, YAMUX_STREAM_RESERVED, YAMUX_STREAM_SOCKS, YAMUX_STREAM_TYPE_TABLE,
+    YAMUX_STREAM_FILE, YAMUX_STREAM_FS, YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY,
+    YAMUX_STREAM_RESERVED, YAMUX_STREAM_SOCKS, YAMUX_STREAM_TYPE_TABLE,
 };
-
-// RDP port-forward thin bridge (requires L2 desktop module when module-loader is on)
-#[cfg(feature = "module-loader")]
-pub mod desktop_bridge;
 
 // 🛡️ Phase 2: Message Fragmentation — split large payloads for DPI evasion
 pub mod fragment;

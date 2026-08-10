@@ -41,9 +41,9 @@
             <el-icon><Box /></el-icon>
             <span>模块</span>
           </el-menu-item>
-          <el-menu-item index="desktop">
-            <el-icon><Monitor /></el-icon>
-            <span>远程桌面</span>
+          <el-menu-item index="ad">
+            <el-icon><Connection /></el-icon>
+            <span>域渗透</span>
           </el-menu-item>
         </el-menu>
       </div>
@@ -86,7 +86,7 @@ const activeMenu = computed(() => {
   if (name === 'ClientProcesses') return 'processes'
   if (name === 'ClientPlugins') return 'plugins'
   if (name === 'ClientModules') return 'modules'
-  if (name === 'ClientDesktop') return 'desktop'
+  if (name === 'ClientAd') return 'ad'
   return 'terminals'
 })
 
@@ -98,7 +98,7 @@ const handleMenuSelect = (index) => {
     processes: 'ClientProcesses',
     plugins: 'ClientPlugins',
     modules: 'ClientModules',
-    desktop: 'ClientDesktop'
+    ad: 'ClientAd',
   }
   router.push({ name: routeMap[index], params: { id: clientId.value } })
 }
@@ -111,7 +111,7 @@ const getPageTitle = () => {
     ClientProcesses: '进程管理',
     ClientPlugins: '插件与工具',
     ClientModules: 'Stage0 模块',
-    ClientDesktop: '远程桌面'
+    ClientAd: '域渗透',
   }
   return titleMap[route.name] || '终端'
 }

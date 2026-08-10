@@ -65,6 +65,8 @@ func main() {
 	go services.RestoreTunnels()
 	services.StartAgentHealthMonitor(time.Duration(cfg.AgentStaleSecs) * time.Second)
 	store.StartTaskLogRetentionWorker(time.Hour)
+	services.RegisterMCPConfirmHooks()
+	services.StartMCPPendingJanitor()
 
 	gin.SetMode(gin.ReleaseMode)
 	adminRouter := gin.New()
@@ -115,6 +117,8 @@ func main() {
 	adminRouter.GET("/api/readyz", controllers.HandleReadyz)
 
 	adminRouter.Use(middleware.AuthMiddleware())
+	// MCP writes → panel confirmation queue (reads pass through).
+	adminRouter.Use(middleware.MCPConfirmGate())
 
 	// Public stager delivery (auth-exempt via AuthMiddleware; rate-limited + hit-capped)
 	stagerPublic := stagerguard.RateLimitMiddleware()
@@ -128,11 +132,21 @@ func main() {
 
 	api := adminRouter.Group("/api")
 	{
-		// --- viewer (any authenticated principal) ---
-		api.GET("/dashboard", controllers.GetDashboard)
-		api.GET("/clients", controllers.GetClients)
-		api.GET("/clients/history/:uuid", controllers.HandleGetAgentHistory)
-		api.GET("/resp", controllers.GetResponse)
+		// MCP pending confirmation (panel admin approve/deny; MCP polls GET by id)
+		mcpPending := api.Group("/mcp/pending")
+		{
+			mcpPending.GET("", middleware.RequirePanelAdmin(), controllers.HandleListMcpPending)
+			mcpPending.GET("/:id", controllers.HandleGetMcpPending) // panel admin or MCP poll
+			mcpPending.POST("/:id/approve", middleware.RequirePanelAdmin(), controllers.HandleApproveMcpPending)
+			mcpPending.POST("/:id/deny", middleware.RequirePanelAdmin(), controllers.HandleDenyMcpPending)
+		}
+
+			// --- viewer (any authenticated principal) ---
+			api.GET("/dashboard", controllers.GetDashboard)
+			api.GET("/clients", controllers.GetClients)
+			api.GET("/clients/history/:uuid", controllers.HandleGetAgentHistory)
+			api.GET("/history", controllers.HandleGetGlobalHistory) // global audit: ?source=&uuid=&limit=&type=
+			api.GET("/resp", controllers.GetResponse)
 		api.GET("/listeners", controllers.ListListeners)
 		api.GET("/tunnel", controllers.ListTunnels)
 		api.GET("/socks", controllers.ListSocks)
@@ -176,13 +190,9 @@ func main() {
 			processes.POST("/kill", middleware.RequireOperator(), controllers.KillProcess)
 		}
 
-		// --- operator: interactive shells / desktop control ---
+		// --- operator: interactive shells ---
 		api.GET("/shell/:uuid", middleware.RequireOperator(), controllers.HandleAdminShell)
 		api.GET("/pty/:uuid", middleware.RequireOperator(), controllers.StreamPTY)
-		// Remote desktop = RDP port-forward (agent → target:3389 via SOCKS yamux)
-		api.GET("/desktop/:uuid/status", controllers.DesktopStatus)
-		api.POST("/desktop/:uuid/start", middleware.RequireOperator(), controllers.StartDesktopRDP)
-		api.POST("/desktop/:uuid/stop", middleware.RequireOperator(), controllers.StopDesktopRDP)
 
 		plugins := api.Group("/plugins")
 		{
@@ -194,19 +204,39 @@ func main() {
 			plugins.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeletePlugin)
 		}
 
-		// L2 product modules: desktop | iso_host | inject
-		modules := api.Group("/modules")
-		{
-			// viewer: list + pack download
-			modules.GET("", controllers.HandleListModules)
-			modules.GET("/pack/:id", controllers.HandlePackModule)
-			// operator: query agent module state
-			modules.POST("/query", middleware.RequireOperator(), controllers.HandleQueryAgentModules)
-			// admin: upload / push / delete modules
-			modules.POST("/upload", middleware.RequireAdmin(), controllers.HandleUploadModule)
-			modules.POST("/push", middleware.RequireAdmin(), controllers.HandlePushModule)
-			modules.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeleteModule)
-		}
+// L2 product modules: bof | inject | ad
+			modules := api.Group("/modules")
+			{
+				// viewer: list + pack download
+				modules.GET("", controllers.HandleListModules)
+				modules.GET("/pack/:id", controllers.HandlePackModule)
+				// operator: query agent module state
+				modules.POST("/query", middleware.RequireOperator(), controllers.HandleQueryAgentModules)
+				// admin: upload / push / delete modules
+				modules.POST("/upload", middleware.RequireAdmin(), controllers.HandleUploadModule)
+modules.POST("/push", middleware.RequireAdmin(), controllers.HandlePushModule)
+					modules.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeleteModule)
+				}
+
+				// Unified capability matrix: 模块能力 (L2) vs 插件能力 (weapons)
+				api.GET("/capabilities", controllers.HandleCapabilities)
+
+				// L2 AD module: domain post-exploitation (docs/AD_MODULE_DESIGN.md)
+			ad := api.Group("/ad")
+			{
+				// viewer: capabilities + task list
+				ad.GET("/capabilities", controllers.HandleAdCapabilities)
+				ad.GET("/tasks", controllers.HandleAdListTasks)
+				ad.GET("/tasks/:id", controllers.HandleAdGetTask)
+				ad.GET("/tasks/:id/download", middleware.RequireOperator(), controllers.HandleAdDownloadTask)
+				ad.GET("/tasks/:id/graph", middleware.RequireOperator(), controllers.HandleAdTaskGraph)
+				// operator: dispatch AD commands
+				ad.POST("/exec", middleware.RequireOperator(), controllers.HandleAdExec)
+				ad.POST("/discover", middleware.RequireOperator(), controllers.HandleAdDiscover)
+				ad.POST("/ping", middleware.RequireOperator(), controllers.HandleAdPing)
+				// admin: delete tasks
+				ad.DELETE("/tasks/:id", middleware.RequireAdmin(), controllers.HandleAdDeleteTask)
+			}
 
 		api.GET("/build/logs/:task_id", controllers.HandleBuildLogsWS)
 
@@ -221,25 +251,26 @@ func main() {
 		// Light observability (admin-only; not public scrape)
 		api.GET("/metrics", middleware.RequireAdmin(), controllers.HandleMetrics)
 
-		settings := api.Group("/settings")
-		{
-			settings.Use(middleware.RequireAdmin())
-			settings.GET("/users", controllers.HandleGetUsers)
-			settings.POST("/users", controllers.HandleAddUser)
-			settings.PUT("/users/:id", controllers.HandleUpdateUser)
-			settings.DELETE("/users/:id", controllers.HandleDeleteUser)
-			settings.GET("/logs/login", controllers.HandleGetLoginLogs)
-			settings.GET("/logs/audit", controllers.HandleGetAuditLogs)
-			settings.GET("/audit", controllers.HandleGetAuditLogs) // alias
-			settings.GET("/config", controllers.HandleGetSettings)
-			settings.POST("/config", controllers.HandleUpdateSettings)
-			settings.GET("/webhooks", controllers.HandleGetWebhooks)
-			settings.POST("/webhooks", controllers.HandleSaveWebhook)
-			settings.DELETE("/webhooks/:id", controllers.HandleDeleteWebhook)
-			settings.GET("/mcp", controllers.HandleGetMCPSettings)
-			settings.PUT("/mcp", controllers.HandleUpdateMCPSettings)
-			settings.POST("/mcp/rotate-token", controllers.HandleRotateMCPToken)
-		}
+			settings := api.Group("/settings")
+			{
+				settings.Use(middleware.RequireAdmin())
+				settings.GET("/users", controllers.HandleGetUsers)
+				settings.POST("/users", controllers.HandleAddUser)
+				settings.PUT("/users/:id", controllers.HandleUpdateUser)
+				settings.DELETE("/users/:id", controllers.HandleDeleteUser)
+				// Login audit stream is panel-only (excludes MCP; MCP uses AuditLog separately)
+				settings.GET("/logs/login", controllers.HandleGetLoginLogs)
+				settings.GET("/logs/audit", controllers.HandleGetAuditLogs)
+				settings.GET("/audit", controllers.HandleGetAuditLogs) // alias
+				settings.GET("/config", controllers.HandleGetSettings)
+				settings.POST("/config", controllers.HandleUpdateSettings)
+				settings.GET("/webhooks", controllers.HandleGetWebhooks)
+				settings.POST("/webhooks", controllers.HandleSaveWebhook)
+				settings.DELETE("/webhooks/:id", controllers.HandleDeleteWebhook)
+				settings.GET("/mcp", controllers.HandleGetMCPSettings)
+				settings.PUT("/mcp", controllers.HandleUpdateMCPSettings)
+				settings.POST("/mcp/rotate-token", controllers.HandleRotateMCPToken)
+			}
 
 		api.POST("/agents/connect", middleware.RequireAdmin(), controllers.HandleConnectBindAgent)
 		// Payload generation / stager — admin (template rebuild, host keys)

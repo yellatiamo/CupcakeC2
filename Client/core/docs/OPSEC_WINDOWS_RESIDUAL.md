@@ -42,7 +42,7 @@ Version helpers live in `stealth/version.rs` (Layer A implementation, used by La
 
 Caches (arch-agnostic): module base (`ntdll`/`kernel32`/`kernelbase`), export `(base, hash)→VA`.
 
-Stack spoof: `stealth::stack::with_spoofed_stack` → **hard path on x64 Windows 10+ only** (return-address rewrite of *this image* frames via `RtlCaptureStackBackTrace` + synthetic RBP locals + ntdll gadgets). **Pre-Win10 (Win8.1 / Server 2012 R2 = 6.3) defaults to soft path** (stack noise only) — hard rewrite caused BEX64 / `StackHash` / `PCH_AB_FROM_ntdll` AVs under AppCompat. Override: `CUPCAKE_HARD_SPOOF=0|1`. RBP+8 rewrite requires validated frame pointer (omit-fp safe). **Not CET/shadow-stack proof.**
+Stack spoof: `stealth::stack::with_spoofed_stack` → **hard path on x64 Windows 10+ only** (return-address rewrite of *this image* frames via `RtlCaptureStackBackTrace` + synthetic RBP locals + ntdll gadgets). **Pre-Win10 (Win8.1 / Server 2012 R2 = 6.3) defaults to soft path** (stack noise only) — hard rewrite caused BEX64 / `StackHash` / `PCH_AB_FROM_ntdll` AVs under AppCompat. Override: `APP_STACK_POLICY=0|1`. RBP+8 rewrite requires validated frame pointer (omit-fp safe). **Not CET/shadow-stack proof.**
 
 ---
 
@@ -55,7 +55,7 @@ Stack spoof: `stealth::stack::with_spoofed_stack` → **hard path on x64 Windows
 | Network adapters | IP Helper `GetAdaptersAddresses` (PEB) — shell `ipconfig` not used |
 | Local users/groups | NetAPI `NetUserEnum` / `NetLocalGroupEnum` — shell `net user` not used |
 | Hybrid shell | Built-ins = API; external = direct spawn + pipes (**no cmd/powershell**) |
-| Interactive PTY stream (0x01) | **Default Mode A HybridSession** (cwd + line mode + stream pipes). Legacy cmd pipe: `CUPCAKE_PTY_MODE=cmd` |
+| Interactive PTY stream (0x01) | **Default Mode A HybridSession** (cwd + line mode + stream pipes). Legacy cmd pipe: `APP_PTY_MODE=cmd` |
 | Thread create (agent) | `NtCreateThreadEx` → CreateThread PEB |
 | Wait / close | `NtWaitForSingleObject` / `NtClose` → Wait/CloseHandle PEB |
 | ETW disable | `NtSetInformationProcess` syscall + spoof; fallback `EtwEventWrite` patch |
@@ -94,9 +94,9 @@ Stack spoof: `stealth::stack::with_spoofed_stack` → **hard path on x64 Windows
 
 ### P1 — Heavy-op pacing (default on)
 
-**Location:** `utils::opsec_heavy_pace*` — called before iso_host BOF/.NET, native_exec, module LoadLibrary.
+**Location:** `utils::opsec_heavy_pace*` — called before BOF (in-process mod_bof), native_exec, module load.
 
-- Default random 300–1200 ms between heavy jobs (env `CUPCAKE_OPSEC_PACE_MS`).
+- Default random 300–1200 ms between heavy jobs (env `APP_PACE_MS`).
 - Stage residual: INetCache `~DF*.dll` / `~DF*.tmp` (not `cpx_*` under %TEMP%).
 
 ### P1 — Sleep mask / heap walk (feature-gated)

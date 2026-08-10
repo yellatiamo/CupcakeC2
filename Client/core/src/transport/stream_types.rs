@@ -6,9 +6,6 @@
 //!
 //! Keep numeric values identical to `server/pkg/utils/stream_types.go`.
 //!
-//! Remote desktop: Yamux **DESKTOP (0x0D)** → L2 `desktop` module must be Loaded;
-//! Stage0 thin bridge dials agent-side RDP (default 127.0.0.1:3389).
-//!
 //! Binary file transfer: Yamux **FILE (0x0E)** — put/get with chunked raw bytes
 //! (see `crate::file_stream`). FS (0x03) remains list/read/rm JSON control.
 
@@ -20,9 +17,7 @@ pub const YAMUX_STREAM_SOCKS: u8 = 0x02;
 pub const YAMUX_STREAM_FS: u8 = 0x03;
 /// Process list / kill stream.
 pub const YAMUX_STREAM_PROCESS: u8 = 0x04;
-/// Remote desktop RDP port-forward (requires L2 `desktop` module).
-pub const YAMUX_STREAM_DESKTOP: u8 = 0x0D;
-/// Binary file transfer stream (put/get; not PROCESS 0x04, not DESKTOP 0x0D).
+/// Binary file transfer stream (put/get; not PROCESS 0x04).
 pub const YAMUX_STREAM_FILE: u8 = 0x0E;
 /// Reserved — reject / future extension; do not assign product streams.
 pub const YAMUX_STREAM_RESERVED: u8 = 0xFF;
@@ -33,7 +28,6 @@ pub const YAMUX_STREAM_TYPE_TABLE: &[(&str, u8)] = &[
     ("SOCKS", YAMUX_STREAM_SOCKS),
     ("FS", YAMUX_STREAM_FS),
     ("PROCESS", YAMUX_STREAM_PROCESS),
-    ("DESKTOP", YAMUX_STREAM_DESKTOP),
     ("FILE", YAMUX_STREAM_FILE),
     ("RESERVED", YAMUX_STREAM_RESERVED),
 ];
@@ -48,7 +42,6 @@ mod tests {
         assert_eq!(YAMUX_STREAM_SOCKS, 0x02);
         assert_eq!(YAMUX_STREAM_FS, 0x03);
         assert_eq!(YAMUX_STREAM_PROCESS, 0x04);
-        assert_eq!(YAMUX_STREAM_DESKTOP, 0x0D);
         assert_eq!(YAMUX_STREAM_FILE, 0x0E);
         assert_eq!(YAMUX_STREAM_RESERVED, 0xFF);
     }
@@ -63,7 +56,6 @@ mod tests {
         assert_eq!(map["SOCKS"], YAMUX_STREAM_SOCKS);
         assert_eq!(map["FS"], YAMUX_STREAM_FS);
         assert_eq!(map["PROCESS"], YAMUX_STREAM_PROCESS);
-        assert_eq!(map["DESKTOP"], YAMUX_STREAM_DESKTOP);
         assert_eq!(map["FILE"], YAMUX_STREAM_FILE);
         assert_eq!(map["RESERVED"], YAMUX_STREAM_RESERVED);
     }

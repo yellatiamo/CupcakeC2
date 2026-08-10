@@ -4,6 +4,105 @@
 
 ---
 
+## [Unreleased]
+
+### 模块体系 v2：进程内经典 BOF（bof | inject | ad）
+
+> 本节**推翻**下方「产品 BOF：回退隔离路径（iso_host）」的方向，恢复并落地进程内经典 BOF。
+
+- **iso_host 整体退役**：删除通用牺牲宿主；`bof` 成为产品模块——**Agent 进程内**经典 BOF（C 语言 COFF 动态加载，Manual-Map 无文件落地、无新进程），按需加载，Agent 落地不带 Beacon*/BOF 引擎特征。
+- **.NET 退役**：`execute_assembly` / `dotnet` 移除；程序集请转 shellcode（如 Donut）后走 `inject`。
+- **inject / ad 保持进程隔离**：各自独立的一次性牺牲 worker EXE（`cupcake-inject-worker` / `cupcake-ad-worker`），Job Object 生命周期不变。
+- 服务端：产品模块白名单 `bof|inject|ad`；`PluginRequiredModule` bof-exec→`bof`；`EnsureHeavyRuntimeModule` 对旧 id（dotnet/execute_assembly/iso_host）返回退役指引；能力门槛文案与 `module_required` 协议不变。
+- **免杀 P0**：模块引擎字符串抹除（日志 `max_level_off`、XOR 常量、`strip=symbols`）；模块 ABI 导出名中性化（`x0..x3`）+ 库名去品牌（`app_rt.dll`，消除导出表 `cupcake_mod_bof.dll`/`mod_*` 特征）；运行时环境变量统一 `APP_*` 前缀；Manual-Map 后 PE 头擦除。
+- **构建脚本**：`server/scripts/build-{bof,inject,ad}-module.ps1`；新增 `pe-strip-debug.py`（抹除 RSDS/PDB/POGO 等全部调试目录残留）并接入 `strings-gate.ps1`。
+- 面板：模块仓库 / 主机模块页 / 插件中心全部切换为 bof | inject | ad；iso_host 与 .NET 文案清零。
+
+### ~~产品 BOF：回退隔离路径（iso_host）~~（已被上节推翻）
+
+- ~~撤销「Stage0 进程内经典 BOF」实验：产品 `minimal` **不再**编入 `feature=bof`。~~
+- ~~`bof_exec` 恢复为 **`run_bof_isolated` + 推送/stage `iso_host`**（与 .NET 共用宿主）。~~
+- ~~服务端/面板：BOF 再次要求 `iso_host`；模块能力含 `bof`。~~
+
+### 客户端体积：删冗余
+
+- 产品 `minimal` **去掉 `mem-map`**：Stage0 不对 L2 Manual-Map（`pe_map` 仅可选 feature）。
+- 删除遗留 crate **`modules/bof` / `modules/dotnet`**（由 `iso_host` 宿主 PE 承担引擎）。
+- 拒绝 stage 旧 id `bof`/`dotnet`；清理误放的嵌套路径与构建垃圾文件。
+
+### iso_host BOF：PPID 管道句柄 + EDR/ghost 秒杀修复（WriteFile failed）
+
+- **现象**：`iso_host` 推送成功（仅缓存宿主 PE，非常驻进程），打 BOF 报 `[STDERR] isolated bof: WriteFile failed err=109`；`exit_code=0xC0000005`（ACCESS_VIOLATION）；防火墙提示「非常规方式执行程序」。
+- **根因 1**：`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` / `NtCreateProcessEx(ParentProcess=spoof)` 时，子进程从**伪装父进程**继承句柄，而非 Agent；Agent 本地 pipe 句柄无效 → 断管。
+- **根因 2**：默认优先 **process-ghost / NtCreateProcessEx 零盘拉起**，EDR 判定非常规执行并拦截/致宿主 AV 崩溃。
+- **修复**：
+  - `spawn.rs`：PPID CreateProcess 前将 stdin/stdout **DuplicateHandle 进伪装父进程**；ghost 路径将 pipe **注入子进程**。
+  - `isolated_exec.rs`：**默认关闭 ghost**（`CUPCAKE_GHOST_HOST=1` 才启用）；优先常规 temp + CreateProcess；WriteFile/秒退后 **自动 plain 重试**（无 PPID）；退出码格式化为 `0xC0000005 STATUS_ACCESS_VIOLATION`。
+- **宿主落盘策略**：BOF 体仍不落盘；仅 `iso_host` 宿主 EXE 短暂落盘。默认优先 **`%TEMP%` + `.exe`**，多路径回退；避免 `INetCache\~DF*.tmp`（易被 CreateProcess `err=5 ACCESS_DENIED`）。
+
+### MCP 写权限 + Web 面板确认
+
+- **默认只读**：`mcp_read_only=true` 时 MCP 仅可查询。
+- **凡增删改均需面板确认**：关闭只读后，MCP 的 POST/PUT/DELETE 一律进入 `mcp_pending_requests`；管理员在面板顶部「MCP 确认」批准后才下发。
+- **确认摘要写明用途**：含完整 Shell 命令原文、AD op/参数、目标 agent。
+- 控制面（settings/users/maintenance/generate）仍不对 MCP 开放。
+- API：`GET/POST /api/mcp/pending`（列表/详情/approve/deny）。
+- MCPClient：`ad_exec` / `ad_discover` / `ad_ping` / `push_module` / `wait_mcp_pending`；写操作自动轮询等待批准。
+
+---
+
+## [4.1.0] — 2026-08-09
+
+**BOF 预览版 — 模块体系 v2 重构**
+
+本版是一次**模块体系大版本重构**，在 4.0.0 的产品化基础上将模块系统从"实验性并行"推进到"三层分工明确"的架构。
+
+### 模块体系 v2：经典 BOF + 隔离 worker
+
+- **BOF 引擎产品化**：`iso_host` 退役，`bof` 转为 **Agent 进程内经典 BOF**（Manual-Map 无文件落地、无新进程、按需加载）。Agent 落地不带 Beacon\*/BOF 引擎特征。
+- **.NET 退役**：`execute_assembly` / `dotnet` 整体移除；程序集请转 shellcode（如 Donut）后走 `inject` 模块。
+- **Desktop 退役**：`desktop_worker` / `desktop_bridge` / `rdp_enable` 移除；远程桌面改由 L2 端口转发 + 独立路径。
+- **inject 保持进程隔离**：重构为纯 `main.rs` 入口，lib.rs 移除；一次性牺牲 worker EXE，Job Object 生命周期。
+- **AD 模块全新**（`modules/ad`）：取代旧 .NET CLR 路径，原生 Rust 实现，9 个源文件：
+  - Tier0 域发现 / LDAP 枚举 / 安全策略查询
+  - Kerberoast / AS-REP Roast 带 hashcat 格式输出
+  - 域图采集 / ACL 采集
+  - DCSync（`ad-dcsync` feature 门控，默认关闭）
+- **模块白名单**：服务端产品模块仅 `bof | inject | ad`；旧 id（dotnet/iso_host）返回退役指引。
+
+### 免杀 / OPSEC 加固
+
+- 模块引擎字符串抹除（`max_level_off`、XOR 常量、`strip=symbols`）
+- ABI 导出名中性化（`x0..x3`）、库名去品牌（`app_rt.dll`）
+- 运行时环境变量统一 `APP_*` 前缀
+- Manual-Map 后 PE 头擦除（`release_carrier_mapping` 清零 + NtUnmapViewOfSection）
+- 新增 `pe-strip-debug.py`（抹除 RSDS/PDB/POGO 全部调试目录残留）
+- 集成 `strings-gate.ps1` 构建门禁
+- 符号解析缓存 + 常见 DLL 兜底解析
+
+### 构建与部署
+
+- 构建脚本：`server/scripts/build-{bof,inject,ad}-module.ps1`
+- 产品 `minimal` 移除 `mem-map` 依赖（Stage0 不对 L2 Manual-Map）
+- 拒绝 stage 旧 id `bof`/`dotnet`；清理误放嵌套路径与构建垃圾文件
+
+### MCP 写权限 + 面板确认
+
+- 默认只读：`mcp_read_only=true` 时 MCP 仅可查询
+- 凡增删改均需面板确认：关闭只读后 MCP 写操作进入 `mcp_pending_requests` 队列，管理员批准后才下发
+- 确认摘要写明用途（含完整命令/参数/目标 agent）
+- API：`GET/POST /api/mcp/pending`（列表/详情/approve/deny）
+- MCPClient 新增：`ad_exec` / `ad_discover` / `ad_ping` / `push_module` / `wait_mcp_pending`
+
+### 服务器端重构
+
+- 模块控制器（`module_controller.go`）重构：产品 worker 注册路径
+- 插件服务（`plugin_service.go`）重构：SHA-256 部署校验 + 信任链
+- 客户端服务（`client_service.go`）重构：模块能力路由
+- 前端模块/插件/面板页面同步更新
+
+---
+
 ## [4.0.0] — 2026-08-05
 
 **对比基线：`v3.0.5`**

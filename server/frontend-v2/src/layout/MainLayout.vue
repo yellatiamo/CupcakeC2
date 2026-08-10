@@ -66,6 +66,18 @@
         </div>
 
         <div class="header-meta">
+          <button
+            v-if="isAdmin"
+            type="button"
+            class="header-chip header-chip--action"
+            :class="{ 'header-chip--alert': mcpPendingCount > 0 }"
+            @click="openMcpDrawer"
+            title="MCP 待确认"
+          >
+            <el-badge :value="mcpPendingCount" :hidden="mcpPendingCount === 0" :max="99">
+              <span>MCP 确认</span>
+            </el-badge>
+          </button>
           <div class="header-chip">
             <span class="chip-dot"></span>
             <span>控制平面在线</span>
@@ -103,6 +115,124 @@
         <el-button type="primary" @click="submitChangePassword" :loading="pwdDialog.loading">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- MCP 确认：待批准 + 历史留存（批准/拒绝/失败均不删除） -->
+    <el-drawer
+      v-model="mcpDrawer.visible"
+      title="MCP 操作确认与记录"
+      size="520px"
+      append-to-body
+      class="mcp-confirm-drawer"
+    >
+      <p class="mcp-drawer-tip">
+        任意 MCP 写操作都会先入库。待确认需批准后才下发；批准/拒绝/失败/超时的记录会永久留存在历史中（含 API 自动批准）。
+      </p>
+      <el-tabs v-model="mcpDrawer.tab" @tab-change="onMcpTabChange">
+        <el-tab-pane :label="`待确认 (${mcpPendingCount})`" name="pending" />
+        <el-tab-pane :label="`历史记录 (${mcpHistoryCount})`" name="history" />
+      </el-tabs>
+
+      <div v-if="mcpDrawer.loading" class="mcp-empty">加载中…</div>
+      <template v-else>
+        <div v-if="!mcpVisibleItems.length" class="mcp-empty">
+          {{ mcpDrawer.tab === 'pending' ? '暂无待确认请求' : '暂无历史记录' }}
+        </div>
+        <div
+          v-for="item in mcpVisibleItems"
+          :key="item.id"
+          class="mcp-card"
+          :data-risk="item.risk_level"
+          :data-status="item.status"
+          @click="openMcpDetail(item)"
+        >
+          <div class="mcp-card-head">
+            <el-tag size="small" :type="statusTagType(item.status)">{{ statusLabel(item.status) }}</el-tag>
+            <el-tag size="small" :type="riskTagType(item.risk_level)" effect="plain">{{ item.risk_level || 'high' }}</el-tag>
+            <span class="mcp-op">{{ item.op || item.path }}</span>
+            <span class="mcp-time">{{ formatMcpTime(item.created_at) }}</span>
+          </div>
+          <pre class="mcp-summary">{{ item.summary }}</pre>
+          <div class="mcp-meta">
+            <span>Agent: {{ item.agent_uuid || '—' }}</span>
+            <span>{{ item.method }} {{ item.path }}</span>
+            <span v-if="item.decided_by">处理人: {{ item.decided_by }} · {{ formatMcpTime(item.decided_at) }}</span>
+            <span v-if="resultPreview(item)" class="mcp-result">{{ resultPreview(item) }}</span>
+            <span v-if="item.error_code && item.status !== 'executed'" class="mcp-err">错误: {{ item.error_code }}</span>
+          </div>
+          <div class="mcp-actions" @click.stop>
+            <el-button size="small" link type="primary" @click="openMcpDetail(item)">详情</el-button>
+            <template v-if="item.status === 'pending'">
+              <el-button size="small" type="danger" plain :loading="mcpDrawer.busyId === item.id" @click="denyMcp(item)">拒绝</el-button>
+              <el-button size="small" type="primary" :loading="mcpDrawer.busyId === item.id" @click="approveMcp(item)">批准执行</el-button>
+            </template>
+          </div>
+        </div>
+      </template>
+    </el-drawer>
+
+    <!-- MCP 执行详情：命令 + Agent 回显 -->
+    <el-dialog
+      v-model="mcpDetail.visible"
+      title="MCP 执行详情"
+      width="640px"
+      append-to-body
+      class="mcp-detail-dialog"
+      destroy-on-close
+    >
+      <template v-if="mcpDetail.item">
+        <div class="mcp-detail-row">
+          <span class="mcp-detail-label">状态</span>
+          <el-tag size="small" :type="statusTagType(mcpDetail.item.status)">{{ statusLabel(mcpDetail.item.status) }}</el-tag>
+          <el-tag size="small" effect="plain">{{ mcpDetail.item.risk_level }}</el-tag>
+        </div>
+        <div class="mcp-detail-row">
+          <span class="mcp-detail-label">操作</span>
+          <code>{{ mcpDetail.item.op || mcpDetail.item.path }}</code>
+        </div>
+        <div class="mcp-detail-row">
+          <span class="mcp-detail-label">Agent</span>
+          <code>{{ mcpDetail.item.agent_uuid || '—' }}</code>
+        </div>
+        <div class="mcp-detail-row">
+          <span class="mcp-detail-label">时间</span>
+          <span>{{ formatMcpTime(mcpDetail.item.created_at) }}
+            <template v-if="mcpDetail.item.decided_by"> → {{ mcpDetail.item.decided_by }} @ {{ formatMcpTime(mcpDetail.item.decided_at) }}</template>
+          </span>
+        </div>
+        <div class="mcp-detail-block">
+          <div class="mcp-detail-label">用途说明</div>
+          <pre class="mcp-detail-pre">{{ mcpDetail.item.summary }}</pre>
+        </div>
+        <div v-if="mcpDetail.parsed?.purpose || mcpDetail.purpose" class="mcp-detail-block">
+          <div class="mcp-detail-label">模型填写的用途</div>
+          <pre class="mcp-detail-pre">{{ mcpDetail.parsed?.purpose || mcpDetail.purpose }}</pre>
+        </div>
+        <div v-if="mcpDetail.parsed?.command || mcpDetail.parsed?.input" class="mcp-detail-block">
+          <div class="mcp-detail-label">执行的命令</div>
+          <pre class="mcp-detail-pre mcp-detail-cmd">{{ mcpDetail.parsed.command || mcpDetail.parsed.input }}</pre>
+        </div>
+        <div v-if="mcpDetail.parsed?.op" class="mcp-detail-block">
+          <div class="mcp-detail-label">AD 操作 / 参数</div>
+          <pre class="mcp-detail-pre">op={{ mcpDetail.parsed.op }}
+params={{ formatJson(mcpDetail.parsed.params) }}</pre>
+        </div>
+        <div class="mcp-detail-block">
+          <div class="mcp-detail-label">Agent 回显 / 结果</div>
+          <pre class="mcp-detail-pre mcp-detail-out">{{ detailOutputText }}</pre>
+        </div>
+        <div v-if="mcpDetail.item.body_json" class="mcp-detail-block">
+          <div class="mcp-detail-label">原始请求 Body</div>
+          <pre class="mcp-detail-pre mcp-detail-muted">{{ prettyJson(mcpDetail.item.body_json) }}</pre>
+        </div>
+        <div v-if="mcpDetail.item.result_body" class="mcp-detail-block">
+          <div class="mcp-detail-label">原始结果 JSON</div>
+          <pre class="mcp-detail-pre mcp-detail-muted">{{ prettyJson(mcpDetail.item.result_body) }}</pre>
+        </div>
+      </template>
+      <template #footer>
+        <el-button @click="mcpDetail.visible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -124,11 +254,299 @@ import {
   Share,
   SwitchButton
 } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import api from '../api/index'
 
 const route = useRoute()
 const router = useRouter()
+
+const isAdmin = computed(() => {
+  try {
+    const role = (JSON.parse(localStorage.getItem('cupcake_user') || '{}').role || '').toLowerCase()
+    return role === 'admin' || role === 'administrator' || role === 'break-glass-admin'
+  } catch {
+    return false
+  }
+})
+
+const mcpPendingCount = ref(0)
+const mcpHistoryCount = ref(0)
+const mcpDrawer = reactive({
+  visible: false,
+  tab: 'pending',
+  loading: false,
+  pendingItems: [],
+  historyItems: [],
+  busyId: '',
+  knownIds: new Set()
+})
+const mcpDetail = reactive({ visible: false, item: null, parsed: null })
+let mcpPollTimer = null
+
+const mcpVisibleItems = computed(() =>
+  mcpDrawer.tab === 'pending' ? mcpDrawer.pendingItems : mcpDrawer.historyItems
+)
+
+const detailOutputText = computed(() => {
+  const p = mcpDetail.parsed || {}
+  if (p.output != null && String(p.output).trim() !== '') return String(p.output)
+  if (p.summary_json) {
+    try {
+      return typeof p.summary_json === 'string'
+        ? JSON.stringify(JSON.parse(p.summary_json), null, 2)
+        : JSON.stringify(p.summary_json, null, 2)
+    } catch {
+      return String(p.summary_json)
+    }
+  }
+  if (p.note) return String(p.note)
+  if (p.error_code) return `error_code: ${p.error_code}`
+  if (mcpDetail.item?.result_body) {
+    try {
+      const j = JSON.parse(mcpDetail.item.result_body)
+      if (j.output) return j.output
+      return JSON.stringify(j, null, 2)
+    } catch {
+      return mcpDetail.item.result_body
+    }
+  }
+  return '（无回显数据 — 可能仍在执行中，或仅记录了下发状态）'
+})
+
+const riskTagType = (r) => {
+  if (r === 'critical') return 'danger'
+  if (r === 'high') return 'warning'
+  if (r === 'medium') return 'info'
+  return 'success'
+}
+
+const statusTagType = (s) => {
+  if (s === 'pending') return 'warning'
+  if (s === 'executed') return 'success'
+  if (s === 'denied') return 'info'
+  if (s === 'failed' || s === 'expired') return 'danger'
+  return ''
+}
+
+const statusLabel = (s) => {
+  const map = {
+    pending: '待确认',
+    approved: '已批准',
+    executed: '已执行',
+    denied: '已拒绝',
+    failed: '执行失败',
+    expired: '已超时'
+  }
+  return map[s] || s || '—'
+}
+
+const formatMcpTime = (t) => {
+  if (!t) return ''
+  try {
+    return new Date(t).toLocaleString()
+  } catch {
+    return String(t)
+  }
+}
+
+const truncateText = (s, n) => {
+  if (!s) return ''
+  const t = String(s)
+  return t.length > n ? t.slice(0, n) + '…' : t
+}
+
+const parseResultBody = (raw) => {
+  if (!raw) return {}
+  try {
+    return typeof raw === 'string' ? JSON.parse(raw) : raw
+  } catch {
+    return { output: String(raw) }
+  }
+}
+
+const resultPreview = (item) => {
+  const p = parseResultBody(item?.result_body)
+  if (p.command || p.input) {
+    const out = (p.output || '').trim()
+    if (out) return `回显: ${truncateText(out.replace(/\s+/g, ' '), 100)}`
+    if (p.completed === false) return '已下发，等待回显…'
+    return `命令: ${truncateText(p.command || p.input, 60)}`
+  }
+  if (p.summary_json) {
+    const s = typeof p.summary_json === 'string' ? p.summary_json : JSON.stringify(p.summary_json)
+    return `结果: ${truncateText(s, 100)}`
+  }
+  if (p.dispatched && !p.output) return '结果: 已下发 (无回显字段)'
+  if (item?.result_body) return `结果: ${truncateText(item.result_body, 100)}`
+  return ''
+}
+
+const prettyJson = (raw) => {
+  if (!raw) return ''
+  try {
+    const o = typeof raw === 'string' ? JSON.parse(raw) : raw
+    return JSON.stringify(o, null, 2)
+  } catch {
+    return String(raw)
+  }
+}
+
+const formatJson = (v) => {
+  if (v == null) return '{}'
+  if (typeof v === 'string') {
+    try {
+      return JSON.stringify(JSON.parse(v), null, 2)
+    } catch {
+      return v
+    }
+  }
+  try {
+    return JSON.stringify(v, null, 2)
+  } catch {
+    return String(v)
+  }
+}
+
+const openMcpDetail = (item) => {
+  mcpDetail.item = item
+  mcpDetail.parsed = parseResultBody(item?.result_body)
+  mcpDetail.purpose = ''
+  // Enrich command / purpose from request body snapshot
+  try {
+    const body = parseResultBody(item?.body_json)
+    if (!mcpDetail.parsed.command && !mcpDetail.parsed.input) {
+      if (body.cmd) mcpDetail.parsed.command = body.cmd
+      if (body.command) mcpDetail.parsed.command = body.command
+    }
+    if (!mcpDetail.parsed.purpose) {
+      mcpDetail.parsed.purpose = body.purpose || body.reason || body.usage || ''
+    }
+    mcpDetail.purpose = mcpDetail.parsed.purpose || ''
+    if (body.op) mcpDetail.parsed.op = body.op
+    if (body.params) mcpDetail.parsed.params = body.params
+  } catch { /* ignore */ }
+  // Fallback: parse "用途:" line from summary
+  if (!mcpDetail.parsed.purpose && item?.summary) {
+    const m = String(item.summary).match(/用途[：:]\s*(.+?)(?:\n命令|\n|$)/s)
+    if (m) mcpDetail.parsed.purpose = m[1].trim()
+  }
+  mcpDetail.visible = true
+}
+
+const loadMcpHistory = async () => {
+  try {
+    // no status filter → all records (API keeps executed/denied/failed permanently)
+    const { data } = await api.get('/api/mcp/pending', { params: {} })
+    const all = data.items || []
+    mcpDrawer.historyItems = all.filter((x) => x.status !== 'pending')
+    mcpHistoryCount.value = mcpDrawer.historyItems.length
+    // also refresh pending count if present
+    if (typeof data.pending_count === 'number') {
+      mcpPendingCount.value = data.pending_count
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+const pollMcpPending = async () => {
+  if (!isAdmin.value) return
+  try {
+    const { data } = await api.get('/api/mcp/pending', { params: { status: 'pending' } })
+    const items = data.items || []
+    mcpPendingCount.value = data.pending_count ?? items.length
+    mcpDrawer.pendingItems = items
+    for (const it of items) {
+      if (!mcpDrawer.knownIds.has(it.id)) {
+        mcpDrawer.knownIds.add(it.id)
+        ElNotification({
+          title: 'MCP 待确认',
+          message: (it.summary || it.op || it.path || '新的写操作').slice(0, 160),
+          type: 'warning',
+          duration: 12000,
+          onClick: () => {
+            mcpDrawer.tab = 'pending'
+            openMcpDrawer()
+          }
+        })
+      }
+    }
+  } catch {
+    /* ignore for non-admin / offline */
+  }
+}
+
+const onMcpTabChange = async (name) => {
+  if (name === 'history') {
+    mcpDrawer.loading = true
+    await loadMcpHistory()
+    mcpDrawer.loading = false
+  } else {
+    await pollMcpPending()
+  }
+}
+
+const openMcpDrawer = async () => {
+  mcpDrawer.visible = true
+  mcpDrawer.loading = true
+  try {
+    await Promise.all([pollMcpPending(), loadMcpHistory()])
+    // 有待确认优先展示待确认，否则展示历史（避免“自动批准后以为没记录”）
+    if (mcpPendingCount.value === 0 && mcpHistoryCount.value > 0) {
+      mcpDrawer.tab = 'history'
+    } else {
+      mcpDrawer.tab = 'pending'
+    }
+  } finally {
+    mcpDrawer.loading = false
+  }
+}
+
+const approveMcp = async (item) => {
+  try {
+    await ElMessageBox.confirm(
+      `确认批准并执行此 MCP 操作？\n\n${item.summary || item.path}`,
+      '批准 MCP 命令',
+      { type: 'warning', confirmButtonText: '批准执行', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  mcpDrawer.busyId = item.id
+  try {
+    const body = {}
+    if (item.op === 'dcsync' || (item.path || '').includes('dcsync')) {
+      // Panel can fill confirm contract on approve if needed later
+      body.confirm = true
+    }
+    const { data } = await api.post(`/api/mcp/pending/${item.id}/approve`, body)
+    if (data.status === 'executed' || data.item?.status === 'executed') {
+      ElMessage.success('已批准并执行')
+    } else {
+      ElMessage.warning(data.error || data.item?.error_code || '执行完成（请检查结果）')
+    }
+    await Promise.all([pollMcpPending(), loadMcpHistory()])
+    mcpDrawer.tab = 'history'
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.error || e.message || '批准失败')
+  } finally {
+    mcpDrawer.busyId = ''
+  }
+}
+
+const denyMcp = async (item) => {
+  mcpDrawer.busyId = item.id
+  try {
+    await api.post(`/api/mcp/pending/${item.id}/deny`)
+    ElMessage.info('已拒绝（记录已写入历史）')
+    await Promise.all([pollMcpPending(), loadMcpHistory()])
+    mcpDrawer.tab = 'history'
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.error || e.message || '拒绝失败')
+  } finally {
+    mcpDrawer.busyId = ''
+  }
+}
 
 const allMenuItems = [
   { path: '/dashboard', label: '仪表盘', icon: Odometer },
@@ -137,7 +555,9 @@ const allMenuItems = [
   { path: '/tunnels', label: '隧道', icon: Share },
   { path: '/generator', label: '生成器', icon: Lightning, adminOnly: true },
   { path: '/modules', label: '模块', icon: Box },
-  { path: '/domain', label: '插件', icon: Connection },
+  { path: '/ad', label: '域渗透模块', icon: Share },
+  { path: '/plugins', label: '插件', icon: Connection },
+  { path: '/history', label: '历史记录', icon: Clock },
   { path: '/settings', label: '设置', icon: Setting, adminOnly: true }
 ]
 
@@ -148,7 +568,10 @@ const titleDisplayNames = {
   Tunnels: '隧道',
   Generator: '生成器',
   Modules: '模块',
+  AD: '域渗透模块',
+  AdCenter: '域渗透模块',
   Plugins: '插件',
+  History: '历史记录',
   Settings: '设置',
   'Client Detail': '主机详情'
 }
@@ -164,10 +587,16 @@ const titleDescriptions = {
   '隧道': '内置 SOCKS5 及端口转发通道的建立、状态与数据桥接。',
   Generator: '跨平台 Shell & Stager 载荷构建、定制模板与能力参数配置。',
   '生成器': '跨平台 Shell & Stager 载荷构建、定制模板与能力参数配置。',
-  Modules: 'L2 模块仓库：desktop / iso_host / inject 三件套，分模块推送。',
-  '模块': 'L2 模块仓库：desktop / iso_host / inject 三件套，分模块推送。',
+  Modules: 'L2 模块仓库：bof / inject / ad，分模块推送。',
+  '模块': 'L2 模块仓库：bof / inject / ad，分模块推送。',
+  AD: '域渗透工具模块 ad 的上传、登记、推送与加载状态管理。',
+  AdCenter: '域渗透工具模块 ad 的上传、登记、推送与加载状态管理。',
+  '域渗透': '域渗透工具模块 ad 的上传、登记、推送与加载状态管理。',
+  '域渗透模块': '域渗透工具模块 ad 的上传、登记、推送与加载状态管理。',
   Plugins: '扩展功能模块集中注入、内存载荷加载与平台兼容插件管理。',
   '插件': '扩展功能模块集中注入、内存载荷加载与平台兼容插件管理。',
+  History: '插件 / 模块 / Shell / AD 执行审计：来源、操作者、输入输出与 req_id 全量可追溯。',
+  '历史记录': '插件 / 模块 / Shell / AD 执行审计：来源、操作者、输入输出与 req_id 全量可追溯。',
   Settings: '多角色操作员鉴权配置、系统审计日志与控制平面安全设置。',
   '设置': '多角色操作员鉴权配置、系统审计日志与控制平面安全设置。',
   'Client Detail': '特定受控端点的详细信息、命令行终端交互、文件管理与高级交互。',
@@ -177,7 +606,6 @@ const titleDescriptions = {
 const userData = JSON.parse(localStorage.getItem('cupcake_user') || '{}')
 const username = ref(userData.username || 'Operator')
 const userRole = (userData.role || 'operator').toLowerCase()
-const isAdmin = computed(() => userRole === 'admin' || userRole === 'administrator')
 const menuItems = computed(() =>
   allMenuItems.filter((m) => !m.adminOnly || isAdmin.value)
 )
@@ -269,11 +697,18 @@ onMounted(() => {
   syncClock()
   clockTimer = window.setInterval(syncClock, 1000)
   window.addEventListener('resize', handleResize)
+  if (isAdmin.value) {
+    pollMcpPending()
+    mcpPollTimer = window.setInterval(pollMcpPending, 5000)
+  }
 })
 
 onBeforeUnmount(() => {
   if (clockTimer) {
     window.clearInterval(clockTimer)
+  }
+  if (mcpPollTimer) {
+    window.clearInterval(mcpPollTimer)
   }
   window.removeEventListener('resize', handleResize)
 })
@@ -693,5 +1128,151 @@ onBeforeUnmount(() => {
   .header-title {
     font-size: 34px;
   }
+}
+
+.header-chip--action {
+  cursor: pointer;
+  border: none;
+  font: inherit;
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.04));
+}
+.header-chip--alert {
+  color: #b45309;
+  box-shadow: 0 0 0 1px rgba(180, 83, 9, 0.35);
+}
+.mcp-drawer-tip {
+  font-size: 13px;
+  color: var(--text-muted, #666);
+  margin: 0 0 16px;
+  line-height: 1.5;
+}
+.mcp-empty {
+  text-align: center;
+  color: #999;
+  padding: 40px 0;
+}
+.mcp-card {
+  border: 1px solid var(--line-soft, #e5e5e5);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  background: var(--bg-card, #fff);
+  cursor: pointer;
+  transition: box-shadow 0.15s ease;
+}
+.mcp-card:hover {
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+}
+.mcp-detail-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+.mcp-detail-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+  min-width: 72px;
+}
+.mcp-detail-block {
+  margin: 14px 0;
+}
+.mcp-detail-pre {
+  margin: 6px 0 0;
+  padding: 10px 12px;
+  background: #0f172a0a;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+}
+.mcp-detail-cmd {
+  background: #1e293b;
+  color: #e2e8f0;
+  font-family: ui-monospace, 'JetBrains Mono', Consolas, monospace;
+}
+.mcp-detail-out {
+  background: #052e16;
+  color: #bbf7d0;
+  font-family: ui-monospace, 'JetBrains Mono', Consolas, monospace;
+  max-height: 320px;
+}
+.mcp-detail-muted {
+  max-height: 160px;
+  opacity: 0.85;
+  font-size: 11px;
+}
+.mcp-card[data-risk='critical'] {
+  border-color: #fca5a5;
+  background: #fff7f7;
+}
+.mcp-card[data-risk='high'] {
+  border-color: #fcd34d;
+  background: #fffbeb;
+}
+.mcp-card[data-status='executed'] {
+  border-color: #86efac;
+  background: #f0fdf4;
+}
+.mcp-card[data-status='denied'] {
+  border-color: #cbd5e1;
+  background: #f8fafc;
+}
+.mcp-card[data-status='failed'],
+.mcp-card[data-status='expired'] {
+  border-color: #fca5a5;
+  background: #fef2f2;
+}
+.mcp-result {
+  color: #166534;
+  word-break: break-all;
+}
+.mcp-err {
+  color: #b91c1c;
+}
+.mcp-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.mcp-op {
+  font-weight: 600;
+  flex: 1;
+  font-size: 13px;
+}
+.mcp-time {
+  font-size: 11px;
+  color: #999;
+}
+.mcp-summary {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 0 0 8px;
+  max-height: 200px;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.03);
+  padding: 8px;
+  border-radius: 6px;
+}
+.mcp-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 10px;
+}
+.mcp-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 </style>

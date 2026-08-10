@@ -127,7 +127,7 @@
               <span class="section-index">02b</span>
               <div>
                 <strong>客户端类型</strong>
-                <p>仅两种方向：反向（回连）与正向（bind）。能力相同：终端/文件/进程内置；BOF/.NET 按需模块。</p>
+                <p>仅两种方向：反向（回连）与正向（bind）。能力相同：终端/文件/进程内置；BOF/inject 按需模块。</p>
               </div>
             </div>
 
@@ -155,8 +155,8 @@
               :closable="false"
               show-icon
               :title="form.profile === 'forward'
-                ? '正向：与反向同能力（~0.8MB 内置终端/文件/进程）。须选 正向TCP；生成后面板「正向接入」。BOF/.NET 走模块。'
-                : '反向：与正向同能力（~0.8MB 内置终端/文件/进程）。须选 TCP/WS/DNS。BOF/.NET 走模块。'"
+                ? '正向：与反向同能力（~0.8MB 内置终端/文件/进程）。须选 正向TCP；生成后面板「正向接入」。BOF/inject 走模块。'
+                : '反向：与正向同能力（~0.8MB 内置终端/文件/进程）。须选 TCP/WS/DNS。BOF/inject 走模块。'"
               class="profile-alert"
             />
 
@@ -246,7 +246,7 @@
               show-icon
               class="stager-alert"
               title="内存上线 ≠ BOF"
-              description="此处将 Stage0 Agent 打成 shellcode 在目标内存执行（上线本身）。上线后的 BOF/.NET 是另一步，走 iso_host。杀软对注入极敏感，实验室优先。"
+              description="此处将 Stage0 Agent 打成 shellcode 在目标内存执行（上线本身）。上线后的 BOF 走 bof 模块（进程内）、shellcode 注入走 inject。杀软对注入极敏感，实验室优先。"
             />
             <div v-if="stagerMeta.panel_host || stagerMeta.callback" class="stager-meta">
               <div class="stager-meta__row">
@@ -714,7 +714,7 @@ const previewUrl = computed(() => {
 
 const modeDescription = computed(() => (
   form.value.mode === 'build'
-    ? '源码构建：唯一产品档 minimal（shell/fs/pty/socks 内置；BOF/.NET/desktop/inject 按需 L2 模块）。'
+    ? '源码构建：唯一产品档 minimal（shell/fs/pty/socks 内置；BOF/inject 按需 L2 模块）。'
     : '模板补丁：秒级生成；模板均为 minimal。'
 ))
 
@@ -725,7 +725,7 @@ const profileLabel = computed(() => {
 
 const profileDescription = computed(() => {
   const same =
-    '能力与另一方向完全一致：终端/文件/进程内置（约 0.8MB）；BOF、.NET 按需加载模块，不进默认包。'
+    '能力与另一方向完全一致：终端/文件/进程内置（约 0.8MB）；BOF、inject 按需加载模块，不进默认包。'
   if (form.value.profile === 'forward') {
     return `正向客户端：目标机监听，面板主动接入。${same} 须选 正向TCP 监听器。`
   }

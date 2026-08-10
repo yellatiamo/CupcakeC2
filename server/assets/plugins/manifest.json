@@ -8,5 +8,16 @@
     "category": "general",
     "required_os": "windows",
     "params": null
+  },
+  {
+    "id": "PL-1786084217",
+    "name": "dir.x64",
+    "description": "dir",
+    "file_name": "dir.x64.o",
+    "type": "bof-exec",
+    "category": "general",
+    "required_os": "windows",
+    "hash": "55af23237b3cc1cda8d014ae71408a6eb73342d4e6c78f94e97c9f0a9747b0ed",
+    "params": null
   }
 ]

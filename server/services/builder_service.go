@@ -53,7 +53,7 @@ type PayloadConfig struct {
 	Jitter            int    `json:"jitter"`
 	// Profile is connection *direction* for UI (reverse/forward), NOT a cargo capability tier.
 	// Stage0 cargo features are always **minimal** (sole product aggregate).
-	// Heavy caps: L2 modules (desktop / inject / iso_host).
+	// Heavy caps: L2 modules (bof / inject / ad).
 	Profile string `json:"profile"`
 }
 
@@ -346,7 +346,7 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	}
 
 	// Sole product cargo tier: always minimal (ignore legacy standard/full/beacon names).
-	// shell/fs/proc/pty/socks built-in; BOF/.NET → iso_host L2; RDP → desktop L2.
+	// shell/fs/proc/pty/socks built-in; BOF → bof L2 (in-process); inject/ad L2 workers; .NET retired.
 	// conf.Profile remains reverse/forward direction for UI only.
 	capProfile := "minimal"
 	if p := strings.ToLower(strings.TrimSpace(conf.Profile)); p != "" {
@@ -361,7 +361,7 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	if logChan != nil {
 		logChan <- "[Builder] Cargo profile: minimal (sole product tier)"
 		if isBind {
-			logChan <- "[Builder] 正向客户端 — tcp_bind + minimal（BOF/.NET/desktop 按需 L2 模块）"
+			logChan <- "[Builder] 正向客户端 — tcp_bind + minimal（BOF/.NET 按需 L2 模块）"
 		} else {
 			logChan <- "[Builder] 反向客户端 — minimal（终端/文件/进程/socks 内置；重能力 L2）"
 		}

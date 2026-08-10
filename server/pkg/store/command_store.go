@@ -17,12 +17,23 @@ import (
 const TaskLogRetentionDaysDefault = 7
 
 func CreateCommandLog(agentUUID, reqID, cmdType, input string) error {
+	return CreateCommandLogWithSource(agentUUID, reqID, cmdType, input, "panel", "")
+}
+
+// CreateCommandLogWithSource creates a command log entry and tags the auditable source/created_by.
+// source should be "panel" | "mcp" | "internal"; createdBy is the acting principal (username or "mcp").
+func CreateCommandLogWithSource(agentUUID, reqID, cmdType, input, source, createdBy string) error {
+	if source == "" {
+		source = "panel"
+	}
 	logEntry := model.CommandLog{
 		AgentUUID: agentUUID,
 		ReqID:     reqID,
 		Type:      cmdType,
 		Input:     input,
 		Status:    "pending",
+		Source:    source,
+		CreatedBy: createdBy,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
@@ -45,9 +56,20 @@ func UpdateCommandOutput(reqID, stdout, stderr string) error {
 	os.MkdirAll(logDir, 0755)
 	_ = os.WriteFile(logPath, []byte(output), 0644)
 
+	// stderr-only or stderr with empty/whitespace stdout → failed (UI can show red)
+	status := "completed"
+	if strings.TrimSpace(stderr) != "" && strings.TrimSpace(stdout) == "" {
+		status = "failed"
+	} else if strings.Contains(strings.ToLower(stderr), "writefile failed") ||
+		strings.Contains(strings.ToLower(stderr), "isolated bof:") ||
+		strings.Contains(strings.ToLower(stderr), "host runtime missing") ||
+		strings.Contains(strings.ToLower(stderr), "module_required:") {
+		status = "failed"
+	}
+
 	return DB.Model(&model.CommandLog{}).Where("req_id = ?", reqID).Updates(map[string]interface{}{
 		"output":     output,
-		"status":     "completed",
+		"status":     status,
 		"updated_at": time.Now(),
 	}).Error
 }
@@ -56,6 +78,41 @@ func GetCommandHistory(agentUUID string) ([]model.CommandLog, error) {
 	var logs []model.CommandLog
 	err := DB.Where("agent_uuid = ?", agentUUID).Order("created_at desc").Find(&logs).Error
 	return logs, err
+}
+
+// GetCommandHistoryFiltered returns command logs for an agent (or all agents if agentUUID=="").
+// sourceFilter: "" or "all" → no filter; "panel" | "mcp" | "internal" → exact match on Source.
+// limit <=0 means default 100 (cap 500).
+func GetCommandHistoryFiltered(agentUUID, sourceFilter string, limit int) ([]model.CommandLog, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	q := DB.Order("created_at desc").Limit(limit)
+	if agentUUID != "" {
+		q = q.Where("agent_uuid = ?", agentUUID)
+	}
+	sf := strings.TrimSpace(sourceFilter)
+	if sf != "" && !strings.EqualFold(sf, "all") {
+		q = q.Where("source = ?", sf)
+	}
+	var logs []model.CommandLog
+	if err := q.Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	return logs, nil
+}
+
+// GetCommandLogByReqID returns a single command log by request id.
+func GetCommandLogByReqID(reqID string) (*model.CommandLog, error) {
+	var logEntry model.CommandLog
+	err := DB.Where("req_id = ?", reqID).First(&logEntry).Error
+	if err != nil {
+		return nil, err
+	}
+	return &logEntry, nil
 }
 
 // TaskLogRetentionDays resolves retention period from env or default.

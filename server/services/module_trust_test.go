@@ -18,7 +18,7 @@ func TestVerifyModulePackageOK(t *testing.T) {
 	payload := []byte("MZ-module-pe")
 	sha := ModuleFileSHA256(payload)
 	meta := &ModulePackageMeta{
-		ID:      "desktop",
+		ID:      "inject",
 		Version: "1.0.0",
 		SHA256:  sha,
 		Signer:  "test-key-1",
@@ -56,7 +56,7 @@ func TestVerifyModulePackageEmptyFailsClosed(t *testing.T) {
 	t.Setenv("CUPCAKE_ALLOW_UNSIGNED_MODULE", "")
 	t.Setenv("CUPCAKE_TRUST_REQUIRE_SIG", "")
 	ResetModuleRollbackForTest()
-	err := VerifyModulePackage("desktop", "1.0.0", "aa", "", "s")
+	err := VerifyModulePackage("inject", "1.0.0", "aa", "", "s")
 	if err == nil {
 		t.Fatal("empty sig must fail")
 	}
@@ -66,20 +66,20 @@ func TestVerifyModulePackageRollback(t *testing.T) {
 	t.Setenv("CUPCAKE_TRUST_HMAC_KEY", "module-trust-test-key!!")
 	ResetModuleRollbackForTest()
 
-	sha := ModuleFileSHA256([]byte("iso"))
+	sha := ModuleFileSHA256([]byte("img"))
 	sign := func(ver string) (sig string) {
 		meta := &ModulePackageMeta{
-			ID: "iso_host", Version: ver, SHA256: sha, Signer: "k",
+			ID: "bof", Version: ver, SHA256: sha, Signer: "k",
 		}
 		if err := SignModulePackage(meta); err != nil {
 			t.Fatal(err)
 		}
 		return meta.Signature
 	}
-	if err := VerifyModulePackage("iso_host", "1.2.0", sha, sign("1.2.0"), "k"); err != nil {
+	if err := VerifyModulePackage("bof", "1.2.0", sha, sign("1.2.0"), "k"); err != nil {
 		t.Fatal(err)
 	}
-	err := VerifyModulePackage("iso_host", "1.1.0", sha, sign("1.1.0"), "k")
+	err := VerifyModulePackage("bof", "1.1.0", sha, sign("1.1.0"), "k")
 	if err == nil || !strings.Contains(err.Error(), "rollback") {
 		t.Fatalf("expected rollback, got %v", err)
 	}
@@ -92,29 +92,29 @@ func TestRegisterRawWithTrustAndBeforePush(t *testing.T) {
 
 	dir := t.TempDir()
 	ms := NewModuleServiceForTest(dir)
-	pe := []byte("MZ\x00\x00fake-desktop-module")
+	pe := []byte("MZ\x00\x00fake-inject-module")
 	meta := ModulePackageMeta{Version: "1.0.0", Signer: "test-key-1"}
-	signed, err := ms.RegisterRawWithTrust("desktop", pe, meta)
+	signed, err := ms.RegisterRawWithTrust("inject", pe, meta)
 	if err != nil {
 		t.Fatalf("RegisterRawWithTrust: %v", err)
 	}
 	if signed.Signature == "" {
 		t.Fatal("expected non-empty signature after upload")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "desktop.trust.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "inject.trust.json")); err != nil {
 		t.Fatalf("trust sidecar missing: %v", err)
 	}
-	if err := ms.VerifyModuleBeforePush("desktop"); err != nil {
+	if err := ms.VerifyModuleBeforePush("inject"); err != nil {
 		t.Fatalf("VerifyModuleBeforePush: %v", err)
 	}
 	// Tamper trust signature on disk/memory
-	stored, ok := getModuleTrust("desktop")
+	stored, ok := getModuleTrust("inject")
 	if !ok {
 		t.Fatal("trust meta missing")
 	}
 	stored.Signature = strings.Repeat("ff", 32)
 	_ = StoreModuleTrust(dir, stored)
-	err = ms.VerifyModuleBeforePush("desktop")
+	err = ms.VerifyModuleBeforePush("inject")
 	if err == nil {
 		t.Fatal("tampered signature must fail before push")
 	}
@@ -159,22 +159,22 @@ func TestEnsureModuleSignedOnDiskMissingSidecar(t *testing.T) {
 
 	dir := t.TempDir()
 	ms := NewModuleServiceForTest(dir)
-	pe := []byte("MZ\x00\x00orphan-desktop")
-	if err := ms.RegisterRaw("desktop", pe); err != nil {
+	pe := []byte("MZ\x00\x00orphan-inject")
+	if err := ms.RegisterRaw("inject", pe); err != nil {
 		t.Fatal(err)
 	}
 	// No trust.json yet
-	if _, err := os.Stat(filepath.Join(dir, "desktop.trust.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "inject.trust.json")); err == nil {
 		t.Fatal("unexpected trust file before ensure")
 	}
-	meta, err := ms.EnsureModuleSignedOnDisk("desktop", pe)
+	meta, err := ms.EnsureModuleSignedOnDisk("inject", pe)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if meta.Signature == "" {
 		t.Fatal("expected signature")
 	}
-	if err := ms.VerifyModuleBeforePush("desktop"); err != nil {
+	if err := ms.VerifyModuleBeforePush("inject"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -183,7 +183,7 @@ func TestVerifyModuleTrustAlias(t *testing.T) {
 	t.Setenv("CUPCAKE_TRUST_HMAC_KEY", "module-trust-test-key!!")
 	ResetModuleRollbackForTest()
 	sha := ModuleFileSHA256([]byte("x"))
-	meta := &ModulePackageMeta{ID: "desktop", Version: "3", SHA256: sha, Signer: "s"}
+	meta := &ModulePackageMeta{ID: "inject", Version: "3", SHA256: sha, Signer: "s"}
 	if err := SignModulePackage(meta); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestModuleSignUsesRealTrustchain(t *testing.T) {
 	ResetModuleRollbackForTest()
 	key := trustchain.HMACKeyForSigner("s")
 	pm := trustchain.PackageMeta{
-		ModuleID: "desktop",
+		ModuleID: "inject",
 		Version:  "1.0.0",
 		SHA256:   ModuleFileSHA256([]byte("p")),
 		Signer:   "s",

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode/utf16"
 
 	"github.com/google/uuid"
 
@@ -26,6 +27,25 @@ var (
 	manifestLoaded bool
 	pluginCache    = make(map[string][]byte)
 )
+
+// packBofArgsWide encodes an operator argument string as a CS-style datap blob:
+// [big-endian u32 byte-length][UTF-16LE payload, wide-NUL terminated].
+// BOFs such as dir.x64 cast the BeaconDataExtract result directly to wchar_t*,
+// so the blob must carry UTF-16 (the Cobalt Strike wide-arg convention). An
+// empty argument string yields an empty buffer so the BOF keeps its defaults.
+func packBofArgsWide(args string) []byte {
+	if args == "" {
+		return nil
+	}
+	units := utf16.Encode([]rune(args))
+	units = append(units, 0) // wide NUL terminator
+	buf := make([]byte, 4+len(units)*2)
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(units)*2))
+	for i, u := range units {
+		binary.LittleEndian.PutUint16(buf[4+i*2:], u)
+	}
+	return buf
+}
 
 // DetectPluginExecType infers deploy type from file bytes (and optional filename).
 // Returns: native-exec | execute-assembly | bof-exec
@@ -141,6 +161,47 @@ type PluginMetadata struct {
 	ABIVersion int    `json:"abi_version,omitempty"`
 	Target     string `json:"target,omitempty"`
 	Params     []interface{} `json:"params"`
+	// RequiredModule is derived at list/run time (not always persisted):
+	// bof-exec → "bof"; native-exec → ""; execute-assembly retired (no module).
+	RequiredModule string `json:"required_module,omitempty"`
+	// Capabilities: plugin-level flags (插件能力), e.g. ["weapon_run","bof"].
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+// PluginRequiredModule returns the L2 product module needed to run a plugin type.
+// BOF needs module "bof"; .NET is retired (convert to shellcode + inject);
+// native PE tools run without L2 modules.
+func PluginRequiredModule(pluginType string) string {
+	switch strings.ToLower(strings.TrimSpace(pluginType)) {
+	case "bof-exec", "bof":
+		return "bof"
+	default:
+		return ""
+	}
+}
+
+// PluginCapabilities returns plugin-level capability flags (插件能力).
+func PluginCapabilities(pluginType string) []string {
+	t := strings.ToLower(strings.TrimSpace(pluginType))
+	caps := []string{"weapon_run"}
+	switch t {
+	case "bof-exec", "bof":
+		caps = append(caps, "bof")
+	case "execute-assembly", "dotnet", "execute_assembly":
+		caps = append(caps, "dotnet")
+	case "native-exec", "native-pe", "native", "pe-exec", "exe":
+		caps = append(caps, "native_pe")
+	}
+	return caps
+}
+
+// EnrichPluginCapabilities fills RequiredModule / Capabilities for API responses.
+func EnrichPluginCapabilities(p *PluginMetadata) {
+	if p == nil {
+		return
+	}
+	p.RequiredModule = PluginRequiredModule(p.Type)
+	p.Capabilities = PluginCapabilities(p.Type)
 }
 
 // pluginRollback is process-wide anti-rollback for signed plugins.
@@ -154,6 +215,14 @@ func GetTrustKey(signer string) []byte {
 func allowUnsignedPlugin() bool {
 	return os.Getenv("CUPCAKE_ALLOW_UNSIGNED_PLUGIN") == "1" ||
 		os.Getenv("CUPCAKE_TRUST_REQUIRE_SIG") == "0"
+}
+
+// hasAnyPluginTrustKey reports whether signing key material is configured for the default signer.
+// When no key is configured at all (pure lab/dev), we allow unsigned plugins with a warning
+// instead of hard-failing every plugin deploy. If a key *is* configured, unsigned plugins are
+// refused unless the explicit allow env is also set.
+func hasAnyPluginTrustKey() bool {
+	return len(GetTrustKey("default")) > 0 || len(GetTrustKey("")) > 0
 }
 
 // VerifyPluginTrust runs hash integrity then package signature + anti-rollback.
@@ -175,6 +244,12 @@ func VerifyPluginTrust(meta *PluginMetadata, fileBytes []byte) error {
 	if sig == "" {
 		if allowUnsignedPlugin() {
 			log.Printf("[plugin] warning: unsigned plugin allowed via env for %s", meta.ID)
+			return nil
+		}
+		// Pure lab / no trust key configured at all: be permissive (matches module upload behavior).
+		// If someone configured a CUPCAKE_TRUST_HMAC_KEY, we require either a signature or the explicit allow.
+		if !hasAnyPluginTrustKey() {
+			log.Printf("[plugin] warning: no trust key configured — allowing unsigned plugin %s (lab mode)", meta.ID)
 			return nil
 		}
 		return fmt.Errorf("plugin signature missing: refuse deploy (set CUPCAKE_ALLOW_UNSIGNED_PLUGIN=1 or CUPCAKE_TRUST_REQUIRE_SIG=0 for lab)")
@@ -334,6 +409,17 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 		}
 	}
 
+	// Platform gate for plugins: if manifest declares required_os (windows/linux), enforce it.
+	if meta != nil {
+		req := strings.ToLower(strings.TrimSpace(meta.RequiredOS))
+		agentOS := strings.ToLower(strings.TrimSpace(client.OS))
+		if req != "" && req != "multi" && req != "any" && req != "all" {
+			if !strings.Contains(agentOS, req) && !strings.Contains(req, agentOS) {
+				return "", fmt.Errorf("plugin %s requires os %q but agent is %q", pluginID, meta.RequiredOS, client.OS)
+			}
+		}
+	}
+
 	if meta == nil {
 		return "", fmt.Errorf("plugin %s not found", pluginID)
 	}
@@ -370,17 +456,19 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 		log.Printf("[Plugin] type auto-detect: manifest=%q → content=%q for %s", meta.Type, pType, meta.FileName)
 	}
 
-	// 3b. BOF/.NET 隔离宿主；原生 PE 不需要 iso_host（自身即进程）
-	switch pType {
-	case "bof-exec", "bof":
-		if err := EnsureHeavyRuntimeModule(agentID, "bof"); err != nil {
-			log.Printf("[Plugin] ensure L2 module bof for %s: %v (will still try deploy)", agentID, err)
+		// 3b. 插件能力 gate：BOF 依赖模块能力 bof；原生 PE 不需要（.NET 已退役）。
+		// 先尝试 stage；失败则硬拦截并返回可解析的 module_required 错误给 UI。
+		if reqMod := PluginRequiredModule(pType); reqMod != "" {
+			if err := EnsureHeavyRuntimeModule(agentID, reqMod); err != nil {
+				log.Printf("[Plugin] ensure L2 module %s for %s: %v", reqMod, agentID, err)
+				return "", ModuleRequiredError(reqMod,
+					fmt.Sprintf("插件类型 %s 需要模块能力 %s：请先在「模块」页推送，或检查仓库是否已登记（%v）", pType, reqMod, err))
+			}
+			if !GetModuleService().AgentHasModule(agentID, reqMod) {
+				return "", ModuleRequiredError(reqMod,
+					fmt.Sprintf("插件类型 %s 需要已加载的 %s 模块", pType, reqMod))
+			}
 		}
-	case "execute-assembly", "dotnet", "execute_assembly":
-		if err := EnsureHeavyRuntimeModule(agentID, "dotnet"); err != nil {
-			log.Printf("[Plugin] ensure L2 module dotnet for %s: %v (will still try deploy)", agentID, err)
-		}
-	}
 
 	// 4. 载荷：每次完整下发
 	cmdType := "shell"
@@ -389,12 +477,11 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 
 	switch pType {
 	case "execute-assembly", "dotnet", "execute_assembly":
-		// .NET 程序集 → 隔离宿主 CLR
-		cmdType = "execute_assembly"
-		content = args
+		// .NET 执行已退役：程序集请转 shellcode（如 Donut）后走 inject 模块
+		return "", fmt.Errorf(".NET 执行已退役：请将程序集转为 shellcode（如 Donut）后通过 inject 模块注入")
 	case "bof-exec", "bof":
 		cmdType = "bof_exec"
-		content = base64.StdEncoding.EncodeToString([]byte(args))
+		content = base64.StdEncoding.EncodeToString(packBofArgsWide(args))
 	case "native-exec", "native-pe", "native", "pe-exec", "exe":
 		// fscan 等原生 PE：PPID 伪装短命进程 + 参数，短时落盘后删除（非注入）
 		cmdType = "native_exec"
@@ -404,7 +491,7 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 	default:
 		// 误配时不要静默变成 shell + 裸参数（会变成 spawn '-h'）
 		return "", fmt.Errorf(
-			"unknown plugin type %q — use native-exec (fscan 等原生 exe)、execute-assembly (.NET)、bof-exec (BOF)",
+			"unknown plugin type %q — use native-exec (fscan 等原生 exe)、bof-exec (BOF)；.NET 已退役（转 shellcode 走 inject）",
 			meta.Type,
 		)
 	}
@@ -434,13 +521,27 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 		return "", err
 	}
 
-	// Do NOT auto-unload iso_host after a fixed timer.
-	// Old 3s unload raced with long BOF/CLR jobs and concurrent plugins
-	// ("iso_host PE missing" mid-flight). Host process itself burns the
-	// temp PE on exit; staged PE in agent memory is reusable until operator
-	// unloads or agent dies. Optional explicit unload: module_unload iso_host.
+	// Do NOT auto-unload the bof module after a fixed timer.
+	// Old 3s unload raced with long jobs and concurrent plugins (module missing
+	// mid-flight). The mapped image stays resident until the operator sends
+	// module_unload bof or the agent exits.
 
-	_ = store.CreateCommandLog(agentID, reqID, meta.Name, fmt.Sprintf("Args: %s", args))
+	_ = store.CreateCommandLogWithSource(agentID, reqID, meta.Name, fmt.Sprintf("Args: %s", args), "panel", "")
+	return reqID, nil
+}
+
+// DeployPluginMCP is the MCP entry point wrapper that tags source=mcp for full audit.
+func DeployPluginMCP(agentID string, pluginID string, args string) (string, error) {
+	reqID, err := DeployPlugin(agentID, pluginID, args)
+	if err != nil {
+		return "", err
+	}
+	// Re-tag last log entry best-effort (or we could have passed source down; keep simple by updating after create).
+	// Since the inner Create already wrote "panel", overwrite source for this reqID.
+_ = store.DB.Model(&struct{ ReqID string }{ReqID: reqID}).
+			Table("command_logs").
+			Where("req_id = ?", reqID).
+			Updates(map[string]interface{}{"source": "mcp", "created_by": "mcp"}).Error
 	return reqID, nil
 }
 

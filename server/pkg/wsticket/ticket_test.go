@@ -100,6 +100,7 @@ func TestValidPurpose(t *testing.T) {
 	if !ValidPurpose("pty") || !ValidPurpose("SHELL") || !ValidPurpose(" build_logs ") {
 		t.Fatal("expected known purposes valid")
 	}
+
 	if ValidPurpose("foo") || ValidPurpose("") {
 		t.Fatal("expected unknown purposes invalid")
 	}

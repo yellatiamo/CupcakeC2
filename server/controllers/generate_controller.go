@@ -152,7 +152,7 @@ func cargoProfile(product string) string {
 
 // profileBuildHint returns operator-facing notes for logs / errors.
 func profileBuildHint(profile string) string {
-	const caps = "唯一产品档 minimal：终端/文件/进程/socks 内置；BOF/.NET/desktop/inject 按需 L2"
+	const caps = "唯一产品档 minimal：终端/文件/进程/socks 内置；BOF/.NET/inject 按需 L2"
 	switch normalizeCapabilityProfile(profile) {
 	case "forward":
 		return "正向客户端：Agent 监听 bind 端口，面板主动接入。" + caps
@@ -676,7 +676,7 @@ func HandleGetStager(c *gin.Context) {
 				"「内联」是把 P/Invoke 整段塞进命令体，不依赖 loader 路由，命令最长但无二次请求。",
 				"Stage2 URL 约 10 分钟有效，过期请点刷新重新生成。",
 				"cupcake-stager 需事先放到目标目录；签名更响，仅实验室。",
-				"内存上线 ≠ BOF；上线后的 BOF 走 iso_host。",
+				"内存上线 ≠ BOF；上线后的 BOF 走 bof 模块（进程内执行）。",
 			},
 		})
 		return

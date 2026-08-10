@@ -8,6 +8,10 @@ import { request } from '@/api'
 const props = defineProps({
     socket: Object, 
     clientId: String,
+    sessionId: {
+        type: String,
+        default: ''
+    },
     allowPTY: {
         type: Boolean,
         default: false
@@ -303,7 +307,7 @@ const initPTY = async () => {
     term.writeln('\r\n\x1b[31m[!] Failed to mint PTY upgrade ticket (login required).\x1b[0m')
     return
   }
-  const wsUrl = `${protocol}://${window.location.host}/api/pty/${props.clientId}?ticket=${encodeURIComponent(ticket)}`
+  const wsUrl = `${protocol}://${window.location.host}/api/pty/${props.clientId}?session=${encodeURIComponent(props.sessionId || '')}&ticket=${encodeURIComponent(ticket)}`
 
   ptySocket = new WebSocket(wsUrl)
   ptySocket.binaryType = 'arraybuffer'

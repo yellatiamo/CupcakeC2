@@ -86,19 +86,21 @@ func InitDB() {
 		log.Printf("[DB] warning: pragma apply: %v", err)
 	}
 
-	// Auto Migrate
-	err = DB.AutoMigrate(
-		&model.Agent{},
-		&model.CommandLog{},
-		&model.Listener{},
-		&model.User{},
-		&model.Session{},
-		&model.LoginLog{},
-		&model.AuditLog{},
-		&model.GlobalSetting{},
-		&model.NotificationWebhook{},
-		&model.Tunnel{},
-	)
+// Auto Migrate
+		err = DB.AutoMigrate(
+			&model.Agent{},
+			&model.CommandLog{},
+			&model.AdTask{},
+			&model.McpPendingRequest{},
+			&model.Listener{},
+			&model.User{},
+			&model.Session{},
+			&model.LoginLog{},
+			&model.AuditLog{},
+			&model.GlobalSetting{},
+			&model.NotificationWebhook{},
+			&model.Tunnel{},
+		)
 	if err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
@@ -127,7 +129,9 @@ func initDefaultAdmin() {
 	}
 	ensureSetting("system_mcp_enabled", "false", "mcp")
 	ensureSetting("mcp_allowed_cidrs", "127.0.0.1/32,::1/128", "mcp")
+	// Default: MCP may only query. Writes require mcp_read_only=false AND panel confirmation.
 	ensureSetting("mcp_read_only", "true", "mcp")
+	ensureSetting("mcp_confirm_timeout_sec", "180", "mcp")
 }
 
 func ensureSetting(key, value, group string) {

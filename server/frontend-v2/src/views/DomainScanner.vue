@@ -2,8 +2,12 @@
   <div class="view-shell plugin-shell">
     <section class="view-actions view-actions--between">
       <div class="view-actions__copy">
-        <span class="panel-kicker">Plugin Center</span>
+        <span class="panel-kicker">插件能力 · Plugin Center</span>
         <h3>插件管理</h3>
+        <p class="hint-line">
+          武器库载荷（BOF / shellcode / 原生 PE）。与<strong>模块能力</strong>（bof / inject / ad）分离：
+          BOF 执行需目标已加载 <code>bof</code> 模块（Agent 进程内无文件运行）。
+        </p>
       </div>
 
       <el-button type="primary" class="upload-btn" @click="showUploadDialog = true">
@@ -11,6 +15,14 @@
         添加插件
       </el-button>
     </section>
+
+    <el-alert
+      type="info"
+      show-icon
+      :closable="false"
+      class="cap-banner"
+      title="插件能力 ≠ 模块能力：本页管理武器插件；L2 模块请在「模块」页维护与推送。"
+    />
 
     <section class="stat-grid">
       <article class="surface-card stat-card">
@@ -79,11 +91,20 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="交互机制" width="200" align="center">
+        <el-table-column label="交互机制" width="180" align="center">
           <template #default="{ row }">
             <div class="type-capsule" :class="getTypeTag(row.type)">
               {{ translateType(row.type) }}
             </div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="依赖模块" width="120" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="pluginNeedsModule(row)" size="small" type="warning" effect="plain">
+              bof
+            </el-tag>
+            <span v-else class="desc-text">无（原生 PE）</span>
           </template>
         </el-table-column>
 
@@ -119,7 +140,7 @@
           <el-form-item label="执行方式">
             <el-input model-value="自动识别（按文件内容）" disabled />
             <div class="field-hint">
-              原生 PE（fscan 等）→ native-exec；.NET DLL/EXE → execute-assembly；COFF/BOF → bof-exec
+              原生 PE（fscan 等）→ native-exec；COFF/BOF → bof-exec；.NET 已退役（转 shellcode 走 inject）
             </div>
           </el-form-item>
         </div>
@@ -146,7 +167,7 @@
           >
             <el-icon class="up-icon"><UploadFilled /></el-icon>
             <div class="up-text">点击或拖拽插件文件到这里</div>
-            <div class="up-hint">支持 .exe / .dll（原生或 .NET）/ .o（BOF），类型自动识别</div>
+            <div class="up-hint">支持 .exe / .dll（原生）/ .o（BOF），类型自动识别；.NET 已退役：请转 shellcode 走 inject</div>
           </el-upload>
         </el-form-item>
       </el-form>
@@ -198,9 +219,22 @@ const platformCount = computed(() => {
 const memoryPayloadCount = computed(() => {
   return plugins.value.filter((plugin) => {
     const type = String(plugin.type || '').toLowerCase()
-    return type.includes('mem') || type.includes('shellcode')
+    return (
+      type.includes('mem') ||
+      type.includes('shellcode') ||
+      type.includes('bof') ||
+      type.includes('assembly') ||
+      type.includes('dotnet')
+    )
   }).length
 })
+
+const pluginNeedsModule = (row) => {
+  if (!row) return false
+  if (row.required_module === 'bof') return true
+  const t = String(row.type || '').toLowerCase()
+  return t.includes('bof')
+}
 
 const resetUploadForm = () => {
   uploadForm.value = {
@@ -304,7 +338,7 @@ const getTypeTag = (type) => {
 
 const translateType = (type) => {
   const map = {
-    'execute-assembly': '.NET 内存执行',
+    'execute-assembly': '.NET 内存执行（已退役）',
     'memfd-exec': 'Linux memfd 执行',
     'shellcode-inject': 'Shellcode 注入',
     'native-exec': '原生 PE（隔离进程）',
@@ -332,6 +366,15 @@ onMounted(fetchPlugins)
 </script>
 
 <style scoped>
+.hint-line {
+  margin: 6px 0 0;
+  font-size: 13px;
+  opacity: 0.72;
+  line-height: 1.45;
+  max-width: 640px;
+}
+.hint-line code { font-size: 12px; }
+.cap-banner { margin-bottom: 14px; }
 .plugin-management-container {
   padding: 0;
 }

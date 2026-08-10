@@ -80,7 +80,7 @@ impl ObjectAttributes {
 
 /// Primary: `indirect_syscall` (x64 gadget / x86 D/Invoke).
 /// Secondary: force PEB-resolved ntdll call if primary returns our "unresolved" marker.
-unsafe fn invoke_nt(name: &[u8], args: &[usize]) -> i32 {
+pub(crate) unsafe fn invoke_nt(name: &[u8], args: &[usize]) -> i32 {
     let hash = stealth::hash_api_name(name);
     let status = crate::syscalls::indirect_syscall(hash, args);
 
@@ -533,7 +533,7 @@ fn terminate_process_inner(pid: u32) -> Result<(), String> {
         }
         // Fall through to Win32 with a fresh handle
         crate::utils::db_print(&format!(
-            "[Cupcake] NtTerminateProcess 0x{:08X}, trying Win32",
+            "[agent] NtTerminateProcess 0x{:08X}, trying Win32",
             status as u32
         ));
     }

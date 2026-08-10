@@ -43,6 +43,11 @@ if not API_TOKEN:
     logging.error("C2_API_TOKEN is required. Rotate it from /api/settings/mcp/rotate-token and export it before starting MCP.")
     sys.exit(1)
 REQUEST_TIMEOUT = int(os.environ.get("C2_TIMEOUT", "30"))
+# 写操作默认进面板确认队列；自动轮询等待批准（秒）
+CONFIRM_POLL_SEC = float(os.environ.get("C2_CONFIRM_POLL_SEC", "3"))
+CONFIRM_WAIT_SEC = float(os.environ.get("C2_CONFIRM_WAIT_SEC", "180"))
+# 是否在收到 pending_confirmation 后自动轮询直到结束（默认 true）
+CONFIRM_AUTO_WAIT = os.environ.get("C2_CONFIRM_AUTO_WAIT", "1") not in ("0", "false", "False")
 
 # 自定义规则配置文件路径 (可选)
 GUARD_CONFIG_PATH = os.environ.get(
@@ -74,10 +79,55 @@ logger.info(f"Guard 规则: Shell={len(guard.shell_patterns)} File={len(guard.fi
 # HTTP 请求封装
 # ============================================================
 
+def _wait_pending(pending_id: str) -> str:
+    """Poll GET /api/mcp/pending/:id until terminal state or timeout."""
+    import time
+    deadline = time.time() + CONFIRM_WAIT_SEC
+    last = None
+    while time.time() < deadline:
+        raw = c2_request("GET", f"/api/mcp/pending/{pending_id}", wait_confirm=False)
+        last = raw
+        try:
+            obj = json.loads(raw)
+            item = (obj.get("data") or {}).get("item") or {}
+            st = item.get("status")
+            if st in ("executed", "failed", "denied", "expired"):
+                return json.dumps({
+                    "ok": st == "executed",
+                    "status": obj.get("status"),
+                    "pending_id": pending_id,
+                    "pending_status": st,
+                    "summary": item.get("summary"),
+                    "result_status": item.get("result_status"),
+                    "result_body": item.get("result_body"),
+                    "error_code": item.get("error_code"),
+                    "message": (
+                        "面板已批准并执行" if st == "executed" else
+                        "面板已拒绝" if st == "denied" else
+                        "确认超时过期" if st == "expired" else
+                        f"执行结束: {st}"
+                    ),
+                    "item": item,
+                }, ensure_ascii=False, indent=2)
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+        time.sleep(CONFIRM_POLL_SEC)
+    return json.dumps({
+        "ok": False,
+        "error_code": "confirm_wait_timeout",
+        "pending_id": pending_id,
+        "message": f"等待面板确认超时（{CONFIRM_WAIT_SEC}s）。请在 Web 控制台顶部「MCP 确认」中批准。",
+        "last": last,
+    }, ensure_ascii=False, indent=2)
+
+
 def c2_request(method: str, endpoint: str, params: dict = None,
-               json_data: dict = None, timeout: int = None) -> str:
+               json_data: dict = None, timeout: int = None,
+               wait_confirm: bool = True) -> str:
     """
     向 C2 Server 发送 API 请求。
+
+    写操作若返回 202 pending_confirmation，默认自动轮询直到面板批准/拒绝/超时。
 
     Returns:
         str: JSON 文本。成功时包含 data；失败时包含 ok=false、status、error_code、message。
@@ -133,6 +183,26 @@ def c2_request(method: str, endpoint: str, params: dict = None,
                            "message": "C2 server error", "endpoint": endpoint},
                           ensure_ascii=False)
 
+    # 202 Accepted → panel confirmation required for all MCP writes
+    if resp.status_code == 202:
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            data = {"raw": resp.text}
+        pending_id = data.get("id") if isinstance(data, dict) else None
+        if wait_confirm and CONFIRM_AUTO_WAIT and pending_id:
+            logger.info("MCP write pending confirmation id=%s summary=%s",
+                        pending_id, (data.get("summary") or "")[:120])
+            return _wait_pending(pending_id)
+        return json.dumps({
+            "ok": False,
+            "status": 202,
+            "error_code": "pending_confirmation",
+            "message": data.get("message") if isinstance(data, dict) else "pending confirmation",
+            "data": data,
+            "hint": "请在 Web 控制台「MCP 确认」中批准；可用 wait_mcp_pending 轮询",
+        }, ensure_ascii=False, indent=2)
+
     try:
         data = resp.json()
         return json.dumps({"ok": True, "status": resp.status_code, "data": data},
@@ -175,14 +245,26 @@ async def handle_list_tools() -> list[types.Tool]:
         # --- Shell 命令 ---
         types.Tool(
             name="send_cmd",
-            description="在受控端执行 Shell 指令（受安全网关保护，危险命令会被拦截）",
+            description=(
+                "在受控端执行 Shell 指令（写操作，需面板确认）。"
+                "必须由模型填写 purpose（中文用途说明：为什么执行、要获取什么信息），"
+                "面板「MCP 确认」会展示用途 + 完整命令；危险命令仍会被安全网关拦截。"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "uuid": {"type": "string", "description": "受控端 UUID"},
-                    "cmd": {"type": "string", "description": "要执行的 Shell 命令"},
+                    "cmd": {"type": "string", "description": "要执行的 Shell 命令（原文）"},
+                    "purpose": {
+                        "type": "string",
+                        "description": (
+                            "【必填】本条 Shell 的用途说明，由模型用中文撰写。"
+                            "说明：执行目的、期望输出、与当前任务的关系。"
+                            "示例：查询当前登录域用户身份，确认是否为域管理员上下文"
+                        ),
+                    },
                 },
-                "required": ["uuid", "cmd"],
+                "required": ["uuid", "cmd", "purpose"],
             },
         ),
         # --- 文件系统 ---
@@ -318,6 +400,115 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["task_id"],
             },
         ),
+        # --- AD / 域渗透（只读；写操作不在 MCP allowlist，走面板 admin） ---
+        types.Tool(
+            name="get_ad_capabilities",
+            description="获取 L2 AD 模块能力矩阵（op、风险等级、默认超时、分层 tier）",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="get_ad_tasks",
+            description="列出 AD 任务（可选按 agent uuid 过滤）。MCP 只读；critical 任务对非 admin 可能被过滤",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uuid": {
+                        "type": "string",
+                        "description": "可选：仅返回该受控端的 AD 任务",
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="get_ad_task",
+            description="获取单个 AD 任务详情（摘要/错误码/状态）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "AD 任务 ID（数字）",
+                    },
+                },
+                "required": ["task_id"],
+            },
+        ),
+        types.Tool(
+            name="ad_exec",
+            description=(
+                "下发 AD 模块命令（ad_discover/ad_enum_*/kerberoast/dcsync 等）。"
+                "默认 MCP 只读；关闭只读后写操作会进入面板确认队列，摘要含完整 op/参数；"
+                "客户端会自动等待管理员在 Web 控制台批准。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uuid": {"type": "string", "description": "受控端 UUID"},
+                    "op": {"type": "string", "description": "AD op，如 ad_discover / ad_ping / kerberoast"},
+                    "params": {"type": "object", "description": "参数 JSON 对象", "default": {}},
+                    "deadline_ms": {"type": "integer", "description": "墙钟超时毫秒（可选）"},
+                },
+                "required": ["uuid", "op"],
+            },
+        ),
+        types.Tool(
+            name="ad_discover",
+            description="快捷：域/DC 发现（写操作，需面板确认）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uuid": {"type": "string", "description": "受控端 UUID"},
+                    "domain": {"type": "string", "description": "可选域名"},
+                },
+                "required": ["uuid"],
+            },
+        ),
+        types.Tool(
+            name="ad_ping",
+            description="快捷：AD worker ping（写操作，需面板确认）",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uuid": {"type": "string", "description": "受控端 UUID"},
+                },
+                "required": ["uuid"],
+            },
+        ),
+        types.Tool(
+            name="push_module",
+            description="向受控端推送 L2 模块（ad/iso_host/inject）。写操作，需面板确认。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "uuid": {"type": "string", "description": "受控端 UUID"},
+                    "id": {"type": "string", "description": "模块 id：ad | iso_host | inject"},
+                    "force": {"type": "boolean", "description": "强制重推", "default": False},
+                },
+                "required": ["uuid", "id"],
+            },
+        ),
+        types.Tool(
+            name="wait_mcp_pending",
+            description="轮询等待面板对某条 MCP 待确认写操作的批准/拒绝结果",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pending_id": {"type": "string", "description": "pending 请求 ID"},
+                },
+                "required": ["pending_id"],
+            },
+        ),
+        types.Tool(
+            name="get_mcp_pending",
+            description="查询单条 MCP 待确认/已执行请求详情",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pending_id": {"type": "string", "description": "pending 请求 ID"},
+                },
+                "required": ["pending_id"],
+            },
+        ),
         # --- 安全网关 ---
         types.Tool(
             name="guard_status",
@@ -371,14 +562,21 @@ async def _dispatch_tool(name: str, args: dict) -> str:
             return json.dumps({"error": "缺少参数: uuid"})
         return c2_request("GET", f"/api/clients/history/{uuid_val}")
 
-    # === Shell 命令 (受 Command Guard 保护) ===
+    # === Shell 命令 (受 Command Guard 保护；必须带用途说明) ===
     elif name == "send_cmd":
         uuid_val = args.get("uuid", "")
         cmd = args.get("cmd", "")
+        purpose = (args.get("purpose") or args.get("reason") or args.get("usage") or "").strip()
         if not uuid_val:
             return json.dumps({"error": "缺少参数: uuid"})
         if not cmd:
             return json.dumps({"error": "缺少参数: cmd"})
+        if not purpose or len(purpose) < 4:
+            return json.dumps({
+                "error": "缺少参数: purpose",
+                "message": "执行 Shell 必须由模型填写 purpose（中文用途说明），面板确认时展示。",
+                "hint": "例如 purpose=\"枚举当前用户与权限，判断是否具备域管理能力\"",
+            }, ensure_ascii=False)
 
         # 安全网关审查
         check = guard.check_shell_command(cmd)
@@ -386,7 +584,11 @@ async def _dispatch_tool(name: str, args: dict) -> str:
             logger.warning(f"[GUARD] Shell 命令被拦截: {cmd[:100]} | 原因: {check.reason}")
             return guard.format_rejection(check)
 
-        return c2_request("POST", "/api/cmd", json_data={"uuid": uuid_val, "cmd": cmd})
+        return c2_request("POST", "/api/cmd", json_data={
+            "uuid": uuid_val,
+            "cmd": cmd,
+            "purpose": purpose,
+        })
 
     # === 文件系统 (受路径保护) ===
     elif name == "list_files":
@@ -514,6 +716,70 @@ async def _dispatch_tool(name: str, args: dict) -> str:
         if not task_id:
             return json.dumps({"error": "缺少参数: task_id"})
         return c2_request("GET", f"/api/plugins/result/{task_id}")
+
+    # === AD 模块 ===
+    elif name == "get_ad_capabilities":
+        return c2_request("GET", "/api/ad/capabilities")
+
+    elif name == "get_ad_tasks":
+        uuid_val = (args.get("uuid") or "").strip()
+        if uuid_val:
+            return c2_request("GET", "/api/ad/tasks", params={"uuid": uuid_val})
+        return c2_request("GET", "/api/ad/tasks")
+
+    elif name == "get_ad_task":
+        task_id = str(args.get("task_id", "")).strip()
+        if not task_id:
+            return json.dumps({"error": "缺少参数: task_id"})
+        return c2_request("GET", f"/api/ad/tasks/{task_id}")
+
+    elif name == "ad_exec":
+        uuid_val = args.get("uuid", "")
+        op = args.get("op", "")
+        if not uuid_val or not op:
+            return json.dumps({"error": "缺少参数: uuid / op"})
+        payload = {"uuid": uuid_val, "op": op, "params": args.get("params") or {}}
+        if args.get("deadline_ms") is not None:
+            payload["deadline_ms"] = int(args["deadline_ms"])
+        return c2_request("POST", "/api/ad/exec", json_data=payload)
+
+    elif name == "ad_discover":
+        uuid_val = args.get("uuid", "")
+        if not uuid_val:
+            return json.dumps({"error": "缺少参数: uuid"})
+        payload = {"uuid": uuid_val}
+        if args.get("domain"):
+            payload["domain"] = args["domain"]
+        return c2_request("POST", "/api/ad/discover", json_data=payload)
+
+    elif name == "ad_ping":
+        uuid_val = args.get("uuid", "")
+        if not uuid_val:
+            return json.dumps({"error": "缺少参数: uuid"})
+        return c2_request("POST", "/api/ad/ping", json_data={"uuid": uuid_val})
+
+    elif name == "push_module":
+        uuid_val = args.get("uuid", "")
+        mid = args.get("id", "")
+        if not uuid_val or not mid:
+            return json.dumps({"error": "缺少参数: uuid / id"})
+        return c2_request("POST", "/api/modules/push", json_data={
+            "uuid": uuid_val,
+            "id": mid,
+            "force": bool(args.get("force", False)),
+        })
+
+    elif name == "wait_mcp_pending":
+        pid = str(args.get("pending_id", "")).strip()
+        if not pid:
+            return json.dumps({"error": "缺少参数: pending_id"})
+        return _wait_pending(pid)
+
+    elif name == "get_mcp_pending":
+        pid = str(args.get("pending_id", "")).strip()
+        if not pid:
+            return json.dumps({"error": "缺少参数: pending_id"})
+        return c2_request("GET", f"/api/mcp/pending/{pid}", wait_confirm=False)
 
     # === 安全网关状态 ===
     elif name == "guard_status":

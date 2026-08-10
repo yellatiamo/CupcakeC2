@@ -30,7 +30,7 @@ func TestPackModuleRoundtrip(t *testing.T) {
 
 // TestAgentModuleKeyPath documents the correct pack path:
 // moduleHMAC = SHA256("cupcake-mod-key-v1" || DeriveKeyAgent(base, salt))
-// NOT DeriveKey (Argon2) — that was the BOF/iso_host HMAC failure.
+// NOT DeriveKey (Argon2) — that was the historical module HMAC failure.
 func TestAgentModuleKeyPath(t *testing.T) {
 	base := make([]byte, 32)
 	copy(base, []byte("SYSTEM_CONFIG_DATA_ENCRYPT_BLOB_"))
@@ -51,7 +51,7 @@ func TestAgentModuleKeyPath(t *testing.T) {
 	}
 
 	payload := []byte("MZ\x90\x00fake-pe")
-	blob, err := PackModule("iso_host", payload, modKey)
+	blob, err := PackModule("bof", payload, modKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,4 +69,26 @@ func TestAgentModuleKeyPath(t *testing.T) {
 	if bytes.Equal(gotWrong, mac) {
 		t.Fatal("wrong Argon2 module key should not verify")
 	}
+}
+
+func TestSetAgentModulesStripsModeSuffix(t *testing.T) {
+	ms := GetModuleService()
+	uuid := "test-agent-mode-suffix"
+	ms.SetAgentModules(uuid, "bof:mem, inject:worker, ad:worker")
+	if !ms.AgentHasModule(uuid, "bof") {
+		t.Fatal("bof should be marked after id:mode list")
+	}
+	if !ms.AgentHasModule(uuid, "inject") {
+		t.Fatal("inject should be marked")
+	}
+	if !ms.AgentHasModule(uuid, "ad") {
+		t.Fatal("ad should be marked")
+	}
+	// Must not keep the raw "bof:mem" token as the only key
+	if ms.AgentHasModule(uuid, "bof:mem") {
+		t.Fatal("raw id:mode token must not be stored as module id")
+	}
+	ms.ClearAgentModule(uuid, "bof")
+	ms.ClearAgentModule(uuid, "inject")
+	ms.ClearAgentModule(uuid, "ad")
 }

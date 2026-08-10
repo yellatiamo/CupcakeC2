@@ -7,7 +7,7 @@ pub mod bof;
 pub mod error;
 
 #[cfg(all(feature = "bof", target_os = "windows"))]
-pub mod beacon_api;
+pub mod plugin_api;
 
 #[cfg(all(feature = "bof", target_os = "windows"))]
 pub mod safety;

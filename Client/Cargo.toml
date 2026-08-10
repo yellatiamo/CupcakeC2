@@ -2,15 +2,12 @@
 members = [
     "core",
     "stager",
-    # Product L2: desktop / inject / iso_host (BOF·.NET via iso_host)
-    "modules/desktop",
-    "modules/inject",
-    "iso_host",
-    # Long-lived RDP relay worker (opt-in CUPCAKE_DESKTOP_WORKER=1; default = desktop_bridge)
-    "desktop_worker",
-    # Optional crates for iso_host / legacy builds (not product catalog modules)
+    # Product L2: bof (classic in-process COFF) / inject worker / ad worker
     "modules/bof",
-    "modules/dotnet",
+    "modules/inject",
+    "modules/ad",
+    # iso_host sacrificial PE retired — BOF runs classic in-process via modules/bof,
+    # dotnet replaced by shellcode inject; inject is a self-contained worker EXE.
 ]
 resolver = "2"
 

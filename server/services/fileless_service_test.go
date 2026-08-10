@@ -86,19 +86,19 @@ func TestBuildFilelessStage2RejectsGarbage(t *testing.T) {
 }
 
 func TestModuleDescribeLoadMode(t *testing.T) {
-	_, _, _, mode := ModuleDescribeEx("iso_host")
-	if mode != "iso" {
-		t.Fatalf("iso_host load_mode=%s", mode)
-	}
-	_, _, kind, mode := ModuleDescribeEx("desktop")
-	if mode != "mem" || kind != "runtime" {
-		t.Fatalf("desktop kind=%s mode=%s", kind, mode)
+	_, _, _, mode := ModuleDescribeEx("bof")
+	if mode != "mem" {
+		t.Fatalf("bof load_mode=%s", mode)
 	}
 	name, _, kind, mode := ModuleDescribeEx("inject")
-	if mode != "mem" || kind != "runtime" {
+	if mode != "worker" || kind != "runtime" {
 		t.Fatalf("inject name=%s kind=%s mode=%s", name, kind, mode)
 	}
-	// Non-product ids are legacy/ignored
+	// Retired desktop + other non-product ids are legacy/ignored
+	_, _, kind, _ = ModuleDescribeEx("desktop")
+	if kind != "legacy" {
+		t.Fatalf("desktop should be legacy kind after retirement, got %s", kind)
+	}
 	_, _, kind, _ = ModuleDescribeEx("shell")
 	if kind != "legacy" {
 		t.Fatalf("shell should be legacy kind, got %s", kind)

@@ -443,16 +443,23 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 
 			// Broadcast: Format output and send to Client.OutputChannel (Real-time Terminal)
 			if client != nil && client.OutputChannel != nil {
-				// Persistence: Update Output Log
-				if resp.ReqID != "" {
-					// ✅ V3.0.1 Quiet Heartbeat: 忽略周期生存 ping（不写日志，防止滚屏）
-					if resp.ReqID == "heartbeat" {
-						continue
+// Persistence: Update Output Log
+					if resp.ReqID != "" {
+						// ✅ V3.0.1 Quiet Heartbeat: 忽略周期生存 ping（不写日志，防止滚屏）
+						if resp.ReqID == "heartbeat" {
+							continue
+						}
+						go func() {
+							// AD tasks: never persist full hash dumps / large roast bodies in CommandLog.
+							logStdout := resp.Stdout
+							if strings.HasPrefix(resp.ReqID, "AD") {
+								logStdout = SanitizeSummaryForLog(resp.Stdout)
+							}
+							store.UpdateCommandOutput(resp.ReqID, logStdout, resp.Stderr)
+							// Route AD responses to the AD task handler (uses own sanitize for AdTask)
+							HandleAdResponse(resp.ReqID, resp.Stdout, resp.Stderr)
+						}()
 					}
-					go func() {
-						store.UpdateCommandOutput(resp.ReqID, resp.Stdout, resp.Stderr)
-					}()
-				}
 
 				output := resp.Stdout
 				// 🛡️ NOISE FILTER: If output looks like JSON, don't send to terminal (likely raw data for internal modules)
@@ -898,7 +905,18 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 					if resp.ReqID == "heartbeat" {
 						continue
 					}
-					go store.UpdateCommandOutput(resp.ReqID, resp.Stdout, resp.Stderr)
+					go func() {
+						logStdout := resp.Stdout
+						if strings.HasPrefix(resp.ReqID, "AD") {
+							logStdout = SanitizeSummaryForLog(resp.Stdout)
+						}
+						store.UpdateCommandOutput(resp.ReqID, logStdout, resp.Stderr)
+						// Only AD-* correlation IDs can ever be ad_tasks. Guard here too
+						// to avoid pointless DB lookups and "record not found" noise.
+						if strings.HasPrefix(resp.ReqID, "AD-") {
+							HandleAdResponse(resp.ReqID, resp.Stdout, resp.Stderr)
+						}
+					}()
 					// Response handled silently
 				}
 				output := resp.Stdout

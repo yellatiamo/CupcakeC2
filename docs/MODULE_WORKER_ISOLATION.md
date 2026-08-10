@@ -1,57 +1,76 @@
-# Module Worker Isolation
+# Module Isolation & In-Process BOF (v2)
+
+> Module system v2 — 2026-08-08. Supersedes the `iso_host` universal-host design.
+
+## Product modules
+
+| Module   | Form                         | Execution model                                        |
+|----------|------------------------------|--------------------------------------------------------|
+| `bof`    | cdylib (`cupcake_mod_bof`)   | **In-process** classic BOF: COFF Manual-Mapped into the agent (fileless, no new process) |
+| `inject` | EXE (`cupcake-inject-worker`)| **Sacrificial worker** process; shellcode runs in the child, not the agent |
+| `ad`     | EXE (`cupcake-ad-worker`)    | **Sacrificial worker** process (Tier0/roast/graph; DCSync gated) |
+
+Retired: `iso_host` (universal sacrificial host), `dotnet` / `execute_assembly`
+(convert assemblies to shellcode, e.g. Donut, and use `inject`).
 
 ## Goal
 
-Worker crash / leak / hang / output flood **must not** take down Stage0 Agent
+Worker crash / leak / hang / output flood **must not** take down the Stage0 Agent
 (C2 session, heartbeat, command queue).
 
-Core rule:
+Core split:
 
-> Stage0 never loads product L2 DLL/PE and never calls module exports.
-> Product modules run only in independent Worker processes.
+> `inject` / `ad` never run inside the agent — they execute only in
+> independent, short-lived worker processes.
+> `bof` is the deliberate exception: a classic Beacon-style COFF loader that
+> runs **inside** the agent process, because "no file on disk, no new process"
+> is the point of a BOF. Its safety comes from the loader sandbox, not process
+> isolation (see "bof in-process design").
 
 ```text
 Main Agent (Stage0)
   ├─ transport / heartbeat / command queue
-  ├─ ModuleSupervisor
-  │    whitelist · hash/HMAC · Worker state · request id · start/stop · deadline · cleanup · circuit
+  ├─ ModuleSupervisor (whitelist · CKMS verify · state · deadlines · circuit)
+  ├─ bof module (Manual-Mapped cdylib; COFF loader + Beacon API shim)
   └─ IPC (length-prefixed job frame / JSON envelope)
-       ├─ iso_host.exe         (BOF / .NET / KIND_INJECT; short-lived per job)
-       ├─ inject via iso_host  (one-shot KIND=3; process exits after job)
-       └─ desktop_worker.exe   (TARGET: long-lived; Job Object owns RDP dial+relay)
+       ├─ cupcake-inject-worker.exe   (short-lived per job; Job Object)
+       └─ cupcake-ad-worker.exe       (short-lived per job; Job Object)
 ```
 
-### Desktop isolation — target vs current
+## Why bof is in-process
 
-| | **Current (default, shipping)** | **Target (skeleton in tree)** |
-|--|--------------------------------|-------------------------------|
-| RDP dial + byte relay | Stage0 `desktop_bridge` in-process | `desktop_worker.exe` child under Job Object |
-| Module role | Capability gate (`worker_ready`) | Same gate + long-lived worker lifecycle |
-| Stage0 owns | Module state, gate, Yamux accept, dial+pipe | Worker state, request id, start/stop, deadline, cleanup |
-| Worker owns | — | TCP dial to target:3389 + bidirectional relay |
-| Activation | Always (module Loaded) | Future: full path; today opt-in env falls back |
+Requirements driving the design:
 
-**Stage0 keeps (target):** worker state map, request id bookkeeping, start/stop API,
-deadline / idle kill, Job Object assign, cleanup on agent disconnect.
+1. **Fileless** — the COFF image never touches disk; Manual-Map only.
+2. **No new process** — sacrificial processes (and PPID spoofing) are
+   high-signal for EDR; a BOF must look like ordinary agent work.
+3. **Signature hygiene** — the agent must not land on disk pre-packed with
+   Beacon*/BOF-engine strings. The BOF engine ships as an on-demand L2 module
+   whose binary is string-erased (see Client/core/docs/OPSEC_WINDOWS_RESIDUAL.md)
+   and wiped (PE header zeroed after map).
 
-**desktop_worker owns (target):** RDP target dial, ACK/NACK to supervisor/IPC,
-raw bidirectional byte relay (no GDI/JPEG, no C2 crypto).
+Accepted trade-off: a crashing BOF can take the agent. Mitigations:
 
-**Default path today is unchanged:** Yamux `0x0D` → `desktop_bridge::handle_stream`
-in-process. Opt-in `CUPCAKE_DESKTOP_WORKER=1` logs that the worker path is not fully
-implemented and **falls back** to the bridge (no regression).
+- COFF loader validates structure before mapping (section/reloc/symbol checks);
+  malformed images are rejected, not executed.
+- Invocation is wrapped in `catch_unwind`; loader faults abort the job, not the agent
+  (best-effort — a hard AV in mapped COFF code is unrecoverable by design of BOFs).
+- `APP_MEM_MAP_STRICT` / header wipe keep the mapped image off forensic fast paths.
+
+If isolation is acceptable for a given payload, prefer `inject` (shellcode) over bof.
+
 ## Rules
 
-1. Product modules (`desktop`, `iso_host`, `inject`) are **never** Manual-Mapped
-   or `LoadLibrary`'d in Stage0.
-2. Stage0 only: stage bytes, verify, track `WorkerState`, spawn worker, IPC,
-   timeout, kill via Job Object.
-3. Server / UI `loaded_on_agent` means **worker_ready / registered**, not
-   "DLL mapped into agent".
-4. Thread isolation, `catch_unwind`, or `FreeLibrary` alone is **not** isolation.
-   Independent process is mandatory.
+1. `inject` / `ad` are **never** Manual-Mapped or `LoadLibrary`'d in Stage0.
+2. For workers, Stage0 only: stages bytes, verifies, tracks `WorkerState`,
+   spawns the worker, forwards IPC, enforces timeout, kills via Job Object.
+3. Server / UI `loaded_on_agent` means **worker_ready / registered** (inject, ad)
+   or **mapped & ready** (bof: `bof:mem`), not "long-lived process running".
+4. Thread isolation, `catch_unwind`, or `FreeLibrary` alone is **not** isolation
+   for native code you do not trust — independent process is mandatory
+   (which is exactly why untrusted/native payloads go to `inject`, not `bof`).
 
-## Worker states (not Agent state)
+## Worker states (inject/ad — not agent state)
 
 ```text
 Stopped → Starting → Ready → Busy
@@ -70,36 +89,31 @@ String surface (module status, not agent online/offline):
 | Failed    | `failed`           |
 | Timeout   | `timeout`          |
 
-## Current guarantees
+bof has no worker lifecycle: load modes reported by the agent are
+`bof:mem` (mapped), plus `stub` / `absent` before/after unload.
 
-The default `isolated-exec` path now applies the following lifecycle guarantees to one-shot `iso_host` and native workers:
+## Worker lifecycle guarantees (inject/ad)
+
+The `isolated-exec` path applies:
 
 - every spawned worker is assigned to a Windows Job Object before input is sent;
 - a failed Job Object assignment is a hard startup failure and the child is terminated;
-- synchronous pipe I/O runs outside the Tokio executor, while stdout/stderr lengths are bounded;
-- deadlines are clamped to 1-300 seconds and timeout terminates the Job Object and child before cleanup;
-- host staging files, inherited pipe handles, process handles, and staged PE copies are cleaned on success and failure.
-
-`desktop` (default): capability registration + thin Stage0 RDP bridge. Each relay is
-scoped to its own Yamux stream and gated by Supervisor `worker_ready`.
-
-`desktop` (isolation skeleton): `module_supervisor::desktop_worker` exposes long-lived
-lifecycle stubs (`start` / `stop` / `status`); crate `Client/desktop_worker/` is a
-placeholder binary. Full RDP dial+relay ownership by the child is **not** wired yet —
-see “Desktop isolation — target vs current” above.
+- synchronous pipe I/O runs outside the Tokio executor; stdout/stderr lengths are bounded;
+- deadlines are clamped to 1–300 seconds and timeout terminates the Job Object and child before cleanup;
+- staged PE copies, inherited pipe handles, and process handles are cleaned on success and failure.
 
 Main Agent retains only:
 
-- Module whitelist (`desktop` / `iso_host` / `inject`)
-- Hash / HMAC package verify (existing CKMS)
-- Worker status map
-- Request forward to child process
+- Module whitelist (`bof` / `inject` / `ad`)
+- Hash / HMAC package verify (CKMS)
+- Worker status map (inject/ad) · mapped-module registry (bof)
+- Request forward to child process (inject/ad)
 - Deadline / timeout kill
 - Crash auto-restart policy + consecutive-failure circuit breaker
 - Pending request cleanup on worker exit
 - Stop workers when Agent disconnects / process exits (Job Object KillOnJobClose)
 
-**Forbidden in Stage0 for product modules:**
+**Forbidden in Stage0 for `inject` / `ad`:**
 
 - `LoadLibrary` / Manual Map
 - `mod_init` / `mod_invoke` / `mod_shutdown`
@@ -107,7 +121,7 @@ Main Agent retains only:
 
 ## IPC protocol bounds
 
-Request (logical; product inject uses binary job frame over stdin today):
+Request (logical; inject uses binary job frame over stdin today):
 
 ```json
 {
@@ -151,66 +165,66 @@ Workers are assigned to a Job Object with:
 - No orphan child processes after Agent restart
 - Future: process / memory / handle limits
 
-## Product module paths
+## Stage0 role per module
 
-| Module    | Worker model                                      | Stage0 role                          |
-|-----------|---------------------------------------------------|--------------------------------------|
-| `iso_host`| Sacrificial EXE; BOF/.NET jobs; host PE for inject| Stage PE bytes; spawn only           |
-| `inject`  | One-shot: spawn iso_host with KIND_INJECT=3       | Register capability; IPC forward     |
-| `desktop` | **Default:** gate + Stage0 `desktop_bridge` dial/relay. **Target:** long-lived `desktop_worker.exe` under Job Object | Register capability; lifecycle stubs; no DLL map |
+| Module   | Worker model                         | Stage0 role                                    |
+|----------|--------------------------------------|------------------------------------------------|
+| `bof`    | In-process mapped COFF runner        | CKMS verify → Manual-Map → invoke → unload     |
+| `inject` | One-shot sacrificial EXE             | Stage PE bytes; spawn; IPC forward             |
+| `ad`     | One-shot sacrificial EXE             | Stage PE bytes; spawn; IPC forward             |
 
-Phase later (desktop isolation steps after this skeleton):
+## Anti-signature posture (bof path)
 
-1. Supervisor spawns staged `desktop` / `desktop_worker` PE into Job Object
-2. Hand off accepted Yamux side or duplicate socket / framed IPC for relay
-3. Child dials target:3389 and pipes bytes; Stage0 only tracks request + deadline
-4. Stop / agent disconnect terminates Job Object (kill-on-close)
-5. Remove in-process dial from `desktop_bridge` once worker path is proven
-6. Dedicated `inject_worker.exe` binary if iso_host host is undesirable
-## Implementation order
+- Module engine (`cupcake_mod_bof.dll`) built with `max_level_off` logs,
+  XOR-obfuscated carrier strings, no `#[no_mangle]` exports, `strip = "symbols"`.
+- Build scripts (`server/scripts/build-*-module.ps1`) strip the PE debug
+  directory (RSDS/PDB path) via `pe-strip-debug.py` and run `strings-gate.ps1`.
+- On load: CKMS verify → Manual-Map → PE header wipe; `module_unload` unmaps.
+- Runtime env surface uses generic `APP_*` names (no product brand).
 
-1. Main Agent `ModuleSupervisor` (state, limits, Job Object helpers) — **done**
-2. `iso_host` as universal sacrificial worker (BOF/.NET/INJECT kinds) — **done**
-3. `module_loader` product path → register only (no map); inject invoke → supervisor — **done**
-4. Crash / timeout / restart / circuit tests — **done / ongoing**
-5. desktop isolation skeleton (lifecycle stubs + placeholder crate + design) — **this step**
-6. desktop long-lived relay worker (full dial+relay in child; default off until proven)
-7. inject one-shot dedicated PE (optional; currently iso_host KIND 3)
-8. Delete Stage0 product LoadLibrary / Manual-Map paths for whitelist IDs
 ## Acceptance criteria
 
 ```text
-Worker crash          → Agent still heartbeats
-Worker infinite loop  → Agent still handles new commands (deadline kill)
-Worker output flood   → Agent transport not blocked (output cap + drop counter)
-Worker force-killed   → Agent does not crash
-Agent restart         → no residual Worker (Job Object kill-on-close)
+Worker crash (inject/ad) → Agent still heartbeats
+Worker infinite loop     → Agent still handles new commands (deadline kill)
+Worker output flood      → Agent transport not blocked (output cap + drop counter)
+Worker force-killed      → Agent does not crash
+Agent restart            → no residual Worker (Job Object kill-on-close)
+bof: malformed COFF      → rejected before mapping, agent unaffected
+bof: module_unload       → mapped image unmapped; list_loaded drops bof:mem
 ```
 
-## Non-goals (this skeleton step)
+## Non-goals
 
-- Full desktop RDP byte-relay inside long-lived `desktop_worker` (stubs only)
-- Changing default product path away from `desktop_bridge`
 - Cross-platform Job Object (Windows first)
 - Shared-memory zero-copy IPC
 - Policy-locked server-side module delete
-
-## Opt-in env (skeleton)
-
-| Env / flag | Behavior |
-|------------|----------|
-| *(unset)* | Default: Stage0 `desktop_bridge` RDP dial+relay |
-| `CUPCAKE_DESKTOP_WORKER=1` | Log “desktop worker path not fully implemented”; fall back to bridge. May record lifecycle bookkeeping / optional placeholder spawn later |
+- Surviving a hard AV inside mapped COFF (inherent to in-process BOF)
 
 ## Code map
 
-| Area                         | Path                                      |
-|------------------------------|-------------------------------------------|
-| Supervisor                   | `Client/core/src/module_supervisor/`      |
-| Desktop worker lifecycle stubs | `Client/core/src/module_supervisor/desktop_worker.rs` |
-| Product load / invoke bridge | `Client/core/src/module_loader.rs`        |
-| Sacrificial host             | `Client/iso_host/`                        |
-| Desktop worker placeholder   | `Client/desktop_worker/`                  |
-| Isolated BOF/.NET spawn      | `Client/core/src/isolated_exec.rs`        |
-| RDP gate + dial (default)    | `Client/core/src/transport/desktop_bridge.rs` |
-| Design                       | this file + `docs/DESKTOP_MODULE_DESIGN.md` |
+| Area                           | Path                                      |
+|--------------------------------|-------------------------------------------|
+| Supervisor                     | `Client/core/src/module_supervisor/`      |
+| COFF loader + Beacon shim      | `Client/core/src/loader/` · `modules/bof` |
+| Manual-Map (pe_map)            | `Client/core/src/pe_map.rs`               |
+| Product load / invoke bridge   | `Client/core/src/module_loader.rs`        |
+| Inject sacrificial worker      | `Client/modules/inject/`                  |
+| AD sacrificial worker          | `Client/modules/ad/`                      |
+| Isolated exec spawn            | `Client/core/src/isolated_exec.rs`        |
+| Module build scripts           | `server/scripts/build-{bof,inject,ad}-module.ps1` |
+| Design                         | this file                                 |
+
+## Platform split (Linux vs Windows) — 2026-08
+
+Product L2 modules (`bof` / `inject` / `ad`) are Windows-only.
+
+- Server `ListCatalog(agentUUID, agentOS)` filters the catalog using `modulePlatforms` + `IsModuleSupportedOnOS`.
+- Push, auto-push (`MaybeAutoPushModule`), pack, and MCP confirm paths reject windows-only modules for non-windows agents.
+- Client hard-gates: `is_module_supported_on_current_os`, `ensure_module_for_command`, and AD command surface in handler.rs (returns `unsupported_platform`).
+- UI (ModulePanel / ModuleManager / Plugin lists) hides or disables entries for mismatched OS.
+- Plugins declare `required_os` in manifest; `DeployPlugin` and UI respect it.
+
+Agent OS comes from `SystemInfo::collect()` (register) → stored in `globals.Client.OS` and `agents.os`. All decisions must use the live reported value, not build-time or label-only.
+
+Add new entries to `modulePlatforms` (module_service.go) when new platform-specific modules are introduced.

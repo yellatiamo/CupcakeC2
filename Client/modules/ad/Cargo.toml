@@ -1,0 +1,25 @@
+[package]
+name = "cupcake-ad-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Sacrificial L2 AD worker PE (Tier0/roast/graph; DCSync behind ad-dcsync)"
+
+[[bin]]
+name = "cupcake-ad-worker"
+path = "src/main.rs"
+
+[lib]
+name = "cupcake_ad_worker"
+path = "src/lib.rs"
+
+[features]
+default = []
+# KD-18: lab-only DCSync / DRSUAPI path. Release builds leave this off.
+ad-dcsync = []
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+# Release profile is defined once in the workspace root (Client/Cargo.toml):
+# opt-level="z", lto="fat", codegen-units=1, panic="abort", strip="symbols".

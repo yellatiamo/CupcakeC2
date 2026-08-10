@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -164,8 +165,81 @@ func GetClients(c *gin.Context) {
 
 func HandleGetAgentHistory(c *gin.Context) {
 	uuid := c.Param("uuid")
-	history, _ := store.GetCommandHistory(uuid)
+	src := strings.TrimSpace(c.Query("source")) // "", "all", "panel", "mcp", "internal"
+	limit := 100
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	history, _ := store.GetCommandHistoryFiltered(uuid, src, limit)
 	c.JSON(http.StatusOK, history)
+}
+
+// HandleGetGlobalHistory returns auditable command/plugin/module history across agents.
+// Query: source (all|panel|mcp|internal), uuid (empty = all agents), limit (1-500), type (all|plugin|module|shell|ad).
+func HandleGetGlobalHistory(c *gin.Context) {
+	uuid := strings.TrimSpace(c.Query("uuid"))
+	src := strings.TrimSpace(c.Query("source"))
+	typeFilter := strings.TrimSpace(c.Query("type"))
+	limit := 100
+	if raw := c.Query("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	// When type-filtering post-query, over-fetch then trim so limit still applies to filtered set.
+	fetchLimit := limit
+	if typeFilter != "" && !strings.EqualFold(typeFilter, "all") {
+		fetchLimit = 500
+	}
+	history, err := store.GetCommandHistoryFiltered(uuid, src, fetchLimit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if typeFilter != "" && !strings.EqualFold(typeFilter, "all") {
+		history = filterCommandHistoryByType(history, typeFilter)
+		if len(history) > limit {
+			history = history[:limit]
+		}
+	}
+	c.JSON(http.StatusOK, history)
+}
+
+func filterCommandHistoryByType(logs []model.CommandLog, typeFilter string) []model.CommandLog {
+	tf := strings.ToLower(strings.TrimSpace(typeFilter))
+	out := make([]model.CommandLog, 0, len(logs))
+	for _, l := range logs {
+		t := strings.ToLower(strings.TrimSpace(l.Type))
+		match := false
+		switch tf {
+		case "shell":
+			match = t == "shell" || t == "shell_interactive" || t == "shell_exit"
+		case "module":
+			match = t == "module_stage" || t == "module_unload" || strings.HasPrefix(t, "module_")
+		case "ad":
+			match = strings.HasPrefix(t, "ad_") || t == "ad"
+		case "plugin":
+			// Plugin runs log as plugin name or payload kinds; exclude system/shell/module/ad.
+			if t == "shell" || t == "shell_interactive" || t == "shell_exit" ||
+				t == "migrate" || t == "heartbeat" ||
+				strings.HasPrefix(t, "module_") || strings.HasPrefix(t, "ad_") ||
+				strings.HasPrefix(t, "file_") || strings.HasPrefix(t, "process_") {
+				match = false
+			} else {
+				match = t == "execute_assembly" || t == "bof_exec" || t == "native_exec" ||
+					t == "plugin" || t != ""
+			}
+		default:
+			// Exact type match fallback
+			match = t == tf
+		}
+		if match {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 func DeleteClient(c *gin.Context) {

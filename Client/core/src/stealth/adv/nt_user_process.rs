@@ -247,7 +247,7 @@ unsafe fn try_nt_create_user_process_ppid_inner(
     }
 
     crate::utils::db_print(&format!(
-        "[Cupcake] spawn: nt_create_user_process ok pid={}",
+        "[agent] spawn: nt_create_user_process ok pid={}",
         pid
     ));
     Ok(pid)

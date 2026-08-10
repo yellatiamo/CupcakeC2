@@ -299,14 +299,24 @@ func HandleDeleteUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"msg": "User deleted"})
 }
 
-// HandleGetLoginLogs returns recent audit logs
+// HandleGetLoginLogs returns recent panel/user login audit logs only.
+// MCP principals never write LoginLog entries (they use bearer tokens + AuditLog).
+// This endpoint is intentionally panel-only for the "登录审计流".
 func HandleGetLoginLogs(c *gin.Context) {
 	logs, err := store.GetLoginLogs(100)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, logs)
+	// Defensive filter: drop any rows that look like MCP (should never be present).
+	filtered := make([]model.LoginLog, 0, len(logs))
+	for _, l := range logs {
+		if strings.EqualFold(strings.TrimSpace(l.Username), "mcp") {
+			continue
+		}
+		filtered = append(filtered, l)
+	}
+	c.JSON(http.StatusOK, filtered)
 }
 
 // HandleGetSettings returns global config

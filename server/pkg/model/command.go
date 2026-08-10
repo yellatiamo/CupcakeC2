@@ -12,6 +12,10 @@ type CommandLog struct {
 	Input     string    `json:"input"`               // The command sent
 	Output    string    `json:"output"`              // The result from Agent
 	Status    string    `json:"status"`              // "pending", "completed", "failed"
+	// Source distinguishes origin for audit/history classification: "panel" | "mcp" | "internal"
+	Source string `gorm:"size:16;default:'panel'" json:"source,omitempty"`
+	// CreatedBy records the principal (username for panel, "mcp" for automation)
+	CreatedBy string    `gorm:"size:64" json:"created_by,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

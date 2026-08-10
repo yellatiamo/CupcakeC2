@@ -133,28 +133,9 @@ Client:
   `module_supervisor::supervisor().stop_all()`.
 - `utils::self_destruct` calls `stop_all()` before `process::exit`.
 
-## 9. Desktop relay connection-level protection
+## 9. Server HTTP timeouts and file/plugin quotas
 
-### 9a. Agent idle timeout
-
-- `desktop_bridge.rs` bidirectional copy uses `copy_with_idle` with 120s
-  per-read idle timeout (resets on data).
-
-### 9b. Server idle timeout + per-agent conn cap
-
-- `desktop_service.go` wraps both ends of the RDP pipe with
-  `idleDeadlineConn` (120s deadline reset on I/O).
-- Concurrent client pipes per agent capped at 8
-  (`desktopMaxConnsPerAgent`).
-
-### 9c. RDP listener default loopback
-
-- `StartDesktopRDP` binds `127.0.0.1` by default.
-- Override with env `CUPCAKE_DESKTOP_LISTEN_HOST` (e.g. `0.0.0.0`).
-
-## 10. Server HTTP timeouts and file/plugin quotas
-
-### 10a. Admin HTTP Server timeouts (P0)
+### 9a. Admin HTTP Server timeouts (P0)
 
 - `main.go` `newAdminHTTPServer`:
   - `ReadHeaderTimeout` 10s
@@ -163,24 +144,24 @@ Client:
   - `IdleTimeout` 120s
   - `MaxHeaderBytes` 1 MiB
 
-### 10b. Agent upload limits (P0)
+### 9b. Agent upload limits (P0)
 
 - `transfer_service.go`: max file 256 MiB; RFC-4122 UUID required
   (`ValidateAgentUpload` / `ValidAgentUUID`).
 
-### 10c. Plugin upload size + admin auth (P0)
+### 9c. Plugin upload size + admin auth (P0)
 
 - `plugin_controller.go`: max plugin file 64 MiB; SHA-256 stored on upload.
 - `main.go` `/plugins/upload`, `/plugins/run`, `/plugins/delete` gated with
   `RequireAdmin()` (same as module delete / generate).
 
-### 10d. Plugin hash trust chain (P1)
+### 9d. Plugin hash trust chain (P1)
 
 - `PluginMetadata.Hash` = lowercase hex SHA-256 of file bytes.
 - `DeployPlugin` calls `VerifyPluginHash` before staging to the agent;
   mismatch refuses deploy and drops cache.
 
-### 10e. Task output retention (P1)
+### 9e. Task output retention (P1)
 
 - `command_store.go` `PurgeExpiredTaskLogs` removes `logs/task_*.txt` and
   matching DB rows older than N days (default 7;
@@ -193,12 +174,11 @@ Client:
 Server:
   go test ./...
   → admin HTTP timeouts, transfer gates, plugin hash, retention,
-    desktop listen host / idle constants, plugin RequireAdmin routes
+    plugin RequireAdmin routes
 
 Client:
   cargo test --features minimal --lib
-  → job_object fail-closed, stop_all, MAX_OUTPUT_BYTES, apply_output_bound,
-    desktop_bridge idle copy
+  → job_object fail-closed, stop_all, MAX_OUTPUT_BYTES, apply_output_bound
 ```
 
 ## Not covered (later batches)
@@ -206,7 +186,6 @@ Client:
 True remaining deferrals after Batches 1–7 (this document). Items already
 shipped are **not** listed here.
 
-- **Default-on desktop worker** — opt-in `CUPCAKE_DESKTOP_WORKER=1` runs real out-of-process dial+relay under Job Object; product default remains Stage0 `desktop_bridge` (spawn failure falls back to bridge)
 - **Prometheus ecosystem** — no scrape-format `/metrics`, exporters, or PromQL; admin JSON `/api/metrics` only
 - **HSM / production release signing** — HMAC trust keys + CI checksum/module inventory; no hardware key custody, no signed GitHub Releases, no client reproducible-build attestation
 - **External PKI / sigstore** — package trust is HMAC-SHA256 + version anti-rollback (`pkg/trustchain`), not public-key PKI
@@ -232,8 +211,8 @@ Route gates in `server/main.go` (min role):
 
 | Min role | Routes |
 |----------|--------|
-| **viewer** (any authenticated) | GET dashboard, clients, history, listeners, tunnel/socks list, files list/read/download, processes list, plugins list/result, modules list/pack, resp, desktop status; auth logout/password |
-| **operator** | POST `/cmd`; files upload/delete; processes kill; tunnel/socks start/stop/delete; shell/pty WS; desktop start/stop; modules query POST |
+| **viewer** (any authenticated) | GET dashboard, clients, history, listeners, tunnel/socks list, files list/read/download, processes list, plugins list/result, modules list/pack, resp; auth logout/password |
+| **operator** | POST `/cmd`; files upload/delete; processes kill; tunnel/socks start/stop/delete; shell/pty WS; modules query POST |
 | **admin** | modules upload/push/DELETE; plugins run/upload/delete; listeners mutate; clients DELETE/migrate; agents/connect; settings/*; generate/stager; maintenance |
 
 Tests: `server/controllers/rbac_routes_test.go` — viewer denied on `/cmd` and kill;
@@ -421,7 +400,7 @@ Caching: Go modules (`setup-go`), Cargo (`Swatinem/rust-cache`), npm (`setup-nod
 
 ---
 
-# Batch 7 — Trust chain, sessions, desktop opt-in, quotas, CI artifacts
+# Batch 7 — Trust chain, sessions, quotas, CI artifacts
 
 Consolidates hardening that lands after Batch 6 (CI scaffold) and the
 checksum/module-inventory job in this batch.
@@ -449,16 +428,7 @@ checksum/module-inventory job in this batch.
   - `Authorization: Bearer <session>` still accepted on those paths.
 - Package: `pkg/wsticket` + middleware Redeem; frontend-v2 mints tickets.
 
-## 22. Desktop worker opt-in path (real relay)
-
-- Default product path: Stage0 in-process `desktop_bridge`.
-- Opt-in `CUPCAKE_DESKTOP_WORKER=1`: Stage0 spawns `cupcake-desktop-worker relay host port`
-  under Job Object; worker dials TCP, emits `READY`, then stdin/stdout duplex relay.
-- Binary resolve: `CUPCAKE_DESKTOP_WORKER_BIN` → next to agent → cwd.
-- Spawn/READY failure **falls back to bridge** (warn). Default remains bridge.
-- Crate: `Client/desktop_worker`; supervisor: `module_supervisor/desktop_worker.rs`.
-
-## 23. Disk / file quotas (server)
+## 22. Disk / file quotas (server)
 
 | Control | Limit |
 |---------|--------|

