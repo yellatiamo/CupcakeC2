@@ -27,6 +27,7 @@ Cargo.lock             # 本项目作 binary，Cargo.lock 可以提交；如不�
 /server/assets/plugins/*.exe
 /server/storage/modules/*
 !/server/storage/modules/.gitkeep
+/server/storage/ad/
 /storage/
 
 # ---- Vue / Node.js (Frontend) ----

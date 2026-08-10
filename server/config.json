@@ -1,6 +1,0 @@
-{
-  "admin_port": 9999,
-  "admin_user": "admin",
-  "admin_pass": "",
-  "admin_bind": "127.0.0.1"
-}
