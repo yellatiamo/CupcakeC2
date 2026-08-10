@@ -1,1 +1,0 @@
-import{r as n}from"./index-CRl982pA.js";function s(){return n.get("/api/socks")}function o(t){return n.post("/api/socks/start",t)}function r(t){return n.post("/api/socks/stop",t)}function u(t){return n.post("/api/tunnel/delete",t)}export{r as a,u as d,s as g,o as s};
