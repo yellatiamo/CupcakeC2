@@ -43,7 +43,7 @@
           </el-menu-item>
           <el-menu-item index="ad">
             <el-icon><Connection /></el-icon>
-            <span>域渗透</span>
+            <span>域渗透工具</span>
           </el-menu-item>
         </el-menu>
       </div>
@@ -111,7 +111,7 @@ const getPageTitle = () => {
     ClientProcesses: '进程管理',
     ClientPlugins: '插件与工具',
     ClientModules: 'Stage0 模块',
-    ClientAd: '域渗透',
+    ClientAd: '域渗透工具',
   }
   return titleMap[route.name] || '终端'
 }

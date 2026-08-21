@@ -2,15 +2,12 @@
 name = "cupcake-ad-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Sacrificial L2 AD worker PE (Tier0/roast/graph; DCSync behind ad-dcsync)"
-
-[[bin]]
-name = "cupcake-ad-worker"
-path = "src/main.rs"
+description = "Sacrificial L2 AD worker DLL (Tier0/roast/graph; DCSync behind ad-dcsync)"
 
 [lib]
 name = "cupcake_ad_worker"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []

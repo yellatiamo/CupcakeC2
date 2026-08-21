@@ -5,9 +5,8 @@
 // - Module bases for hot DLLs (ntdll/kernel32/kernelbase)
 // - Export address cache keyed by (module_base, func_hash)
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use super::hash_module_name;
 #[cfg(target_arch = "x86")]
@@ -32,29 +31,60 @@ fn module_cache() -> &'static ModuleBaseCache {
     })
 }
 
-/// Export resolve cache: (module_base, name_hash) → VA. Arch-independent.
-const EXPORT_CACHE_MAX: usize = 256;
+// ────────────────────────────────────────────────────────────────────────────
+// Export resolve cache: (module_base, name_hash) → VA.
+//
+// Direct-mapped ATOMIC SLOTS — deliberately NOT std Mutex<HashMap>:
+// std's HashMap default hasher (`RandomState::new`) touches a `thread_local`
+// (hash/random.rs: `thread_local!(static KEYS: Cell<(u64,u64)> ...)`) which
+// ACCESS-VIOLATES inside Manual-Mapped L2 modules once pe_map neuters the TLS
+// directory (TLS_SENTINEL_INDEX = 0x7FFFFFFF → gs:[0x58] walk → 0xC0000005).
+// The atomic-slot design is TLS-free, allocation-free and lock-free; a slot
+// collision degrades to a cache miss (correct, just re-walks the export dir).
+// ────────────────────────────────────────────────────────────────────────────
 
-fn export_cache() -> &'static Mutex<HashMap<(usize, u32), usize>> {
-    static CACHE: OnceLock<Mutex<HashMap<(usize, u32), usize>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(64)))
+/// Export cache slots (direct-mapped by func hash).
+const EXPORT_CACHE_SLOTS: usize = 64;
+
+/// One cache entry: tag = (module, hash) validated before returning addr.
+struct ExportCacheSlot {
+    m: AtomicUsize,
+    h: AtomicUsize,
+    addr: AtomicUsize,
 }
 
+static EXPORT_CACHE: [ExportCacheSlot; EXPORT_CACHE_SLOTS] = {
+    const EMPTY: ExportCacheSlot = ExportCacheSlot {
+        m: AtomicUsize::new(0),
+        h: AtomicUsize::new(0),
+        addr: AtomicUsize::new(0),
+    };
+    [EMPTY; EXPORT_CACHE_SLOTS]
+};
+
+#[inline]
 fn export_cache_get(module: usize, hash: u32) -> Option<usize> {
-    export_cache()
-        .lock()
-        .ok()
-        .and_then(|g| g.get(&(module, hash)).copied())
+    crate::tracef_g(&format!("cache: get m=0x{:X} h=0x{:X}", module, hash));
+    let slot = &EXPORT_CACHE[(hash as usize) % EXPORT_CACHE_SLOTS];
+    if slot.m.load(Ordering::Acquire) == module && slot.h.load(Ordering::Acquire) == hash as usize
+    {
+        let a = slot.addr.load(Ordering::Acquire);
+        if a != 0 {
+            crate::tracef_g(&format!("cache: got Some(0x{:X})", a));
+            return Some(a);
+        }
+    }
+    crate::tracef_g("cache: got None");
+    None
 }
 
+#[inline]
 fn export_cache_put(module: usize, hash: u32, addr: usize) {
-    if let Ok(mut g) = export_cache().lock() {
-        if g.len() >= EXPORT_CACHE_MAX {
-            // Simple eviction: clear half when full (rare; avoids complex LRU).
-            g.clear();
-        }
-        g.insert((module, hash), addr);
-    }
+    let slot = &EXPORT_CACHE[(hash as usize) % EXPORT_CACHE_SLOTS];
+    // addr first, tag last → readers see a validated entry (Release/Acquire).
+    slot.addr.store(addr, Ordering::Release);
+    slot.m.store(module, Ordering::Release);
+    slot.h.store(hash as usize, Ordering::Release);
 }
 
 #[inline]
@@ -216,12 +246,16 @@ pub unsafe fn ensure_module_base(dll_name: &[u8], name_hash: u32) -> usize {
 /// Results cached (arch-independent) after first successful resolve.
 #[cfg(windows)]
 pub unsafe fn get_api_addr(module_ptr: usize, func_hash: u32) -> Option<usize> {
+    crate::tracef_g(&format!("apiaddr: enter m=0x{:X} h=0x{:X}", module_ptr, func_hash));
     if module_ptr == 0 {
+        crate::tracef_g("apiaddr: zero module");
         return None;
     }
     if let Some(cached) = export_cache_get(module_ptr, func_hash) {
+        crate::tracef_g("apiaddr: cache HIT");
         return Some(cached);
     }
+    crate::tracef_g("apiaddr: cache miss -> walk");
     let addr = get_api_addr_uncached(module_ptr, func_hash)?;
     export_cache_put(module_ptr, func_hash, addr);
     Some(addr)
@@ -229,6 +263,7 @@ pub unsafe fn get_api_addr(module_ptr: usize, func_hash: u32) -> Option<usize> {
 
 #[cfg(windows)]
 unsafe fn get_api_addr_uncached(module_ptr: usize, func_hash: u32) -> Option<usize> {
+    crate::tracef_g(&format!("apiwalk: enter m=0x{:X} h=0x{:X}", module_ptr, func_hash));
     let dos_header = module_ptr as *const IMAGE_DOS_HEADER;
     if (*dos_header).e_magic != 0x5A4D {
         return None;
@@ -244,8 +279,15 @@ unsafe fn get_api_addr_uncached(module_ptr: usize, func_hash: u32) -> Option<usi
     let names = (module_ptr + (*export_dir).AddressOfNames as usize) as *const u32;
     let ordinals = (module_ptr + (*export_dir).AddressOfNameOrdinals as usize) as *const u16;
     let functions = (module_ptr + (*export_dir).AddressOfFunctions as usize) as *const u32;
+    crate::tracef_g(&format!(
+        "apiwalk: dir names={} fns={}",
+        (*export_dir).NumberOfNames, (*export_dir).NumberOfFunctions
+    ));
 
     for i in 0..(*export_dir).NumberOfNames {
+        if i % 256 == 0 {
+            crate::tracef_g(&format!("apiwalk: i={}", i));
+        }
         let name_ptr = (module_ptr + *names.add(i as usize) as usize) as *const i8;
         let mut h: u32 = 0;
         let mut offset = 0;
@@ -257,6 +299,7 @@ unsafe fn get_api_addr_uncached(module_ptr: usize, func_hash: u32) -> Option<usi
         }
 
         if h == func_hash {
+            crate::tracef_g(&format!("apiwalk: MATCH at i={}", i));
             let ordinal = *ordinals.add(i as usize);
             let func_rva = *functions.add(ordinal as usize) as usize;
 
@@ -310,5 +353,6 @@ unsafe fn get_api_addr_uncached(module_ptr: usize, func_hash: u32) -> Option<usi
             return Some(module_ptr + func_rva);
         }
     }
+    crate::tracef_g("apiwalk: no match");
     None
 }

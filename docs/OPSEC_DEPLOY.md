@@ -89,9 +89,33 @@ powershell -File scripts/test-services.ps1 -WithDonut -Compile
 
 Production `go build` is unchanged (real Donut included).
 
-## Wire seed
+## Wire seed (production)
 
-Client `build.rs` and server `WireIDs` share `CUPCAKE_WIRE_SEED` (default `wire-v1-default-2026`).
+Client `build.rs` and server `WireIDs` **must** share the same seed.
+
+| Priority | Source |
+|----------|--------|
+| 1 | Env `CUPCAKE_WIRE_SEED` |
+| 2 | `server/config.json` → `wire_seed` |
+| 3 | DB setting `wire_seed` |
+| 4 | Generate once (`wire-gen-…`), write to config.json + DB |
+
+- Retired public default `wire-v1-default-2026` is rejected.
+- Builder always sets `CUPCAKE_WIRE_SEED` from `utils.WireSeed()` when compiling agents.
+
+## Agent build injection (Builder)
+
+Source placeholders in `Client/core/src/config.rs` (must remain until Builder runs):
+
+| Token | Injected as |
+|-------|-------------|
+| `REPLACE_ME_URL` | Listener C2 URL (`ws://` / `wss://` / …) |
+| `REPLACE_ME_AES_KEY` | 32-byte ASCII or 64 hex AES base key |
+| `REPLACE_ME_SALT` | Encryption salt (padded to 32 bytes at runtime) |
+| `REPLACE_ME_OBF` | Packet obfuscation (`padding` default; empty/`none` forced to `padding`) |
+| `REPLACE_ME_JITTER` | Heartbeat jitter percent |
+
+Unpatched **release** agents: empty server URL → `invalid_target` (no lab localhost fallback).
 
 ## Noise v2 + agent/server alignment (required)
 
@@ -100,19 +124,22 @@ Client `build.rs` and server `WireIDs` share `CUPCAKE_WIRE_SEED` (default `wire-
 | Handshake | **Noise v2 only**: 49-byte frames (`0x02 \|\| pubkey32 \|\| psk_mac16`) |
 | PSK | Listener AES **base** key — same bytes as agent `get_aes_key_base()` (32 ASCII or 64 hex). Short keys rejected (no zero-pad). |
 | Legacy | 33-byte v1 handshake is **rejected** on WS/TCP |
-| Register | Agent must send `reg_proof` = HMAC(session_key, `cupcake-reg-v1\|`\|\|uuid) |
-| Deploy | Rebuild **both** `cupcake-server` and agent after this cut |
+| Register | Agent `reg_proof` = HMAC(session_key, seed-derived-domain\|\|uuid) (both ends from wire seed) |
+| Deploy | Rebuild **both** `cupcake-server` and agent after protocol/seed changes |
 
 ```powershell
 cd server
-go build -o cupcake-server.exe .
-# Listener EncryptKey must be exactly 32 bytes (or 64 hex) matching the patched agent key
+# 1) Edit config.json (admin_bind / wire_seed / pass)
+# 2) go build -o cupcake-server.exe .
+# 3) Start server once — note printed admin password if generated
+# 4) Create listener with 32-byte AES key + obfuscation=padding
+# 5) Panel generate / Builder → patches REPLACE_ME_* + CUPCAKE_WIRE_SEED
 ```
 
 ## L2 inject methods (panel / API)
 
 `process_inject` JSON `method`: `nt` | `crt` | `apc` | `stomping` | `auto`  
-(`auto` does not include stomping — opt-in only.)
+(`auto` = stomping → apc → nt fallback chain.)
 
 ## WSS / JA3 (起步)
 

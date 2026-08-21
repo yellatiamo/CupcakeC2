@@ -127,7 +127,7 @@
               <span class="section-index">02b</span>
               <div>
                 <strong>客户端类型</strong>
-                <p>仅两种方向：反向（回连）与正向（bind）。能力相同：终端/文件/进程内置；BOF/inject 按需模块。</p>
+                <p>仅两种方向：反向（回连）与正向（bind）。BOF / inject / ad 按需加载模块。</p>
               </div>
             </div>
 
@@ -155,8 +155,8 @@
               :closable="false"
               show-icon
               :title="form.profile === 'forward'
-                ? '正向：与反向同能力（~0.8MB 内置终端/文件/进程）。须选 正向TCP；生成后面板「正向接入」。BOF/inject 走模块。'
-                : '反向：与正向同能力（~0.8MB 内置终端/文件/进程）。须选 TCP/WS/DNS。BOF/inject 走模块。'"
+                ? '正向：目标监听，面板主动接入。须选 正向TCP；生成后使用「正向接入」。'
+                : '反向：Agent 主动回连。须选 TCP / WebSocket / DNS。'"
               class="profile-alert"
             />
 
@@ -371,7 +371,7 @@
               <div class="tip-row__icon">
                 <el-icon><Monitor /></el-icon>
               </div>
-              <p>休眠时间建议保留在 10 到 30 秒区间，兼顾联机体验和自动化沙箱规避。</p>
+              <p>休眠时间写入 agent：首次回连前等待 N 秒（0=立即连接）。与内置随机静默无关，完全按此处配置。</p>
             </div>
 
             <div class="tip-row">
@@ -379,8 +379,8 @@
                 <el-icon><Share /></el-icon>
               </div>
               <p>
-                <strong>上线</strong>：落盘 EXE 或内存 Fileless（二选一）。
-                <strong>BOF</strong>：上线之后再执行，不是上线步骤。
+                <strong>内存上线 ≠ BOF</strong>：内存上线是把 Stage0 Agent 打成 shellcode 执行（上线本身）。
+                上线后 BOF 走 <code>bof</code> 模块，shellcode 注入走 <code>inject</code>。
               </p>
             </div>
           </div>
@@ -714,7 +714,7 @@ const previewUrl = computed(() => {
 
 const modeDescription = computed(() => (
   form.value.mode === 'build'
-    ? '源码构建：唯一产品档 minimal（shell/fs/pty/socks 内置；BOF/inject 按需 L2 模块）。'
+    ? '源码构建：产品档 minimal；BOF / inject / ad 按需 L2 模块。'
     : '模板补丁：秒级生成；模板均为 minimal。'
 ))
 
@@ -724,12 +724,10 @@ const profileLabel = computed(() => {
 })
 
 const profileDescription = computed(() => {
-  const same =
-    '能力与另一方向完全一致：终端/文件/进程内置（约 0.8MB）；BOF、inject 按需加载模块，不进默认包。'
   if (form.value.profile === 'forward') {
-    return `正向客户端：目标机监听，面板主动接入。${same} 须选 正向TCP 监听器。`
+    return '正向客户端：目标机监听，面板主动接入。须选 正向TCP 监听器。'
   }
-  return `反向客户端：Agent 主动回连。${same} 须选 TCP/WebSocket/DNS。`
+  return '反向客户端：Agent 主动回连。须选 TCP / WebSocket / DNS。'
 })
 
 const onClientTypeChange = (value) => {

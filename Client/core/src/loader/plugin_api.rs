@@ -6,11 +6,14 @@
 use log::warn;
 use std::cell::RefCell;
 use std::ffi::CStr;
+use std::sync::Mutex;
 
-thread_local! {
-    /// BOF 输出缓冲区
-    static BOF_OUTPUT: RefCell<String> = RefCell::new(String::new());
-}
+// NOTE: BOF output state must stay in a plain global (not `thread_local!`):
+// product modules (app_rt.dll) are Manual-Mapped into the agent process, and
+// pe_map refuses images carrying a TLS directory (a thread_local in this file
+// is what used to add one). BOF execution is single-threaded per invocation,
+// so a Mutex is equivalent and keeps the module TLS-free.
+static BOF_OUTPUT: Mutex<String> = Mutex::new(String::new());
 
 /// Beacon 数据解析器
 /// 用于解析从服务器传递给 BOF 的参数
@@ -446,9 +449,9 @@ pub unsafe extern "C" fn BeaconPrintf(
     }
     let args = [a1, a2, a3, a4, a5, a6, a7, a8];
     let msg = mini_printf(fmt, &args);
-    BOF_OUTPUT.with(|o| {
-        o.borrow_mut().push_str(&msg);
-    });
+    if let Ok(mut o) = BOF_OUTPUT.lock() {
+        o.push_str(&msg);
+    }
 }
 
 /// Minimal printf for BOF output. `args` consumed left-to-right for each conversion.
@@ -659,19 +662,21 @@ pub extern "C" fn BeaconOutput(_typ: i32, data: *const u8, len: i32) {
 
     let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
     let msg = String::from_utf8_lossy(slice).into_owned();
-    BOF_OUTPUT.with(|o| {
-        o.borrow_mut().push_str(&msg);
-    });
+    if let Ok(mut o) = BOF_OUTPUT.lock() {
+        o.push_str(&msg);
+    }
 }
 
 /// 获取 BOF 输出
 pub fn get_bof_output() -> String {
-    BOF_OUTPUT.with(|o| o.borrow().clone())
+    BOF_OUTPUT.lock().map(|o| o.clone()).unwrap_or_default()
 }
 
 /// 清空 BOF 输出
 pub fn clear_bof_output() {
-    BOF_OUTPUT.with(|o| o.borrow_mut().clear());
+    if let Ok(mut o) = BOF_OUTPUT.lock() {
+        o.clear();
+    }
 }
 
 #[cfg(test)]

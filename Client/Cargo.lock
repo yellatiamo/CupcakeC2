@@ -296,15 +296,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cupcake-inject-worker"
-version = "0.1.0"
-dependencies = [
- "base64",
- "cupcake-core",
- "serde_json",
-]
-
-[[package]]
 name = "cupcake-mod-bof"
 version = "0.1.0"
 dependencies = [
@@ -312,8 +303,16 @@ dependencies = [
  "cupcake-core",
  "log",
  "serde_json",
- "tokio",
  "winapi",
+]
+
+[[package]]
+name = "cupcake-mod-inject"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cupcake-core",
+ "serde_json",
 ]
 
 [[package]]

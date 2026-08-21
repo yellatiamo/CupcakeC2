@@ -5,7 +5,7 @@
 use crate::config::{get_aes_key, get_aes_key_base};
 use crate::crypto;
 use crate::error::{ClientError, Result};
-use crate::transport::session_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
+use crate::transport::traffic_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -227,9 +227,9 @@ impl Transport for TcpBindTransport {
             match self.accept_one().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    crate::utils::db_print(&format!(
-                        "[agent] bind accept/handshake failed, waiting next peer: {e}"
-                    ));
+                    crate::db_print!(
+                        "[*] bind accept/handshake failed, waiting next peer: {e}"
+                    );
                     // small backoff then accept again (listener stays open)
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }

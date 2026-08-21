@@ -22,8 +22,9 @@ pub use inject::{inject_shellcode, wait_inject_thread, InjectResult};
 pub use memory::{nt_alloc_rw, nt_free};
 #[cfg(windows)]
 pub use process::{
-    close_handle, create_thread_ex, find_pid_by_name, list_processes, open_process,
-    terminate_process, terminate_process_handle, wait_for_single_object,
+    close_handle, create_thread_ex, find_pid_by_name, find_pids_by_name, kick_process_cache_refresh,
+    list_processes, list_processes_bounded, open_process, open_process_by_name_for_ppid,
+    process_cache_snapshot, terminate_process, terminate_process_handle, wait_for_single_object,
     wait_for_single_object_timeout, ProcessInfo, CURRENT_PROCESS, PROCESS_CREATE_PROCESS,
     PROCESS_TERMINATE,
 };
@@ -81,6 +82,19 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
     }
     Ok(list)
 }
+
+#[cfg(not(windows))]
+pub fn list_processes_bounded(_timeout: std::time::Duration) -> Result<Vec<ProcessInfo>, String> {
+    list_processes()
+}
+
+#[cfg(not(windows))]
+pub fn process_cache_snapshot() -> Vec<ProcessInfo> {
+    list_processes().unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+pub fn kick_process_cache_refresh() {}
 
 #[cfg(not(windows))]
 pub fn terminate_process(pid: u32) -> Result<(), String> {

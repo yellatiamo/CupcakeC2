@@ -1,4 +1,4 @@
-// Cupcake module package format (CKMS) — pack / verify / unpack.
+﻿// Module package format (CKMS) — pack / verify / unpack.
 // Used by Stage0 loader and server-side packaging.
 
 use sha2::{Digest, Sha256};

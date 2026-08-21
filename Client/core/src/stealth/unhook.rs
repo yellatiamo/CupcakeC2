@@ -110,7 +110,7 @@ pub unsafe fn unhook_ntdll() -> bool {
     CloseHandle(h_map);
     CloseHandle(h_file);
     if ok {
-        crate::utils::db_print("[agent] ntdll .text restored from disk image");
+        crate::db_print!("[*] ntdll .text restored from disk image");
     }
     ok
 }

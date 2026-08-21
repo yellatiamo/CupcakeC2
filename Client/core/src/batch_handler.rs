@@ -112,10 +112,10 @@ impl BatchMessageHandler {
                 interval_secs.saturating_sub(jitter as u64).max(10)
             };
 
-            crate::utils::db_print(&format!(
-                "[agent] batch loop; next heartbeat {}s",
+            crate::db_print!(
+                "[*] batch loop; next heartbeat {}s",
                 final_delay
-            ));
+            );
 
             let transport = match self.transport.as_mut() {
                 Some(t) => t,

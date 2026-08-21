@@ -2,51 +2,74 @@
 
 | Script | Purpose |
 |--------|---------|
-| `test-services.ps1` | Safe `go test ./services -tags nodonut` (avoids AV on Donut) |
-| `build-frontend.ps1` | `frontend-v2` → `dist/` (go:embed) |
-| `build-inject-module.ps1` | Build L2 inject DLL → `storage/modules/inject.bin` |
+| `build-frontend.ps1` | `frontend-v2` → **`web/dist`** (`//go:embed web/dist/*`) |
+| `build-bof-module.ps1` | L2 BOF engine → `storage/modules/bof.bin` (`app_rt.dll`) |
+| `build-inject-module.ps1` | L2 inject PE → `storage/modules/inject.bin` |
+| `build-ad-module.ps1` | L2 AD PE → `storage/modules/ad.bin` |
+| `test-services.ps1` | Safe Go tests with `-tags nodonut` |
+| `pe-strip-debug.py` | Wipe RSDS/PDB residual from PE |
 
-## Frontend (M-011)
+## Repo root (recommended)
 
-Embed path is **only** `server/dist`. Do not use `server/ui`.
+```powershell
+# Everything
+.\compile.ps1
+
+# Server only (reuse existing web/dist)
+.\compile.ps1 -Target server -SkipFrontend
+
+# Lab binary name
+.\compile.ps1 -Target server -OutputName tmp-server.exe
+
+# Fast agent iterate (x64 WS only)
+.\compile.ps1 -Target agent -AgentProfile core
+
+# L2 modules only
+.\compile.ps1 -Target modules -SkipModuleGate
+```
+
+Or call legacy wrappers:
+
+```powershell
+.\compile_server.ps1
+.\compile_windows.ps1 -Profile product
+```
+
+## Frontend embed path
+
+**Only** `server/web/dist` is embedded (`server/embed.go`).
 
 ```powershell
 powershell -File scripts/build-frontend.ps1
 ```
 
-## `test-services.ps1` (recommended)
+Do **not** rely on `server/ui` (removed / obsolete).
 
-AV often quarantines `services.test.exe` because package `services` used to always
-link **go-donut** (shellcode generator). Daily tests should use:
+## L2 modules
+
+```powershell
+powershell -File scripts/build-bof-module.ps1
+powershell -File scripts/build-inject-module.ps1
+powershell -File scripts/build-ad-module.ps1
+# optional lab DCSync feature:
+powershell -File scripts/build-ad-module.ps1 -WithDcsync
+```
+
+Artifacts land in `storage/modules/{bof,inject,ad}.bin` (stripped + strings-gated).
+
+## Go tests (`test-services.ps1`)
+
+AV often quarantines Donut-linked test binaries. Daily:
 
 ```powershell
 cd server
 powershell -File scripts/test-services.ps1
 ```
 
-This runs:
-
-```text
-go test ./services/ -tags nodonut -count=1
-```
-
-With `-tags nodonut`, `ToShellcodeFromBytes` is a stub (`donut_service_stub.go`), so the
-test binary does not embed Donut.
-
-### Full Donut / fileless conversion tests
+Full Donut path:
 
 ```powershell
 powershell -File scripts/test-services.ps1 -WithDonut
-# or compile only under TEMP:
-powershell -File scripts/test-services.ps1 -WithDonut -Compile
 ```
 
-If AV still kills the binary, exclude the folder or run on a lab VM without real-time scan on `%TEMP%`.
-
-### Never do this on a scanned volume
-
-```powershell
-go test -c ./services/          # writes services.test.exe into server/ → often deleted
-```
-
-Production `go build` is unchanged (Donut included; no `nodonut` tag).
+Never leave `go test -c` artifacts on a scanned volume without exclusion.

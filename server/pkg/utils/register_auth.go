@@ -8,13 +8,15 @@ import (
 	"strings"
 )
 
-// RegProofDomain must match Client/core crypto::REG_PROOF_DOMAIN.
-const RegProofDomain = "cupcake-reg-v1|"
+// regProofDomain returns the seed-derived register proof domain (matches client wire_ids).
+func regProofDomain() []byte {
+	return GetWireIDs().RegProofDomain
+}
 
 // ComputeRegisterProof returns base64(HMAC-SHA256(sessionKey, domain||uuid)).
 func ComputeRegisterProof(sessionKey []byte, agentUUID string) string {
 	mac := hmac.New(sha256.New, sessionKey)
-	mac.Write([]byte(RegProofDomain))
+	mac.Write(regProofDomain())
 	mac.Write([]byte(agentUUID))
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
@@ -34,7 +36,7 @@ func VerifyRegisterProof(sessionKey []byte, agentUUID, proofB64 string) bool {
 		return false
 	}
 	mac := hmac.New(sha256.New, sessionKey)
-	mac.Write([]byte(RegProofDomain))
+	mac.Write(regProofDomain())
 	mac.Write([]byte(agentUUID))
 	expect := mac.Sum(nil)
 	return subtle.ConstantTimeCompare(got, expect) == 1

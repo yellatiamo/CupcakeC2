@@ -123,56 +123,74 @@ func DeriveKeyAgent(baseKey, salt []byte) []byte {
 // ObfuscatePacket applies secondary obfuscation to encrypted data.
 // Supported modes: base64, junk, padding, none.
 // "xor" mode removed (repeating-key XOR leaks key material via frequency analysis).
+//
+// padding = client apply_tailored_padding: [ciphertext][rand 50..2048][orig_len u32 BE]
+// junk    = [ciphertext][rand 8..64][orig_len u32 BE]
 func ObfuscatePacket(data []byte, mode string, key []byte) []byte {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
 	case "base64":
 		return []byte(base64.StdEncoding.EncodeToString(data))
 	case "junk":
-		originalLen := uint32(len(data))
-		// Random junk 8-64 bytes
-		junkLen := randInt(8, 64)
-		junk := make([]byte, junkLen)
-		_, _ = rand.Read(junk)
-
-		out := make([]byte, len(data)+junkLen+4)
-		copy(out, data)
-		copy(out[len(data):], junk)
-		// Put original length at the very end (4 bytes BE)
-		binary.BigEndian.PutUint32(out[len(out)-4:], originalLen)
-		return out
+		return appendLenPrefixedPadding(data, randInt(8, 64))
+	case "padding":
+		// Match Client/core crypto::apply_tailored_padding (50–2048 random + u32 BE len)
+		return appendLenPrefixedPadding(data, randInt(50, 2048+1))
 	default:
+		// "none"/empty: pure ciphertext
 		return data
 	}
 }
 
+// appendLenPrefixedPadding: [data][junk N][len(data) as u32 BE]
+func appendLenPrefixedPadding(data []byte, junkLen int) []byte {
+	if junkLen < 1 {
+		junkLen = 8
+	}
+	originalLen := uint32(len(data))
+	junk := make([]byte, junkLen)
+	_, _ = rand.Read(junk)
+	out := make([]byte, len(data)+junkLen+4)
+	copy(out, data)
+	copy(out[len(data):], junk)
+	binary.BigEndian.PutUint32(out[len(out)-4:], originalLen)
+	return out
+}
+
 // DeobfuscatePacket reverses the obfuscation.
-// "xor" mode removed (see ObfuscatePacket comments).
 func DeobfuscatePacket(data []byte, mode string, key []byte) []byte {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
 	case "base64":
 		decoded, err := base64.StdEncoding.DecodeString(string(data))
-		if err != nil { return data }
-		return decoded
-	case "junk":
-		if len(data) < 4 { return data }
-		originalLen := binary.BigEndian.Uint32(data[len(data)-4:])
-		if int(originalLen) <= len(data)-4 {
-			return data[:originalLen]
+		if err != nil {
+			return data
 		}
-		return data
-	case "padding":
-		return RemoveDefaultPadding(data)
+		return decoded
+	case "junk", "padding":
+		// Same wire layout as Client (u32 BE original length trailer)
+		return RemoveTailoredPadding(data)
 	default:
 		// "none"/empty: pure ciphertext. Do NOT strip padding here.
 		return data
 	}
 }
 
-// RemoveDefaultPadding strips the client-side default padding format used by a
-// previous buggy agent build: [ciphertext][junk N bytes][N as u16 BE].
-// Safe when N is out of range — returns data unchanged.
+// RemoveTailoredPadding strips client padding/junk:
+// [ciphertext][random…][original_len u32 BE]. Safe if trailer is nonsense.
+func RemoveTailoredPadding(data []byte) []byte {
+	if len(data) < 4 {
+		return data
+	}
+	originalLen := binary.BigEndian.Uint32(data[len(data)-4:])
+	if originalLen == 0 || int(originalLen) > len(data)-4 {
+		return data
+	}
+	return data[:originalLen]
+}
+
+// RemoveDefaultPadding strips the legacy small-padding format:
+// [ciphertext][junk N bytes][N as u16 BE], N in 1..16.
 func RemoveDefaultPadding(data []byte) []byte {
 	if len(data) < 2 {
 		return data
@@ -188,19 +206,22 @@ func RemoveDefaultPadding(data []byte) []byte {
 }
 
 // DecryptAESWithCompat tries DecryptAES; on GCM failure, retries after stripping
-// legacy default padding (broken client "none" mode). Keeps old minimal agents online
-// until they are rebuilt.
+// tailored padding and legacy u16 padding (agent/server mode mismatch recovery).
 func DecryptAESWithCompat(data []byte, key []byte) ([]byte, error) {
 	plain, err := DecryptAES(data, key)
 	if err == nil {
 		return plain, nil
 	}
-	stripped := RemoveDefaultPadding(data)
-	if len(stripped) == len(data) {
-		return nil, err
-	}
-	if plain2, err2 := DecryptAES(stripped, key); err2 == nil {
-		return plain2, nil
+	for _, stripped := range [][]byte{
+		RemoveTailoredPadding(data),
+		RemoveDefaultPadding(data),
+	} {
+		if len(stripped) == len(data) || len(stripped) == 0 {
+			continue
+		}
+		if plain2, err2 := DecryptAES(stripped, key); err2 == nil {
+			return plain2, nil
+		}
 	}
 	return nil, err
 }

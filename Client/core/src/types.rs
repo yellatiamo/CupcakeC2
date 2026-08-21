@@ -44,7 +44,7 @@ pub struct RegisterPayload {
     /// Per-build KDF salt (base64), so server module HMAC matches agent get_aes_key().
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kdf_salt: Option<String>,
-    /// HMAC-SHA256(session_key, "cupcake-reg-v1|"||uuid) base64 — required by server.
+    /// HMAC-SHA256(session_key, seed-derived-domain||uuid) base64 — required by server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reg_proof: Option<String>,
 }

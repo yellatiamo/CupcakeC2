@@ -69,17 +69,21 @@
       <div class="panel-column right-panel">
         <div class="surface-card card-container">
           <div class="card-header">
-            <span class="header-title"><el-icon><Clock /></el-icon> 执行历史 (最近 10 条)</span>
+            <span class="header-title">
+              <el-icon><Clock /></el-icon>
+              执行历史
+              <span v-if="historyTotal" class="header-count">共 {{ historyTotal }} 条</span>
+            </span>
             <div class="header-actions">
-              <el-button link type="primary" @click="goFullHistory">全部历史</el-button>
+              <el-button link type="primary" @click="goFullHistory">全局审计</el-button>
               <el-button link type="primary" @click="fetchLogs">刷新</el-button>
             </div>
           </div>
 
           <div class="card-body task-list-body" v-loading="loadingLogs">
             <div class="task-list">
-              <el-empty v-if="history.length === 0" description="暂无执行记录" />
-              <div v-for="log in history" :key="log.req_id" class="task-item" :class="log.status">
+              <el-empty v-if="historyTotal === 0" description="暂无执行记录" />
+              <div v-for="log in pagedHistory" :key="log.req_id" class="task-item" :class="log.status">
                 <div class="task-info">
                   <div class="task-type-row">
                     <span class="task-type">{{ log.type }}</span>
@@ -92,13 +96,23 @@
                 <div class="task-actions">
                   <el-tag size="small" :type="getStatusType(log.status)">{{ log.status }}</el-tag>
                   <el-button 
-                    v-if="log.status === 'completed'" 
+                    v-if="log.status === 'completed' || log.status === 'failed'" 
                     link 
                     type="primary" 
                     @click="viewResult(log)"
                   >查看回显</el-button>
                 </div>
               </div>
+            </div>
+            <div v-if="historyTotal > pageSize" class="history-pager">
+              <el-pagination
+                v-model:current-page="historyPage"
+                :page-size="pageSize"
+                :total="historyTotal"
+                layout="prev, pager, next"
+                small
+                background
+              />
             </div>
           </div>
         </div>
@@ -162,8 +176,11 @@ const router = useRouter()
 
 const search = ref('')
 const plugins = ref([])
+/** Full plugin execution history for this agent (newest first). */
 const history = ref([])
 const loadingLogs = ref(false)
+const historyPage = ref(1)
+const pageSize = 10
 
 const filteredPlugins = computed(() => {
   return plugins.value.filter(p => {
@@ -185,6 +202,13 @@ const filteredPlugins = computed(() => {
     
     return true
   })
+})
+
+const historyTotal = computed(() => history.value.length)
+
+const pagedHistory = computed(() => {
+  const start = (historyPage.value - 1) * pageSize
+  return history.value.slice(start, start + pageSize)
 })
 
 const runningTasks = computed(() => history.value.filter(h => h.status === 'pending'))
@@ -216,9 +240,9 @@ const fetchPlugins = async () => {
 const fetchLogs = async () => {
     loadingLogs.value = true
     try {
-        // Prefer source-aware agent history; keep existing endpoint shape.
+        // Server caps at 500; load full agent history then filter plugins client-side.
         const histRes = await api.get(`/api/clients/history/${props.clientId}`, {
-          params: { source: 'all', limit: 50 }
+          params: { source: 'all', limit: 500 }
         })
         // 只显示插件执行记录，过滤掉系统命令（migrate、shell、heartbeat等）
         const systemCommands = ['migrate', 'shell', 'shell_interactive', 'shell_exit', 'heartbeat', 'file_upload', 'file_download', 'file_upload_chunk', 'file_download_chunk', 'file_delete', 'file_list', 'module_stage', 'module_unload']
@@ -228,7 +252,10 @@ const fetchLogs = async () => {
           if (t.startsWith('file_') || t.startsWith('process_') || t.startsWith('ad_') || t.startsWith('module_')) return false
           return true
         })
-        history.value = pluginOnly.slice(0, 10)
+        history.value = pluginOnly
+        // Keep current page in range after refresh
+        const maxPage = Math.max(1, Math.ceil(pluginOnly.length / pageSize) || 1)
+        if (historyPage.value > maxPage) historyPage.value = maxPage
     } catch (e) {
         console.error('Logs fetch failed', e)
     } finally {
@@ -537,10 +564,26 @@ onMounted(() => {
   color: var(--text-strong);
 }
 
+.header-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
 .header-actions {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+}
+
+.history-pager {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--line-muted);
+  background: var(--bg-panel-strong);
 }
 
 .task-type-row {

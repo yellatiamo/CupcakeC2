@@ -1,4 +1,4 @@
-//! Yamux **FILE (0x0E)** binary transfer stream (agent half).
+﻿//! Yamux **FILE (0x0E)** binary transfer stream (agent half).
 //!
 //! # Wire protocol (must match server)
 //!
@@ -18,7 +18,7 @@
 //!   chunk_len: u32 BE   // 0 = end of file
 //!   chunk:     [chunk_len] raw bytes
 //! ```
-//! Agent writes to `path + ".cupcake.part"`, renames to `path` on chunk_len=0.
+//! Agent writes to `path + ".part"`, renames to `path` on chunk_len=0.
 //!
 //! ## Put response (agent → server)
 //! ```text
@@ -59,7 +59,7 @@ pub const STATUS_OK: u8 = 0;
 /// Error status.
 pub const STATUS_ERR: u8 = 1;
 
-const PART_SUFFIX: &str = ".cupcake.part";
+const PART_SUFFIX: &str = crate::wire_ids::STAGING_FILE_SUFFIX;
 /// Reject single chunks larger than this (DoS / OOM guard).
 const MAX_CHUNK: u32 = 16 * 1024 * 1024;
 /// Max path length (matches u16, with a practical cap).
@@ -625,6 +625,10 @@ mod tests {
 
     #[test]
     fn staging_suffix() {
-        assert_eq!(staging_path("/tmp/a.bin"), "/tmp/a.bin.cupcake.part");
+        let p = staging_path("/tmp/a.bin");
+        assert!(p.starts_with("/tmp/a.bin."));
+        assert!(p.ends_with(".part"));
+        // Must not use the old fixed brand suffix
+        assert!(!p.ends_with(".part"));
     }
 }

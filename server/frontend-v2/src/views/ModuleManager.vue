@@ -6,11 +6,11 @@
           <span class="panel-kicker">模块能力 · L2 Modules</span>
           <h3>模块仓库</h3>
           <p class="hint">
-            <strong>模块能力</strong>（L2 产品模块，分模块推送）：
-            <code>bof</code>（进程内 BOF 执行器）、
-            <code>inject</code>（进程注入 worker）、
+            L2 产品模块仓库：
+            <code>bof</code>（进程内经典 BOF 执行器，Manual-Map 无文件）、
+            <code>inject</code>（shellcode 注入 worker）、
             <code>ad</code>（域渗透 worker）。
-            与「插件能力」分离：插件是武器载荷，依赖对应模块。
+            插件是载荷，依赖对应模块。
           </p>
         </div>
         <el-button type="primary" :loading="loading" @click="refresh">

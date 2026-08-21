@@ -2,13 +2,13 @@
   <div class="module-panel">
     <div class="panel-head">
       <div>
-        <h3>模块能力 · L2</h3>
+        <h3>模块</h3>
         <p class="hint">
-          终端/文件/进程已内置。本页推送<strong>模块能力</strong>：
+          本页推送<strong>模块能力</strong>：
           <code>bof</code>（进程内经典 BOF 执行器，Manual-Map 无文件加载）、
           <code>inject</code>（shellcode 注入 worker）、
           <code>ad</code>（域渗透 worker）。
-          「已就绪」= 模块已在 Agent 侧可执行，inject/ad 为独立 worker 而非常驻进程。
+          「已就绪」= 模块已在 Agent 侧可执行；inject / ad 为独立 worker，而非常驻进程。
         </p>
       </div>
       <div class="head-actions">
@@ -94,7 +94,7 @@
     </el-table>
 
     <p class="foot-note">
-      bof = Agent 进程内 Manual-Map 加载（无文件落地、无新进程）；inject / ad = 独立 sacrificial worker。.NET 执行已退役：程序集请转 shellcode（如 Donut）后走 inject。
+      bof：进程内 Manual-Map（无落盘）。inject / ad：独立 worker。
     </p>
   </div>
 </template>

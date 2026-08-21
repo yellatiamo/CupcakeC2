@@ -1,0 +1,14 @@
+{
+  "admin_port": 9999,
+  "admin_user": "admin",
+  "admin_pass": "",
+  "admin_bind": "127.0.0.1",
+  "admin_tls": false,
+  "admin_tls_auto": false,
+  "agent_stale_secs": 180,
+  "wire_seed": "",
+  "_comment_admin": "Empty admin_pass → random password printed once on first boot. Never use CUPCAKE_FORCE_DEV_PASS in production.",
+  "_comment_bind": "Loopback is the safe default. Public panel: set admin_bind and preferably admin_tls (+ cert/key).",
+  "_comment_wire": "wire_seed must match agent Builder CUPCAKE_WIRE_SEED. Empty → server generates once and writes back to config.json + DB.",
+  "_comment_noise": "Listener AES key must be 32 ASCII bytes or 64 hex; Builder patches agent REPLACE_ME_AES_KEY / REPLACE_ME_URL / REPLACE_ME_SALT."
+}

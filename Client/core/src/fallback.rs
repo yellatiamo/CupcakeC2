@@ -1,4 +1,4 @@
-// Client/core/src/fallback.rs
+﻿// Client/core/src/fallback.rs
 // 🛡️ Phase 3: Fallback Channel Implementation
 //
 // When primary channel (ws/wss/tcp) disconnects, automatically switch to
@@ -8,7 +8,6 @@
 
 use crate::config::get_server_url;
 use crate::error::{ClientError, Result};
-use crate::transport::Transport;
 use log::{debug, info, warn};
 
 /// Fallback channel state
@@ -72,7 +71,7 @@ impl FallbackManager {
     /// Switch to fallback channel when primary fails
     pub fn switch_to_fallback(&mut self) -> Option<String> {
         if self.state == FallbackState::Primary {
-            info!("[agent] primary channel failed, switching backup");
+            info!("[*] primary channel failed, switching backup");
             // Allow a fresh recovery budget after each primary failure
             self.recovery_attempts = 0;
 
@@ -80,17 +79,17 @@ impl FallbackManager {
                 #[cfg(feature = "dns")]
                 {
                     self.state = FallbackState::DnsBackup;
-                    info!("[agent] DNS backup active");
+                    info!("[*] DNS backup active");
                     return Some(dns_url.clone());
                 }
 
                 #[cfg(not(feature = "dns"))]
                 {
-                    warn!("[agent] DNS backup unavailable");
+                    warn!("[*] DNS backup unavailable");
                     self.state = FallbackState::WaitingRecovery;
                 }
             } else {
-                warn!("[agent] No DNS backup available, entering recovery mode");
+                warn!("[*] No DNS backup available, entering recovery mode");
                 self.state = FallbackState::WaitingRecovery;
             }
         }
@@ -104,12 +103,12 @@ impl FallbackManager {
 
             if self.recovery_attempts <= self.max_recovery_attempts {
                 info!(
-                    "[agent] Recovery attempt {} of {}",
+                    "[*] Recovery attempt {} of {}",
                     self.recovery_attempts, self.max_recovery_attempts
                 );
                 Some(self.primary_url.clone())
             } else {
-                warn!("[agent] Max recovery attempts reached, staying on backup");
+                warn!("[*] Max recovery attempts reached, staying on backup");
                 None
             }
         } else {
@@ -120,7 +119,7 @@ impl FallbackManager {
     /// Mark primary channel as recovered
     pub fn mark_recovered(&mut self) {
         if self.state != FallbackState::Primary {
-            info!("[agent] Primary channel recovered");
+            info!("[*] Primary channel recovered");
             self.state = FallbackState::Primary;
             self.recovery_attempts = 0;
         }

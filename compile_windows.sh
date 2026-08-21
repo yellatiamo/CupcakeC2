@@ -1,18 +1,12 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Cupcake C2 - Windows agent templates (Linux cross-compile via mingw)
+# Product features: <transport>,minimal  |  bin: cupcake-agent.exe
+set -euo pipefail
 
-# Cupcake C2 - Windows Agent 交叉编译脚本 (Linux -> Windows)
-# 使用 mingw-w64 编译器在 Linux 上生成 Windows 版本的 Agent 模板。
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
 
-set -e
+PROFILE="${1:-product}"   # product | core
 
-# 颜色定义
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# 确保脚本在根目录运行
 cd "$(dirname "$0")"
 PROJECT_ROOT=$(pwd)
 CLIENT_DIR="$PROJECT_ROOT/Client"
@@ -22,85 +16,71 @@ echo -e "${BLUE}=========================================${NC}"
 echo -e "${BLUE}   Cupcake C2 - Windows Cross-Compiler   ${NC}"
 echo -e "${BLUE}=========================================${NC}"
 
-# 1. 检查 Rust 环境
-if ! command -v cargo &> /dev/null; then
-    echo -e "${RED}[!] 未检测到 Cargo，请先安装 Rust 环境。${NC}"
-    exit 1
+command -v cargo >/dev/null || { echo -e "${RED}cargo not found${NC}"; exit 1; }
+
+if ! command -v x86_64-w64-mingw32-gcc >/dev/null; then
+  echo -e "${YELLOW}[*] installing mingw-w64...${NC}"
+  sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
 fi
 
-# 2. 检查 MinGW 环境
-if ! command -v x86_64-w64-mingw32-gcc &> /dev/null; then
-    echo -e "${YELLOW}[*] 未检测到 x86_64-w64-mingw32-gcc，正在尝试安装...${NC}"
-    sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
-fi
-
-# 3. 准备输出目录
 mkdir -p "$ASSETS_DIR"
 
-# 4. 编译函数
-build_windows_template() {
-    local arch=$1
-    local proto=$2
-    local output_name=$3
-    local target=""
+# Prefer config.json / env wire seed
+if [[ -z "${CUPCAKE_WIRE_SEED:-}" && -f "$PROJECT_ROOT/server/config.json" ]]; then
+  CUPCAKE_WIRE_SEED=$(python3 -c "import json;print(json.load(open('server/config.json')).get('wire_seed',''))" 2>/dev/null || true)
+  export CUPCAKE_WIRE_SEED
+fi
+[[ -n "${CUPCAKE_WIRE_SEED:-}" ]] && echo -e "${GREEN}  [OK] wire_seed=$CUPCAKE_WIRE_SEED${NC}"
 
-    echo -e "${YELLOW}[*] 正在构建 Windows 模板: $output_name (Arch: $arch, Feature: $proto)...${NC}"
-
-    if [ "$arch" == "x64" ]; then
-        target="x86_64-pc-windows-gnu"
-    elif [ "$arch" == "x86" ]; then
-        target="i686-pc-windows-gnu"
-        if ! command -v i686-w64-mingw32-gcc &> /dev/null; then
-             sudo apt-get install -y gcc-mingw-w64-i686 g++-mingw-w64-i686
-        fi
-    fi
-
-    # 尝试安装 target
-    rustup target add "$target" >/dev/null 2>&1 || true
-
-    cd "$CLIENT_DIR"
-    
-    # 🛡️ STEALTH: 移除本地路径前缀
-    export RUSTFLAGS="--remap-path-prefix $CLIENT_DIR=/cupcake"
-
-    # 执行编译
-    if cargo build -p cupcake-core --release --target "$target" --no-default-features --features "$proto"; then
-        local src_path="$CLIENT_DIR/target/$target/release/cupcake-core.exe"
-        if [ -f "$src_path" ]; then
-            # 🛡️ Phase 3: 可选 UPX 压缩
-            if command -v upx &> /dev/null; then
-                echo -e "${YELLOW}[*] 正在 UPX 压缩: $output_name...${NC}"
-                upx --ultra-brute "$src_path" 2>/dev/null || upx --best "$src_path" 2>/dev/null || true
-            fi
-            cp "$src_path" "$ASSETS_DIR/$output_name"
-            echo -e "${GREEN}[+] 成功生成: $output_name${NC}"
-        else
-            echo -e "${RED}[!] 错误: 产物文件丢失${NC}"
-            exit 1
-        fi
-    else
-        echo -e "${RED}[!] 编译失败: $output_name${NC}"
-        exit 1
-    fi
-    cd ..
+find_agent_bin() {
+  local target="$1"
+  local dir="$CLIENT_DIR/target/$target/release"
+  for n in cupcake-agent.exe cupcake-core.exe; do
+    [[ -f "$dir/$n" ]] && { echo "$dir/$n"; return 0; }
+  done
+  return 1
 }
 
-# 5. 执行批量编译任务
-echo -e "${YELLOW}[*] 开始全量 Windows 模板编译进程 (GNU 链)...${NC}"
+build_windows_template() {
+  local arch="$1" transport="$2" output_name="$3"
+  local target features
+  if [[ "$arch" == "x64" ]]; then
+    target="x86_64-pc-windows-gnu"
+  else
+    target="i686-pc-windows-gnu"
+    command -v i686-w64-mingw32-gcc >/dev/null || sudo apt-get install -y gcc-mingw-w64-i686 g++-mingw-w64-i686
+  fi
+  features="${transport},minimal"
+  echo -e "${YELLOW}[*] $output_name  features=$features${NC}"
+  rustup target add "$target" >/dev/null 2>&1 || true
+  cd "$CLIENT_DIR"
+  export RUSTFLAGS="--remap-path-prefix $CLIENT_DIR=."
+  cargo build -p cupcake-core --release --target "$target" \
+    --no-default-features --features "$features"
+  local src
+  src=$(find_agent_bin "$target") || { echo -e "${RED}binary missing${NC}"; exit 1; }
+  cp "$src" "$ASSETS_DIR/$output_name"
+  echo -e "${GREEN}[+] $output_name${NC}"
+  cd "$PROJECT_ROOT"
+}
 
-# WebSocket
-build_windows_template "x64" "ws"       "client_template_windows.exe"
-build_windows_template "x86" "ws"       "client_template_windows_x86.exe"
+echo -e "${YELLOW}[*] profile=$PROFILE${NC}"
 
-# Reverse TCP
-build_windows_template "x64" "tcp"      "client_template_windows_tcp.exe"
-
-# Bind TCP
-build_windows_template "x64" "tcp_bind" "client_template_windows_bind.exe"
-
-# DNS
-build_windows_template "x64" "dns"      "client_template_windows_dns.exe"
+case "$PROFILE" in
+  core)
+    build_windows_template x64 ws client_template_windows.exe
+    ;;
+  product|all|*)
+    build_windows_template x64 ws client_template_windows.exe
+    build_windows_template x86 ws client_template_windows_x86.exe
+    build_windows_template x64 tcp client_template_windows_tcp.exe
+    cp -f "$ASSETS_DIR/client_template_windows_tcp.exe" \
+          "$ASSETS_DIR/client_template_windows_tcp_minimal.exe"
+    build_windows_template x64 tcp_bind client_template_windows_bind.exe
+    build_windows_template x64 dns client_template_windows_dns.exe
+    ;;
+esac
 
 echo -e "${BLUE}-----------------------------------------${NC}"
-echo -e "${GREEN}[DONE] Windows 模板编译完成。${NC}"
+echo -e "${GREEN}[DONE] Windows templates → $ASSETS_DIR${NC}"
 echo -e "${BLUE}-----------------------------------------${NC}"

@@ -83,18 +83,47 @@ pub const PROFILE_GITHUB: MalleableProfile = MalleableProfile {
     ja3_hint: "github-webhook",
 };
 
-/// Default profile — still inject a realistic browser UA (not empty).
+/// Default profile — path is `/socket` (not the eternal `/ws` fingerprint).
+/// UA is a Chrome LTS-style string; pool rotation happens at connect time.
 pub const PROFILE_DEFAULT: MalleableProfile = MalleableProfile {
     name: "default",
     method: "POST",
-    uri_template: "/ws",
+    uri_template: "/socket",
     headers: &[
         ("Accept", "*/*"),
         ("Accept-Language", "en-US,en;q=0.9"),
     ],
-    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    ja3_hint: "chrome-126",
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    ja3_hint: "chrome-128",
 };
+
+/// Rotate among realistic browser UAs (Chrome family aligned with ja3 hints).
+pub fn pick_user_agent(profile: &MalleableProfile) -> &'static str {
+    const POOL: &[&str] = &[
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    ];
+    if profile.name != "default" && !profile.user_agent.is_empty() {
+        return profile.user_agent;
+    }
+    let idx = (crate::utils::next_u32_secure() as usize) % POOL.len();
+    POOL[idx]
+}
+
+/// Sec-Fetch values drawn from realistic browser distributions.
+pub fn pick_sec_fetch() -> (&'static str, &'static str, &'static str) {
+    // (dest, mode, site)
+    const VARIANTS: &[(&str, &str, &str)] = &[
+        ("empty", "cors", "cross-site"),
+        ("empty", "cors", "same-site"),
+        ("empty", "websocket", "cross-site"),
+        ("empty", "websocket", "same-origin"),
+    ];
+    let idx = (crate::utils::next_u32_secure() as usize) % VARIANTS.len();
+    VARIANTS[idx]
+}
 
 /// Get profile by name. Returns default if not found.
 pub fn get_profile(name: &str) -> MalleableProfile {
@@ -191,8 +220,9 @@ pub fn apply_profile_headers(
     builder: &mut tokio_tungstenite::tungstenite::http::Request<()>,
 ) {
     use tokio_tungstenite::tungstenite::http::header;
-    if !profile.user_agent.is_empty() {
-        if let Ok(ua) = profile.user_agent.parse() {
+    let ua_str = pick_user_agent(profile);
+    if !ua_str.is_empty() {
+        if let Ok(ua) = ua_str.parse() {
             builder.headers_mut().insert(header::USER_AGENT, ua);
         }
     }
@@ -234,9 +264,25 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_ws_path() {
+    fn default_profile_not_fixed_ws_path() {
+        let p = get_profile("default");
+        assert_ne!(p.uri_template, "/ws");
+        assert!(p.uri_template.starts_with('/'));
+    }
+
+    #[test]
+    fn sec_fetch_variants_are_nonempty() {
+        let (d, m, s) = pick_sec_fetch();
+        assert!(!d.is_empty());
+        assert!(!m.is_empty());
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn default_profile_socket_path() {
         let p = get_profile("default");
         let u = url_with_profile_path("ws://127.0.0.1:8080/anything", &p);
-        assert_eq!(u, "ws://127.0.0.1:8080/ws");
+        assert_eq!(u, "ws://127.0.0.1:8080/socket");
+        assert!(!u.ends_with("/ws"));
     }
 }

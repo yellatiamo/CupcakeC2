@@ -19,5 +19,27 @@
     "required_os": "windows",
     "hash": "55af23237b3cc1cda8d014ae71408a6eb73342d4e6c78f94e97c9f0a9747b0ed",
     "params": null
+  },
+  {
+    "id": "PL-1786361644",
+    "name": "fsan",
+    "description": "",
+    "file_name": "fscan.exe",
+    "type": "native-exec",
+    "category": "general",
+    "required_os": "windows",
+    "hash": "5aefcbfa98b8e8814dc415a87e4e7e8716004048857d80b37f03e600b6fd2441",
+    "params": null
+  },
+  {
+    "id": "PL-1786361695",
+    "name": "whoami",
+    "description": "",
+    "file_name": "whoami.exe",
+    "type": "native-exec",
+    "category": "general",
+    "required_os": "windows",
+    "hash": "23240ef9f8b0a9a324110b1c2331de31dc1b0e08f5359cb707e51a939af56cd3",
+    "params": null
   }
 ]

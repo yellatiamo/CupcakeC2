@@ -32,7 +32,7 @@ pub fn patch_etw() {
         let trace_flags: u32 = PROCESS_TRACE_FLAG_DISABLE;
         let status = crate::syscall_nt!(
             b"NtSetInformationProcess",
-            0xFFFFFFFFFFFFFFFFusize, // NtCurrentProcess()
+            !0usize, // NtCurrentProcess (-1) — x86/x64
             PROCESS_TRACE_FLAGS,
             &trace_flags as *const u32,
             4u32, // sizeof(u32)
@@ -185,7 +185,7 @@ unsafe fn change_memory_protection(addr: usize, size: usize, new_protect: u32) -
     let mut old_protect: u32 = 0;
     let status = crate::syscall_nt!(
         b"NtProtectVirtualMemory",
-        0xFFFFFFFFFFFFFFFFusize, // NtCurrentProcess
+        !0usize, // NtCurrentProcess (-1) — x86/x64
         &mut base as *mut usize,
         &mut region_size as *mut usize,
         new_protect,
@@ -206,7 +206,7 @@ unsafe fn restore_memory_protection(addr: usize, size: usize, old_protect: u32) 
     let mut dummy: u32 = 0;
     let _ = crate::syscall_nt!(
         b"NtProtectVirtualMemory",
-        0xFFFFFFFFFFFFFFFFusize,
+        !0usize, // NtCurrentProcess (-1) — x86/x64
         &mut base as *mut usize,
         &mut region_size as *mut usize,
         old_protect,

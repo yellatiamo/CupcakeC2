@@ -200,7 +200,7 @@ pub fn upload(path: &str, data_base64: &str) -> Result<()> {
             error!("Failed to decode base64 data: {}", e);
             return Err(ClientError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid base64 data: {}", e),
+                format!("decode error: {}", e),
             )));
         }
     };
@@ -315,7 +315,7 @@ pub fn upload_chunk(path: &str, data_base64: &str, is_append: bool) -> Result<()
         Err(e) => {
             return Err(ClientError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Invalid base64 data: {}", e),
+                format!("decode error: {}", e),
             )));
         }
     };

@@ -128,6 +128,151 @@ pub fn decode_request_frame(data: &[u8]) -> Result<AdJobRequest, String> {
     serde_json::from_slice(&data[4..4 + len]).map_err(|e| e.to_string())
 }
 
+// ── Reflective worker ABI (4.0.2) ───────────────────────────────────────────
+
+/// Worker I/O descriptor mirroring `cupcake_core::worker_io::WorkerIo`
+/// (ABI-shared with reflective_loader; ad worker does not link cupcake_core).
+/// offset 0: u64 job_read — job pipe read handle (child-relative)
+/// offset 8: u64 result_write — result pipe write handle (child-relative)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WorkerIo {
+    job_read: u64,
+    result_write: u64,
+}
+
+/// x0 — init.
+#[export_name = "x0"]
+pub extern "C" fn x0() -> i32 {
+    0
+}
+
+/// x1 — CreateRemoteThread entry. Thread param = `WorkerIo` page (job/result
+/// pipe handles, child-relative); null falls back to legacy stdio. Writes
+/// inject-compatible result framing (out_len|err_len|out|err) where `out` is
+/// the AD `u32le||JSON` response frame.
+#[export_name = "x1"]
+pub unsafe extern "system" fn x1(param: *mut core::ffi::c_void) -> u32 {
+    match std::panic::catch_unwind(|| run_worker_stdio(param)) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => {
+            let _ = write_pipe_result(param, b"", e.as_bytes());
+            1
+        }
+        Err(_) => {
+            let _ = write_pipe_result(param, b"", b"ad worker panic");
+            2
+        }
+    }
+}
+
+/// x2 — free (unused).
+#[export_name = "x2"]
+pub extern "C" fn x2() -> i32 {
+    0
+}
+
+/// x3 — shutdown.
+#[export_name = "x3"]
+pub extern "C" fn x3() -> i32 {
+    0
+}
+
+/// Read the WorkerIo from the thread param (None for legacy null param).
+unsafe fn worker_io(param: *mut core::ffi::c_void) -> Option<WorkerIo> {
+    if param.is_null() {
+        return None;
+    }
+    let b = std::slice::from_raw_parts(param as *const u8, 16);
+    let io = WorkerIo {
+        job_read: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        result_write: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+    };
+    if io.job_read == 0 || io.result_write == 0 {
+        return None;
+    }
+    Some(io)
+}
+
+/// Read exactly `n` bytes from a raw child-relative handle (no close).
+unsafe fn read_exact_handle(handle: u64, buf: &mut [u8]) -> Result<(), String> {
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    let f = std::fs::File::from_raw_handle(handle as RawHandle);
+    let mut f = std::mem::ManuallyDrop::new(f);
+    use std::io::Read;
+    f.read_exact(buf).map_err(|e| e.to_string())
+}
+
+/// Write all bytes to a raw child-relative handle (no close).
+unsafe fn write_all_handle(handle: u64, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    let f = std::fs::File::from_raw_handle(handle as RawHandle);
+    let mut f = std::mem::ManuallyDrop::new(f);
+    f.write_all(data).map_err(|e| e.to_string())?;
+    f.flush().map_err(|e| e.to_string())
+}
+
+fn run_worker_stdio(param: *mut core::ffi::c_void) -> Result<(), String> {
+    let io = unsafe { worker_io(param) };
+    let mut hdr = [0u8; 4];
+    match io {
+        Some(io) => unsafe { read_exact_handle(io.job_read, &mut hdr) }?,
+        None => {
+            use std::io::Read;
+            std::io::stdin()
+                .read_exact(&mut hdr)
+                .map_err(|e| format!("read len: {e}"))?;
+        }
+    }
+    let len = u32::from_le_bytes(hdr) as usize;
+    if len > 8 * 1024 * 1024 {
+        return Err("request too large".into());
+    }
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        match io {
+            Some(io) => unsafe { read_exact_handle(io.job_read, &mut body) }?,
+            None => {
+                use std::io::Read;
+                std::io::stdin()
+                    .read_exact(&mut body)
+                    .map_err(|e| format!("read body: {e}"))?;
+            }
+        }
+    }
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&hdr);
+    frame.extend_from_slice(&body);
+    let req = decode_request_frame(&frame)?;
+    let resp = handle_ad_job(&req);
+    let out = encode_response_frame(&resp)?;
+    write_pipe_result(param, &out, b"")
+}
+
+/// Write inject-compatible framed result (out_len|err_len|out|err).
+/// Prefers the param result handle; falls back to stdout.
+fn write_pipe_result(param: *mut core::ffi::c_void, stdout: &[u8], stderr: &[u8]) -> Result<(), String> {
+    if let Some(io) = unsafe { worker_io(param) } {
+        let mut frame = Vec::with_capacity(8 + stdout.len() + stderr.len());
+        frame.extend_from_slice(&(stdout.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&(stderr.len() as u32).to_le_bytes());
+        frame.extend_from_slice(stdout);
+        frame.extend_from_slice(stderr);
+        return unsafe { write_all_handle(io.result_write, &frame) };
+    }
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(&(stdout.len() as u32).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    out.write_all(&(stderr.len() as u32).to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    out.write_all(stdout).map_err(|e| e.to_string())?;
+    out.write_all(stderr).map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

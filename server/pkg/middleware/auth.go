@@ -1,4 +1,4 @@
-package middleware
+﻿package middleware
 
 import (
 	"crypto/subtle"
@@ -13,8 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"cupcake-server/pkg/metrics"
-	"cupcake-server/pkg/model"
-	"cupcake-server/pkg/store"
+	"cupcake-server/internal/model"
+	"cupcake-server/internal/storage"
 	"cupcake-server/pkg/wsticket"
 )
 
@@ -601,3 +601,4 @@ func AuthMiddleware() gin.HandlerFunc {
 		c.Abort()
 	}
 }
+

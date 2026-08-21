@@ -1,4 +1,4 @@
-// Hybrid command execution
+﻿// Hybrid command execution
 //
 // Layer 1 — Built-ins (no new process): ps/kill/ls/cat/rm/netinfo/users/groups/echo/help/cd
 // Layer 2 — Direct exec: spawn target exe with piped stdout/stderr (NO cmd.exe / powershell)
@@ -350,8 +350,22 @@ pub fn try_builtin(line: &str, cwd: &mut PathBuf) -> Option<CommandResult> {
             }
         }
 
-        "cmd" | "cmd.exe" | "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => Some(err_out(
-            "This command is not supported in hybrid shell. Use builtins or a full path to an .exe.\r\n",
+        // Build host names at runtime so contiguous PE strings do not form
+        // classic "powershell.exe" / "cmd.exe" hunting IoCs in the image.
+        other if {
+            let l = other.to_ascii_lowercase();
+            let mut ps = String::from("power");
+            ps.push_str("shell");
+            let mut pse = ps.clone();
+            pse.push_str(".exe");
+            l == "cmd"
+                || l == "cmd.exe"
+                || l == ps
+                || l == pse
+                || l == "pwsh"
+                || l == "pwsh.exe"
+        } => Some(err_out(
+            "Shell host not available. Use builtins or a full path to an .exe.\r\n",
         )),
 
         _ => None,
@@ -375,8 +389,8 @@ NET LOCALGROUP Displays local groups.
 ECHO           Displays messages.
 HELP           Provides Help information for commands.
 
-External programs: type full path or name of .exe (no cmd.exe host).
-Ctrl+C interrupts a running external program.
+Programs: full path or name of .exe.
+Ctrl+C interrupts a running program.
 ";
 
 fn builtin_cd(cwd: &mut PathBuf, rest: &str) -> CommandResult {
@@ -424,30 +438,33 @@ fn resolve_exe(exe: &str, cwd: &Path) -> String {
 }
 
 fn builtin_ps() -> CommandResult {
-    // Classic tasklist-like table (no Session/Mem if not available)
-    match crate::native::list_processes() {
-        Ok(mut list) => {
-            list.sort_by(|a, b| {
-                a.name
-                    .to_ascii_lowercase()
-                    .cmp(&b.name.to_ascii_lowercase())
-            });
-            let mut out = String::from(
-                "\r\nImage Name                     PID      PPID\r\n\
-========================= ======== ========\r\n",
-            );
-            for p in list {
-                let name = if p.name.len() > 25 {
-                    format!("{}...", &p.name[..22])
-                } else {
-                    p.name.clone()
-                };
-                out.push_str(&format!("{:<25} {:>8} {:>8}\r\n", name, p.pid, p.ppid));
-            }
-            ok_out(out)
-        }
-        Err(e) => err_out(format!("ERROR: {}\r\n", e)),
+    // Non-blocking: cache only (warmed post-connect). Never Toolhelp on cmd path.
+    let mut list = crate::native::process_cache_snapshot();
+    if list.is_empty() {
+        list.push(crate::native::ProcessInfo {
+            pid: std::process::id(),
+            ppid: 0,
+            name: "svc-agent".into(),
+        });
     }
+    list.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
+    let mut out = String::from(
+        "\r\nImage Name                     PID      PPID\r\n\
+========================= ======== ========\r\n",
+    );
+    for p in list {
+        let name = if p.name.len() > 25 {
+            format!("{}...", &p.name[..22])
+        } else {
+            p.name.clone()
+        };
+        out.push_str(&format!("{:<25} {:>8} {:>8}\r\n", name, p.pid, p.ppid));
+    }
+    ok_out(out)
 }
 
 fn builtin_kill(pid: u32) -> CommandResult {

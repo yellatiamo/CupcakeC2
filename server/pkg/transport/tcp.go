@@ -1,4 +1,4 @@
-package transport
+﻿package transport
 
 import (
 	"encoding/binary"
@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"cupcake-server/pkg/globals"
-	"cupcake-server/services"
+	"cupcake-server/internal/service"
 	"github.com/hashicorp/yamux"
 )
 
@@ -87,3 +87,4 @@ func SendTCPMessage(conn net.Conn, data []byte) error {
 	}
 	return nil
 }
+

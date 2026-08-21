@@ -4,7 +4,7 @@ use crate::backoff::ExponentialBackoff;
 use crate::config::{get_aes_key, get_aes_key_base};
 use crate::crypto;
 use crate::error::{ClientError, Result};
-use crate::transport::session_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
+use crate::transport::traffic_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -110,13 +110,14 @@ impl Transport for WebSocketTransport {
             {
                 let headers = req.headers_mut();
                 if self.url.starts_with("wss://") {
-                    if let Ok(v) = "empty".parse() {
+                    let (dest, mode, site) = crate::transport::profile::pick_sec_fetch();
+                    if let Ok(v) = dest.parse() {
                         headers.insert("sec-fetch-dest", v);
                     }
-                    if let Ok(v) = "cors".parse() {
+                    if let Ok(v) = mode.parse() {
                         headers.insert("sec-fetch-mode", v);
                     }
-                    if let Ok(v) = "cross-site".parse() {
+                    if let Ok(v) = site.parse() {
                         headers.insert("sec-fetch-site", v);
                     }
                     if let Some(host) = crate::config::get_host_header() {

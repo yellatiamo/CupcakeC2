@@ -3,26 +3,28 @@
     <section class="surface-card ad-card">
       <div class="panel-head">
         <div>
-          <span class="panel-kicker">模块能力 · AD Tool Module</span>
-          <h3>域渗透工具模块</h3>
+          <span class="panel-kicker">L2 产品模块 · ad</span>
+          <h3>域渗透模块</h3>
           <p class="hint">
-            管理产品模块 <code>ad</code>（域渗透 sacrificial worker）。
-            上传 / 推送 / 查看加载状态。实际 AD 操作在<strong>主机详情 → 域渗透</strong>；
-            执行审计请到「历史记录」筛选类型 AD。
+            本页是<strong>模块列表</strong>（产品模块 <code>ad</code> / sacrificial worker 的登记与推送），
+            <strong>不是</strong> Kerberoast / DCSync 等域渗透<strong>工具</strong>列表。
+            工具在<strong>主机详情 → 域渗透工具</strong>中使用；执行审计见「历史记录」类型 AD。
           </p>
         </div>
         <div class="head-actions">
           <el-button @click="goHistory">AD 执行历史</el-button>
-          <el-button type="primary" :loading="loading" @click="refresh">刷新</el-button>
+          <el-button type="primary" :loading="loading" @click="refresh">刷新模块</el-button>
         </div>
       </div>
 
-      <div class="cap-strip">
-        <div class="cap-item" v-for="c in capabilityHints" :key="c.id">
-          <strong>{{ c.id }}</strong>
-          <span>{{ c.desc }}</span>
-        </div>
-      </div>
+      <el-alert
+        type="info"
+        show-icon
+        :closable="false"
+        class="mb"
+        title="模块 vs 工具"
+        description="模块 = 推送到主机的 ad worker 二进制（本页）。工具 = worker 内可执行的域操作（主机详情页）。"
+      />
 
       <el-divider />
 
@@ -32,6 +34,7 @@
         <el-tag v-if="adModule" size="small" :type="adModule.signed ? 'success' : 'info'" effect="plain">
           {{ adModule.signed ? '已签名' : '未签名' }}
         </el-tag>
+        <el-tag v-else size="small" type="warning" effect="plain">未登记</el-tag>
       </div>
 
       <el-form label-position="top" class="upload-form" @submit.prevent>
@@ -70,20 +73,12 @@
         empty-text="仓库中尚无 ad 模块 — 请上传 cupcake-ad-worker"
         class="mb"
       >
-        <el-table-column prop="id" label="ID" width="90" />
-        <el-table-column prop="name" label="名称" width="140" />
-        <el-table-column prop="description" label="描述" min-width="200" show-overflow-tooltip />
-        <el-table-column label="模块能力" min-width="160">
-          <template #default="{ row }">
-            <div class="cap-row">
-              <el-tag
-                v-for="cap in (row.capabilities || ['ad_ops'])"
-                :key="cap"
-                size="small"
-                type="warning"
-                effect="plain"
-              >{{ cap }}</el-tag>
-            </div>
+        <el-table-column prop="id" label="模块 ID" width="100" />
+        <el-table-column prop="name" label="模块名" width="140" />
+        <el-table-column prop="description" label="说明" min-width="200" show-overflow-tooltip />
+        <el-table-column label="类型" width="110">
+          <template #default>
+            <el-tag size="small" type="warning" effect="plain">L2 worker</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="版本" width="100">
@@ -162,15 +157,15 @@
               {{ isAdLoaded(row.uuid) ? '已在本机' : '推送 ad' }}
             </el-button>
             <el-button size="small" link type="primary" @click="goClientAd(row.uuid)">
-              打开主机 AD
+              打开域渗透工具
             </el-button>
           </template>
         </el-table-column>
       </el-table>
 
       <p class="foot-note">
-        模块能力与插件能力分离：本页只管理 <code>ad</code> 工具模块。
-        执行域发现 / Kerberoast / 图采集等请进入对应主机详情页；全量审计在「历史记录」。
+        本页只管理产品模块 <code>ad</code>（一个 worker 二进制）。
+        域发现 / Kerberoast / DCSync 等<strong>工具</strong>请进入对应主机的「域渗透工具」页；全量审计在「历史记录」。
       </p>
     </section>
   </div>
@@ -209,13 +204,6 @@ const userRole = (() => {
   }
 })()
 const isAdmin = userRole === 'admin' || userRole === 'administrator'
-
-const capabilityHints = [
-  { id: 'ad_ops', desc: '域态势 / 枚举 / 发现' },
-  { id: 'kerberos', desc: 'Kerberoast / AS-REP' },
-  { id: 'graph', desc: '关系图采集预览' },
-  { id: 'dcsync', desc: '高危 · 需确认' }
-]
 
 const adModuleRows = computed(() => (adModule.value ? [adModule.value] : []))
 
@@ -392,23 +380,6 @@ onMounted(refresh)
 }
 .hint { margin: 6px 0 0; opacity: 0.8; font-size: 13px; line-height: 1.55; }
 .head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.cap-strip {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 8px;
-}
-.cap-item {
-  padding: 12px 14px;
-  border-radius: 14px;
-  border: 1px solid rgba(17, 17, 17, 0.08);
-  background: linear-gradient(180deg, #fff, #f7f7f7);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.cap-item strong { font-size: 13px; }
-.cap-item span { font-size: 12px; color: var(--text-muted, #666); }
 .section-title-line {
   display: flex;
   align-items: center;
@@ -425,7 +396,6 @@ onMounted(refresh)
   align-items: flex-end;
 }
 .mb { margin-bottom: 14px; }
-.cap-row { display: flex; flex-wrap: wrap; gap: 4px; }
 .agent-cell { display: flex; flex-direction: column; gap: 2px; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; opacity: 0.7; }
 .foot-note {
@@ -435,7 +405,4 @@ onMounted(refresh)
   color: var(--text-muted, #777);
 }
 code { font-size: 12px; }
-@media (max-width: 960px) {
-  .cap-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
 </style>

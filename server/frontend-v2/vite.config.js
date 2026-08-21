@@ -26,6 +26,8 @@ export default defineConfig({
         },
     },
     build: {
+        // Embed path is server/web/dist (//go:embed web/dist/*). Keep ../dist as
+        // intermediate; compile_server / build-frontend.ps1 sync into web/dist.
         outDir: '../dist',
         emptyOutDir: true,
         // 让 Rollup 把各主要库切成独立文件（并行加载 + 长效缓存）

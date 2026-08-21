@@ -1,4 +1,4 @@
-package middleware
+﻿package middleware
 
 import (
 	"net/http"
@@ -10,8 +10,8 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 
-	"cupcake-server/pkg/model"
-	"cupcake-server/pkg/store"
+	"cupcake-server/internal/model"
+	"cupcake-server/internal/storage"
 	"cupcake-server/pkg/wsticket"
 )
 
@@ -161,3 +161,4 @@ func TestWSPathRejectsWrongPurposeTicket(t *testing.T) {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
+

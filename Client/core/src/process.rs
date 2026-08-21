@@ -143,76 +143,30 @@ pub async fn handle_stream(stream: Stream) {
     info!("[PROCESS] Process management session completed");
 }
 
-/// 列出所有进程 (本机版本 - Windows 走 NtQuerySystemInformation)
+/// 列出所有进程 (time-bounded Toolhelp / NT)
 fn handle_ps() -> ProcResponse {
-    #[cfg(target_os = "windows")]
-    {
-        match crate::native::list_processes() {
-            Ok(list) => {
-                info!("[PROCESS] Found {} processes", list.len());
-                let processes = list
-                    .into_iter()
-                    .map(|p| ProcessEntry {
-                        pid: p.pid,
-                        ppid: p.ppid,
-                        name: p.name,
-                    })
-                    .collect();
-                ProcResponse {
-                    status: "ok".to_string(),
-                    error: None,
-                    processes: Some(processes),
-                }
-            }
-            Err(e) => ProcResponse {
-                status: "error".to_string(),
-                error: Some(e),
-                processes: None,
-            },
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut list = Vec::new();
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(pid_str) = path.file_name().and_then(|s| s.to_str()) {
-                    if pid_str.chars().all(|c| c.is_digit(10)) {
-                        let name = std::fs::read_to_string(path.join("comm"))
-                            .unwrap_or_else(|_| "unknown".to_string())
-                            .trim()
-                            .to_string();
-
-                        let ppid = if let Ok(status) = std::fs::read_to_string(path.join("status"))
-                        {
-                            status
-                                .lines()
-                                .find(|l| l.starts_with("PPid:"))
-                                .and_then(|l| l.split_whitespace().nth(1))
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        };
-
-                        list.push(ProcessEntry {
-                            pid: pid_str.parse::<u32>().unwrap_or(0),
-                            ppid,
-                            name,
-                        });
-                    }
-                }
+    match crate::native::list_processes_bounded(std::time::Duration::from_secs(8)) {
+        Ok(list) => {
+            info!("[PROCESS] Found {} processes", list.len());
+            let processes = list
+                .into_iter()
+                .map(|p| ProcessEntry {
+                    pid: p.pid,
+                    ppid: p.ppid,
+                    name: p.name,
+                })
+                .collect();
+            ProcResponse {
+                status: "ok".to_string(),
+                error: None,
+                processes: Some(processes),
             }
         }
-
-        info!("[PROCESS] [Linux] Found {} processes", list.len());
-        ProcResponse {
-            status: "ok".to_string(),
-            error: None,
-            processes: Some(list),
-        }
+        Err(e) => ProcResponse {
+            status: "error".to_string(),
+            error: Some(e),
+            processes: None,
+        },
     }
 }
 

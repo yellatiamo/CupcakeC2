@@ -88,7 +88,7 @@ pub fn fragment_message(plaintext: &[u8], key: &[u8], max_size: usize) -> Result
         let ciphertext = crypto::encrypt(chunk, key);
         if ciphertext.is_empty() {
             return Err(ClientError::ConnectionError(
-                "Fragment encryption failed".into(),
+                "message encryption failed".into(),
             ));
         }
 
@@ -161,7 +161,7 @@ pub fn reassemble_message(fragments: &[Vec<u8>], key: &[u8]) -> Result<Vec<u8>> 
 
         // Decrypt this fragment's ciphertext
         let decrypted = crypto::decrypt(ciphertext, key).map_err(|e| {
-            ClientError::ConnectionError(format!("Fragment {} decryption failed: {}", seq, e))
+            ClientError::ConnectionError(format!("frame {} open failed: {}", seq, e))
         })?;
 
         plaintext.extend_from_slice(&decrypted);
@@ -225,7 +225,7 @@ impl<'a> Fragmenter<'a> {
         let ciphertext = crypto::encrypt(chunk, self.key);
         if ciphertext.is_empty() {
             return Err(ClientError::ConnectionError(
-                "Fragment encryption failed".into(),
+                "message encryption failed".into(),
             ));
         }
 

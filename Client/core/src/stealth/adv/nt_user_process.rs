@@ -246,10 +246,10 @@ unsafe fn try_nt_create_user_process_ppid_inner(
         return Err("PID query failed after create".into());
     }
 
-    crate::utils::db_print(&format!(
-        "[agent] spawn: nt_create_user_process ok pid={}",
+    crate::db_print!(
+        "[*] spawn: nt_create_user_process ok pid={}",
         pid
-    ));
+    );
     Ok(pid)
 }
 

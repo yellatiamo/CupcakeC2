@@ -16,10 +16,20 @@ doctest = false
 cupcake-core = { path = "../../core", default-features = false, features = ["bof"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 base64 = { version = "0.21", default-features = false, features = ["std"] }
-tokio = { version = "1.35", default-features = false, features = ["rt", "macros", "time"] }
+# No executor crates: the BOF engine is fully synchronous — a hand-rolled
+# no-op-waker drive in lib.rs replaces tokio/futures. Keeps every third-party
+# thread_local out of the module image (see pe_map TLS/Manual-Map rules).
 # max_level_off: log macros compile to no-ops — keeps format/module-path
 # strings out of the mapped module image (this DLL never attaches a logger).
 log = { version = "0.4", default-features = false, features = ["max_level_off"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winnt", "memoryapi"] }
+
+# Fat LTO prunes unreachable cupcake-core code (handler/transport/tokio) from
+# the module image — including their TLS-directory contributions. pe_map only
+# accepts TLS-free modules under Manual-Map (fileless) loading.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

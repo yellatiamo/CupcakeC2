@@ -4,30 +4,43 @@
 
 # ---- Rust (Client) ----
 /Client/target/
-/Client/core/Client/   # Rust 编译中间产物
-Cargo.lock             # 本项目作 binary，Cargo.lock 可以提交；如不需要则取消注释
+/Client/core/Client/
+# Cargo.lock is tracked for this binary workspace.
 
 # ---- Go (Server) ----
-/server/dist/        # Go embed 打包用的前端产物
-/server/ui/          # legacy frontend — obsolete; only dist is embedded
-# keep ui/README.md if present (not ignored by directory pattern for tracked files)
-/server/*.exe        # Windows 编译产物 (includes services.test.exe from go test -c)
+# Generated frontend output and Go embed mirror.
+/server/dist/
+/server/web/dist/
+/server/ui/
+
+# Generated server binaries.
+/server/*.exe
 /server/*.test.exe
-/**/*.test.exe       # never commit go test -c outputs (AV magnet)
+/**/*.test.exe
 /server/services.test.exe
-/server/cupcake-server  # Linux 编译产物
+/server/cupcake-server
 /server/cupcake-server-linux
 /server/cupcake-server-linux-amd64
 /server/temp_builds/
 /server/services_crash.txt
-/server/config.json  # local secrets — use config.example.json
 
-# Agent templates / third-party plugins (build or download; do not commit binaries)
+# Local server configuration and secrets.
+/server/config.json
+
+# Agent templates and third-party plugin binaries.
 /server/assets/*.exe
+/server/assets/*.dll
+/server/assets/*.bin
 /server/assets/plugins/*.exe
+/server/assets/plugins/*.dll
+/server/assets/plugins/*.o
+/server/assets/plugins/*.obj
+
+# Runtime modules and generated storage.
+/server/storage/*
+!/server/storage/modules/
 /server/storage/modules/*
 !/server/storage/modules/.gitkeep
-/server/storage/ad/
 /storage/
 
 # ---- Vue / Node.js (Frontend) ----
@@ -37,33 +50,34 @@ Cargo.lock             # 本项目作 binary，Cargo.lock 可以提交；如不�
 /server/frontend-v2/auto-imports.d.ts
 /server/frontend-v2/components.d.ts
 
-# ---- 本地数据库（含账�?密码/Agent记录等敏感数据）----
+# ---- Local databases ----
 /server/storage/*.db
 /server/storage/*.db-shm
 /server/storage/*.db-wal
 
-# ---- Storage 运行时目录（含已编译 Payload，勿上传�?---
+# ---- Runtime directories ----
 /server/storage/payloads/
 /server/storage/agent_files/
 /server/storage/logs/
 /server/storage/build_cache/
 /server/storage/public_tools/
+/server/storage/ad/
 
-# ---- IDE & 编辑�?----
+# ---- IDE and editor ----
 .idea/
 .vscode/
 *.iml
 
-# ---- 操作系统 ----
+# ---- Operating system ----
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# ---- 日志 ----
+# ---- Logs ----
 *.log
 *.log.*
 
-# ---- 敏感文件 ----
+# ---- Sensitive files ----
 *.pem
 *.key
 *.crt
@@ -71,13 +85,12 @@ desktop.ini
 *.pfx
 secrets.*
 
-# ---- Claude Code ----
+# ---- Local tooling ----
 .claude/
 .worktrees/
-
-# ---- Local tooling / caches (do not publish) ----
 .zcode/
-**/__pycache__/
-*.pyc
+/.go-cache/
 server/.go-build-cache/
 server/.go-review-cache/
+**/__pycache__/
+*.pyc

